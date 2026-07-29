@@ -1,0 +1,18 @@
+name: wecom-codex-bot
+
+services:
+  bot:
+    image: wecom-codex-bot:local
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - BOT_ID
+      - BOT_SECRET
+    working_dir: /app
+    volumes:
+      - ~/.codex:/home/bot/.codex
+      - ~/.agents:/home/bot/.agents
+      - .:/home/bot/workspace
+    stop_grace_period: 1m

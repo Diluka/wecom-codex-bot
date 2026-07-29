@@ -1,0 +1,17 @@
+{
+  "imports": {
+    "@std/assert": "jsr:@std/assert@^1.0.19",
+    "@std/testing": "jsr:@std/testing@^1.0.19",
+    "@wecom/aibot-node-sdk": "npm:@wecom/aibot-node-sdk@1.0.7"
+  },
+  "tasks": {
+    "start": "deno run --env-file=.env --allow-env --allow-net --allow-read --allow-write=.data --allow-run=codex main.ts",
+    "check": "deno check main.ts",
+    "test": "deno test --allow-env --allow-read --allow-write --allow-run=codex",
+    "smoke": "deno run --allow-env --allow-read --allow-run=codex scripts/smoke-app-server.ts",
+    "smoke-turn": "deno run --env-file=.env --allow-env --allow-read --allow-run=codex scripts/smoke-codex-turn.ts"
+  },
+  "fmt": {
+    "exclude": [".vscode"]
+  }
+}

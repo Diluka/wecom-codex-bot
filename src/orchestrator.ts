@@ -1,0 +1,521 @@
+import { buildCodexPrompt } from "./prompt.ts";
+import type {
+  ChatType,
+  ConversationKey,
+  InboundMessage,
+  InboundText,
+} from "./wecom.ts";
+
+export interface RoutedMessage extends InboundMessage {
+  frame: unknown;
+}
+
+export interface RoutedText extends InboundText, RoutedMessage {}
+
+export interface ConversationStateRecord {
+  conversationKey: string;
+  chatType: ChatType;
+  threadId: string;
+  activeTurnId: string | null;
+  lastStatus: string | null;
+  lastError: string | null;
+}
+
+export interface OrchestratorState {
+  claimMessage(msgId: string, conversationKey: string): boolean;
+  getConversation(
+    conversationKey: string,
+  ): ConversationStateRecord | null | undefined;
+  bindConversation(
+    conversationKey: string,
+    chatType: ChatType,
+    threadId: string,
+  ): ConversationStateRecord;
+  beginTurn(
+    conversationKey: string,
+    turnId: string,
+  ): ConversationStateRecord;
+  finishTurn(
+    conversationKey: string,
+    turnId: string,
+    status: string,
+    error?: string | null,
+  ): ConversationStateRecord;
+}
+
+export interface TurnOutcome {
+  status: string;
+  finalAnswer?: string;
+  error?: string | null;
+}
+
+export interface CodexTurnHandle {
+  turnId: string;
+  completion: Promise<TurnOutcome>;
+}
+
+export interface CodexPort {
+  readonly ready: boolean;
+  readonly generation: number;
+  startThread(): Promise<string>;
+  resumeThread(threadId: string): Promise<void>;
+  startTurn(
+    threadId: string,
+    prompt: string,
+    onProgress: (text: string) => void,
+  ): Promise<CodexTurnHandle>;
+  interruptTurn(threadId: string, turnId: string): Promise<void>;
+}
+
+export interface ProgressHandle {
+  append(text: string): void;
+  finish(): Promise<void>;
+}
+
+export interface ChatOutput {
+  send(message: RoutedMessage, text: string, final?: boolean): Promise<void>;
+  startProgress(message: RoutedText): Promise<ProgressHandle>;
+}
+
+export interface ConversationOrchestratorOptions {
+  state: OrchestratorState;
+  codex: CodexPort;
+  output: ChatOutput;
+  workspace: string;
+  onError?: (error: Error) => void;
+  shutdownGraceMs?: number;
+  interruptRetryDelaysMs?: readonly number[];
+}
+
+interface ActiveTurn {
+  threadId: string;
+  turnId: string;
+  progress: ProgressHandle;
+  forceComplete: (outcome: TurnOutcome) => void;
+}
+
+interface ConversationSlot {
+  pending?: RoutedText;
+  resetPending?: RoutedText;
+  active?: ActiveTurn;
+  interruptRequested: boolean;
+  interruptFailures: number;
+  interruptRetryTimer?: ReturnType<typeof setTimeout>;
+  drain?: Promise<void>;
+}
+
+const HELP = [
+  "可用命令：",
+  "- `/new`：中断当前任务并新建 Codex 会话",
+  "- `/status`：查看当前聊天的绑定与运行状态",
+  "- `/help`：显示本帮助",
+].join("\n");
+
+export class ConversationOrchestrator {
+  readonly #state: OrchestratorState;
+  readonly #codex: CodexPort;
+  readonly #output: ChatOutput;
+  readonly #workspace: string;
+  readonly #onError?: (error: Error) => void;
+  readonly #shutdownGraceMs: number;
+  readonly #interruptRetryDelaysMs: readonly number[];
+  readonly #slots = new Map<ConversationKey, ConversationSlot>();
+  readonly #loadedThreads = new Map<string, number>();
+  #shuttingDown = false;
+
+  constructor(options: ConversationOrchestratorOptions) {
+    this.#state = options.state;
+    this.#codex = options.codex;
+    this.#output = options.output;
+    this.#workspace = options.workspace;
+    this.#onError = options.onError;
+    this.#shutdownGraceMs = options.shutdownGraceMs ?? 30_000;
+    this.#interruptRetryDelaysMs = options.interruptRetryDelaysMs ?? [
+      1_000,
+      2_000,
+      4_000,
+    ];
+    if (
+      !Number.isFinite(this.#shutdownGraceMs) || this.#shutdownGraceMs < 0
+    ) {
+      throw new RangeError("shutdownGraceMs must be a non-negative number");
+    }
+    if (
+      this.#interruptRetryDelaysMs.some((delay) =>
+        !Number.isFinite(delay) || delay < 0
+      )
+    ) {
+      throw new RangeError(
+        "interruptRetryDelaysMs must contain non-negative numbers",
+      );
+    }
+  }
+
+  async handleText(message: RoutedText): Promise<void> {
+    if (this.#shuttingDown) return;
+    if (!this.#state.claimMessage(message.msgId, message.conversationKey)) {
+      return;
+    }
+
+    const command = message.text.trim();
+    if (command === "/help") {
+      await this.#output.send(message, HELP);
+      return;
+    }
+    if (command === "/status") {
+      await this.#output.send(message, this.#status(message.conversationKey));
+      return;
+    }
+    if (!this.#codex.ready) {
+      await this.#output.send(
+        message,
+        "Codex App Server 暂不可用，请稍后重试。",
+      );
+      return;
+    }
+
+    const slot = this.#slot(message.conversationKey);
+    if (command === "/new") {
+      slot.pending = undefined;
+      slot.resetPending = message;
+    } else if (slot.resetPending) {
+      slot.pending = message;
+    } else {
+      slot.pending = message;
+    }
+
+    if (slot.active) this.#requestInterrupt(slot);
+    if (!slot.drain) {
+      slot.drain = this.#drain(message.conversationKey, slot).finally(() => {
+        slot.drain = undefined;
+      });
+    }
+    await slot.drain;
+  }
+
+  async handleUnsupported(
+    message: RoutedMessage,
+    messageType: string,
+  ): Promise<void> {
+    if (this.#shuttingDown) return;
+    if (!this.#state.claimMessage(message.msgId, message.conversationKey)) {
+      return;
+    }
+    await this.#output.send(
+      message,
+      `暂不支持 \`${messageType}\` 消息，请发送纯文本。`,
+    );
+  }
+
+  async interruptAll(): Promise<void> {
+    const drains: Promise<void>[] = [];
+    this.#shuttingDown = true;
+    for (const slot of this.#slots.values()) {
+      this.#clearInterruptRetry(slot);
+      slot.pending = undefined;
+      slot.resetPending = undefined;
+      if (slot.drain) drains.push(slot.drain);
+      if (!slot.active || slot.interruptRequested) continue;
+      slot.interruptRequested = true;
+      void this.#codex.interruptTurn(slot.active.threadId, slot.active.turnId)
+        .catch(() => {});
+    }
+    if (drains.length === 0) return;
+
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<false>((resolve) => {
+      timeout = setTimeout(() => resolve(false), this.#shutdownGraceMs);
+    });
+    const drained = await Promise.race([
+      Promise.all(drains).then(() => true as const),
+      deadline,
+    ]);
+    if (timeout !== undefined) clearTimeout(timeout);
+    if (drained) return;
+
+    for (const slot of this.#slots.values()) {
+      slot.active?.forceComplete({
+        status: "runtime_lost",
+        error: "shutdown grace period expired",
+      });
+    }
+    await Promise.all(drains);
+  }
+
+  #slot(key: ConversationKey): ConversationSlot {
+    let slot = this.#slots.get(key);
+    if (!slot) {
+      slot = { interruptRequested: false, interruptFailures: 0 };
+      this.#slots.set(key, slot);
+    }
+    return slot;
+  }
+
+  async #drain(
+    conversationKey: ConversationKey,
+    slot: ConversationSlot,
+  ): Promise<void> {
+    while (slot.resetPending || slot.pending) {
+      if (slot.resetPending) {
+        const request = slot.resetPending;
+        slot.resetPending = undefined;
+        try {
+          await this.#resetConversation(request);
+        } catch {
+          // Output failures must not strand already-claimed pending work.
+        }
+        continue;
+      }
+
+      const message = slot.pending!;
+      slot.pending = undefined;
+      try {
+        await this.#runTurn(message, slot);
+      } catch (error) {
+        try {
+          await this.#output.send(
+            message,
+            `任务启动失败：${errorMessage(error)}`,
+            true,
+          );
+        } catch {
+          // Continue draining newer work when the fallback cannot be sent.
+        }
+      }
+    }
+
+    if (!slot.active && !slot.pending && !slot.resetPending) {
+      this.#slots.delete(conversationKey);
+    }
+  }
+
+  async #resetConversation(message: RoutedText): Promise<void> {
+    let threadId: string;
+    try {
+      threadId = await this.#codex.startThread();
+      this.#state.bindConversation(
+        message.conversationKey,
+        message.chatType,
+        threadId,
+      );
+      this.#loadedThreads.set(threadId, this.#codex.generation);
+    } catch (error) {
+      await this.#output.send(
+        message,
+        `新建 Codex 会话失败：${errorMessage(error)}`,
+        true,
+      );
+      return;
+    }
+
+    await this.#output.send(
+      message,
+      `已新建 Codex 会话。\n\n工作目录：\`${this.#workspace}\``,
+    );
+  }
+
+  async #runTurn(
+    message: RoutedText,
+    slot: ConversationSlot,
+  ): Promise<void> {
+    const threadId = await this.#ensureThread(message);
+
+    // A newer message that arrived while loading the thread wins before any
+    // model work is started.
+    if (this.#shuttingDown || slot.resetPending || slot.pending) return;
+
+    const progress = await this.#output.startProgress(message);
+    progress.append("[queued] 已提交给 Codex\n");
+    const prompt = buildCodexPrompt({
+      chatType: message.chatType,
+      conversationKey: message.conversationKey,
+      senderUserId: message.senderUserId,
+      msgId: message.msgId,
+      content: message.text,
+    });
+
+    let handle: CodexTurnHandle;
+    try {
+      handle = await this.#codex.startTurn(
+        threadId,
+        prompt,
+        (text) => progress.append(text),
+      );
+    } catch (error) {
+      progress.append(`[failed] ${errorMessage(error)}\n`);
+      await progress.finish();
+      throw error;
+    }
+
+    const forced = Promise.withResolvers<TurnOutcome>();
+    slot.active = {
+      threadId,
+      turnId: handle.turnId,
+      progress,
+      forceComplete: forced.resolve,
+    };
+    slot.interruptRequested = false;
+    slot.interruptFailures = 0;
+    try {
+      this.#state.beginTurn(message.conversationKey, handle.turnId);
+    } catch (error) {
+      this.#requestInterrupt(slot);
+      try {
+        await Promise.race([handle.completion, forced.promise]);
+      } catch {
+        // Rejection also means the old turn can no longer run concurrently.
+      }
+      try {
+        progress.append(`[failed] ${errorMessage(error)}\n`);
+        await progress.finish();
+      } finally {
+        this.#clearInterruptRetry(slot);
+        slot.active = undefined;
+        slot.interruptRequested = false;
+        slot.interruptFailures = 0;
+      }
+      void handle.completion.catch(() => undefined);
+      throw error;
+    }
+    if (slot.resetPending || slot.pending) this.#requestInterrupt(slot);
+
+    let outcome: TurnOutcome;
+    try {
+      outcome = await Promise.race([handle.completion, forced.promise]);
+    } catch (error) {
+      outcome = { status: "failed", error: errorMessage(error) };
+    }
+
+    let progressAppendFailure: unknown;
+    let progressAppendFailed = false;
+    try {
+      try {
+        progress.append(`[turn ${outcome.status}]\n`);
+      } catch (error) {
+        progressAppendFailed = true;
+        progressAppendFailure = error;
+      }
+      if (!progressAppendFailed) {
+        try {
+          await progress.finish();
+        } catch {
+          // Progress finish failures are already reported by ChatOutput.
+        }
+      }
+      try {
+        this.#state.finishTurn(
+          message.conversationKey,
+          handle.turnId,
+          outcome.status,
+          outcome.error ?? null,
+        );
+      } catch (error) {
+        this.#report(error);
+      }
+    } finally {
+      this.#clearInterruptRetry(slot);
+      slot.active = undefined;
+      slot.interruptRequested = false;
+      slot.interruptFailures = 0;
+    }
+    if (progressAppendFailed) throw progressAppendFailure;
+
+    const superseded = Boolean(slot.resetPending || slot.pending);
+    if (
+      outcome.status === "completed" && outcome.finalAnswer && !superseded &&
+      !this.#shuttingDown
+    ) {
+      await this.#output.send(message, outcome.finalAnswer, true);
+    } else if (
+      outcome.status === "failed" && !superseded && !this.#shuttingDown
+    ) {
+      await this.#output.send(
+        message,
+        `Codex 执行失败：${outcome.error ?? "unknown error"}`,
+        true,
+      );
+    }
+  }
+
+  async #ensureThread(message: RoutedText): Promise<string> {
+    const existing = this.#state.getConversation(message.conversationKey);
+    if (!existing) {
+      const threadId = await this.#codex.startThread();
+      this.#state.bindConversation(
+        message.conversationKey,
+        message.chatType,
+        threadId,
+      );
+      this.#loadedThreads.set(threadId, this.#codex.generation);
+      return threadId;
+    }
+
+    if (
+      this.#loadedThreads.get(existing.threadId) !== this.#codex.generation
+    ) {
+      await this.#codex.resumeThread(existing.threadId);
+      this.#loadedThreads.set(existing.threadId, this.#codex.generation);
+    }
+    return existing.threadId;
+  }
+
+  #requestInterrupt(slot: ConversationSlot): void {
+    if (!slot.active || slot.interruptRequested) return;
+    this.#clearInterruptRetry(slot);
+    slot.interruptRequested = true;
+    const active = slot.active;
+    void this.#codex.interruptTurn(active.threadId, active.turnId).catch(
+      (error) => {
+        try {
+          active.progress.append(
+            `[interrupt failed] ${errorMessage(error)}\n`,
+          );
+        } catch {
+          // The progress stream may have completed while the RPC was pending.
+        }
+        if (slot.active !== active) return;
+        slot.interruptRequested = false;
+        if (this.#shuttingDown || (!slot.pending && !slot.resetPending)) return;
+
+        const delay = this.#interruptRetryDelaysMs[slot.interruptFailures++];
+        if (delay === undefined) return;
+        slot.interruptRetryTimer = setTimeout(() => {
+          slot.interruptRetryTimer = undefined;
+          this.#requestInterrupt(slot);
+        }, delay);
+      },
+    );
+  }
+
+  #clearInterruptRetry(slot: ConversationSlot): void {
+    if (slot.interruptRetryTimer === undefined) return;
+    clearTimeout(slot.interruptRetryTimer);
+    slot.interruptRetryTimer = undefined;
+  }
+
+  #report(value: unknown): void {
+    const error = value instanceof Error ? value : new Error(String(value));
+    try {
+      this.#onError?.(error);
+    } catch {
+      // Error reporting must not break conversation draining.
+    }
+  }
+
+  #status(conversationKey: ConversationKey): string {
+    const record = this.#state.getConversation(conversationKey);
+    const slot = this.#slots.get(conversationKey);
+    return [
+      `conversation: \`${conversationKey}\``,
+      `thread: \`${record?.threadId ?? "not bound"}\``,
+      `codex: ${this.#codex.ready ? "ready" : "unavailable"}`,
+      `turn: ${slot?.active ? "in_progress" : record?.lastStatus ?? "idle"}`,
+      `queued: ${slot?.pending || slot?.resetPending ? "yes" : "no"}`,
+      record?.lastError ? `last_error: ${record.lastError}` : "",
+    ].filter(Boolean).join("\n");
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

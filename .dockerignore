@@ -1,0 +1,6 @@
+.data/
+.env
+.git/
+.vscode/
+docs/
+*.log
