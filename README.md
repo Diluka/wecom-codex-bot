@@ -20,8 +20,10 @@ BOT_SECRET=your-bot-secret
 CODEX_WORKSPACE=.
 ```
 
-`CODEX_WORKSPACE` 支持相对路径，按机器人项目目录解析。机器人只将解析后的 `cwd`
-传给 Codex；审批、沙盒、网络、模型等行为全部使用现有 Codex config。
+<!-- deno-fmt-ignore -->
+`CODEX_WORKSPACE` 支持相对路径，按机器人项目目录解析。机器人将解析后的 `cwd`
+传给 Codex，并在每个 turn 上显式设置 `effort: "ultra"`，使 Codex 可在任务适合时主动
+使用子代理。审批、沙盒、网络、模型等其余行为仍使用现有 Codex config。
 
 当前实验配置把 `.env` 放在 Codex 工作区内，因此 Codex 可以读取机器人
 Secret。发送到企业微信的内容会脱敏，但这不构成可靠的 Secret 隔离。

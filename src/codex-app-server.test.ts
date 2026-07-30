@@ -263,6 +263,7 @@ describe("CodexAppServerClient", () => {
           threadId: "thread-existing",
           input: [{ type: "text", text: "Run tests", text_elements: [] }],
           cwd: "/workspace/project",
+          effort: "ultra",
         },
       });
       deepStrictEqual(requests[4], {

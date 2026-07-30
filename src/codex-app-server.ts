@@ -266,6 +266,7 @@ export class CodexAppServerClient {
       threadId,
       input: [{ type: "text", text, text_elements: [] }],
       cwd: this.#cwd,
+      effort: "ultra",
     });
     return requiredNestedString(result, "turn", "id");
   }
