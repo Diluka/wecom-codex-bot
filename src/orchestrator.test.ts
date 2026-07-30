@@ -13,6 +13,7 @@ import {
 } from "./orchestrator.ts";
 import type { ActivityEvent } from "./activity-event.ts";
 import { OUTPUT_TAGS, type OutputSettings } from "./output-settings.ts";
+import { ConversationSendQueue } from "./output.ts";
 
 function message(
   conversationKey: `single:${string}` | `group:${string}`,
@@ -213,6 +214,63 @@ class FakeOutput implements ChatOutput {
         return Promise.resolve();
       },
     });
+  }
+}
+
+class QueueBlockedOutput implements ChatOutput {
+  readonly directStarted = Promise.withResolvers<void>();
+  readonly directGate = Promise.withResolvers<void>();
+  readonly afterShutdownGate = Promise.withResolvers<void>();
+  readonly progress: Array<
+    { msgId: string; chunks: string[]; finished: boolean }
+  > = [];
+  readonly lateProgressAppends: Array<{ msgId: string; text: string }> = [];
+  readonly #queue = new ConversationSendQueue();
+
+  async send(message: RoutedMessage): Promise<void> {
+    try {
+      await this.#queue.enqueue(message.conversationKey, async () => {
+        this.directStarted.resolve();
+        await this.directGate.promise;
+      });
+    } catch {
+      // Keep the ChatOutput callback pending after its queue slot is released.
+      await this.afterShutdownGate.promise;
+    }
+  }
+
+  startProgress(message: RoutedText) {
+    const entry = {
+      msgId: message.msgId,
+      chunks: [] as string[],
+      finished: false,
+    };
+    this.progress.push(entry);
+    return Promise.resolve({
+      append: (text: string) => {
+        if (entry.finished) {
+          this.lateProgressAppends.push({ msgId: message.msgId, text });
+          return;
+        }
+        entry.chunks.push(text);
+      },
+      finish: async () => {
+        const attempt = await this.#queue.enqueueCritical(
+          message.conversationKey,
+          () => {
+            entry.finished = true;
+            return Promise.resolve();
+          },
+        );
+        if (!attempt.accepted) {
+          throw new Error("progress finish was not accepted");
+        }
+      },
+    });
+  }
+
+  beginShutdown(): void {
+    this.#queue.beginShutdown();
   }
 }
 
@@ -543,6 +601,90 @@ describe("ConversationOrchestrator", () => {
     codex.starts[0].resolve({ status: "interrupted" });
     await Promise.all([running, stopping]);
     assertEquals(stopped, true);
+  });
+
+  it("forces shutdown past a permanently pending direct reply and releases the progress queue", async () => {
+    const state = new FakeState();
+    const codex = new FakeCodex();
+    const output = new QueueBlockedOutput();
+    const orchestrator = new ConversationOrchestrator({
+      state,
+      codex,
+      output,
+      workspace: "/workspace",
+      shutdownGraceMs: 1,
+    });
+    const running = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await waitFor(() => codex.starts.length === 1);
+
+    const direct = codex.starts[0].onActivity({
+      tag: "CONTENT",
+      body: "Codex needs input",
+      delivery: "direct",
+    });
+    void Promise.resolve(direct).catch(() => {});
+    await output.directStarted.promise;
+
+    const stopping = orchestrator.interruptAll();
+    output.beginShutdown();
+    const stoppedWithinDeadline = await Promise.race([
+      stopping.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
+    ]);
+
+    if (!stoppedWithinDeadline) output.directGate.resolve();
+    codex.starts[0].resolve({ status: "interrupted" });
+    await Promise.all([running, stopping]);
+
+    assertEquals(stoppedWithinDeadline, true);
+    assertEquals(output.progress[0].finished, true);
+    output.afterShutdownGate.resolve();
+    await direct;
+    await codex.starts[0].onActivity({
+      tag: "CONTENT",
+      body: "late activity",
+      delivery: "progress",
+    });
+    assertEquals(output.lateProgressAppends, []);
+  });
+
+  it("shuts down a turn whose start RPC resolves after the grace deadline without rendering started", async () => {
+    const startGate = Promise.withResolvers<void>();
+    const { codex, orchestrator, output } = setup({ shutdownGraceMs: 1 });
+    codex.startTurnGates.push(startGate.promise);
+    const running = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await waitFor(() => codex.startTurnAttempts === 1);
+
+    const stopping = orchestrator.interruptAll();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    startGate.resolve();
+    await waitFor(() => codex.starts.length === 1);
+    const interrupted = await Promise.race([
+      waitFor(() => codex.interrupts.length === 1).then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
+    ]);
+
+    if (!interrupted) codex.starts[0].resolve({ status: "interrupted" });
+    await Promise.all([running, stopping]);
+
+    assertEquals(interrupted, true);
+    assertEquals(
+      output.progress[0].chunks.includes("[shutdown] shutting down"),
+      true,
+    );
+    assertEquals(
+      output.progress[0].chunks.includes("[turn] started"),
+      false,
+    );
+    assertEquals(
+      output.progress[0].chunks.includes("[turn] runtime_lost"),
+      true,
+    );
+    assertEquals(output.progress[0].finished, true);
   });
 
   it("renders shutdown through the active pipeline and rejects late activity after finish", async () => {
