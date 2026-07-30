@@ -18,38 +18,88 @@
 BOT_ID=your-bot-id
 BOT_SECRET=your-bot-secret
 CODEX_WORKSPACE=.
-CODEX_INTERMEDIATE_OUTPUT=full
-CODEX_STATUS_DETAIL=verbose
+OUTPUT_LEVEL=full
+OUTPUT_LABEL=show
+OUTPUT_FORMAT_TOOL=individual
 ```
 
 `CODEX_WORKSPACE` 支持相对路径，按机器人项目目录解析。机器人只将解析后的 `cwd`
 传给 Codex；审批、沙盒、网络、模型等行为全部使用现有 Codex config。
 
-`CODEX_INTERMEDIATE_OUTPUT` 控制 Codex 的中间过程内容，默认 `full`：
+### 企业微信输出
 
-| 值                | 行为                                                                             |
-| ----------------- | -------------------------------------------------------------------------------- |
-| `full`            | 输出摘要、工具生命周期和工具结果。                                               |
-| `no_tool_results` | 保留摘要和工具生命周期，不输出命令、进程、文件及 MCP 的结果增量。                |
-| `merge_same_tool` | 同一 turn 内相同且并发执行的工具只显示一次启动；只在最后一个完成时显示完成状态。 |
-| `merge_all_tools` | 同一 turn 的任意工具聚合为一次 `[tools] running` 和一次 `[tools completed]`。    |
-| `none`            | 不输出普通中间过程。错误和警告仍会显示。                                         |
+输出配置的全局默认值是：
 
-相同工具的合并按活动调用计数，而不是简单布尔缓存：重复的启动会增加计数，只有对应的
-最后一次完成才会释放该工具。计数仅作用于一个 `threadId + turnId`，turn 结束、App
-Server 重启或机器人关闭时会清理。
+```dotenv
+OUTPUT_LEVEL=full
+OUTPUT_LABEL=show
+OUTPUT_FORMAT_TOOL=individual
+```
 
-`CODEX_STATUS_DETAIL` 控制被动状态信息，默认 `verbose`：
+`OUTPUT_LEVEL` 设置所有活动标签的全局输出级别。`OUTPUT_LEVEL_<TAG>`
+可单独覆盖一个标签，留空或未设置时继承全局值。两者都支持：
 
-| 值        | 行为                                                               |
-| --------- | ------------------------------------------------------------------ |
-| `verbose` | 显示排队、turn 和工具的开始/完成状态；关闭机器人时也显示关闭状态。 |
-| `turn`    | 仅显示排队和 turn 的开始/完成状态。                                |
-| `none`    | 不显示被动状态信息。                                               |
+| 值        | 行为                                                                                                         |
+| --------- | ------------------------------------------------------------------------------------------------------------ |
+| `off`     | 不输出该标签的任何内容。                                                                                     |
+| `line`    | 每个来源流只输出第一个非空逻辑行，最多 160 个 Unicode 码点；省略了内容时追加一次 `...`，之后的片段不再输出。 |
+| `excerpt` | 输出一个来源流的前 800 个 Unicode 码点；超出时追加一次 `...`，并抑制该来源流的后续片段。                     |
+| `full`    | 保留原始文本，不截断正文。                                                                                   |
 
-最终回答、直接失败、错误/警告、`/status`
-和需要用户输入的提示不会被这些设置隐藏。 当 `CODEX_INTERMEDIATE_OUTPUT=none`
-时，也不会显示被动状态信息。
+支持以下 9 个标签；标签名同时也是 `OUTPUT_LEVEL_<TAG>` 和 `OUTPUT_LABEL_<TAG>`
+的后缀：
+
+| 标签          | 说明                                    |
+| ------------- | --------------------------------------- |
+| `QUEUE`       | 消息已提交给 Codex 的排队状态。         |
+| `TURN`        | turn 的开始、完成或终止状态。           |
+| `TOOL`        | 工具调用的启动与完成生命周期。          |
+| `TOOL_RESULT` | 命令、进程、文件或 MCP 等工具结果增量。 |
+| `CONTENT`     | Codex 的推理摘要或过程性内容。          |
+| `PLAN`        | Codex 生成的计划内容。                  |
+| `WARNING`     | Codex App Server 发出的警告。           |
+| `ERROR`       | Codex 或机器人运行过程中的错误。        |
+| `SHUTDOWN`    | 机器人关闭时的中断状态。                |
+
+`OUTPUT_LABEL` 设置全局标签样式，`OUTPUT_LABEL_<TAG>` 可按标签覆盖；留空或未设置
+时继承全局值。`show` 会添加生成的 `[tag]` 前缀，`hide` 只移除这个前缀，不删除或
+隐藏正文，也不改变输出级别。
+
+`OUTPUT_FORMAT_TOOL` 只选择工具生命周期的格式或聚合方式，默认 `individual`：
+
+| 值           | 行为                                                                           |
+| ------------ | ------------------------------------------------------------------------------ |
+| `individual` | 每个工具调用分别显示启动与完成事件。                                           |
+| `merge_same` | 同一 turn 内相同工具的并发调用按工具身份聚合，只显示第一次启动和最后一次完成。 |
+| `merge_all`  | 同一 turn 内所有工具调用聚合，只显示第一项启动和最后一项完成。                 |
+
+聚合使用活动调用的引用计数，而不是简单布尔缓存：每次启动增加计数、每次完成减少
+计数，最后一个活动调用完成时释放该组状态；缓存和计数状态也会在 turn 结束、App
+Server 重启和机器人关闭时释放。
+
+`OUTPUT_FORMAT_TOOL` 永远不决定内容是否可见。工具生命周期与工具结果分别由独立的
+`OUTPUT_LEVEL_TOOL` 和 `OUTPUT_LEVEL_TOOL_RESULT` 控制。例如，只显示无标签的工具
+生命周期首行、隐藏工具结果，并聚合相同工具：
+
+```dotenv
+OUTPUT_LEVEL=off
+OUTPUT_LEVEL_TOOL=line
+OUTPUT_LEVEL_TOOL_RESULT=off
+OUTPUT_LABEL_TOOL=hide
+OUTPUT_FORMAT_TOOL=merge_same
+```
+
+直发消息不经过上述级别和标签过滤。即使所有输出级别均为 `off`，最终回答、
+`/help`、`/status`、不支持消息类型的提示、用户输入请求和直接失败消息仍会发送。
+
+`CODEX_INTERMEDIATE_OUTPUT` 和 `CODEX_STATUS_DETAIL` 这两个旧变量会被静默忽略：
+它们不再被读取、校验，也不会继续影响运行时行为；迁移时应删除旧变量并改用
+`OUTPUT_*`。
+
+原始 `ActivityEvent` 的架构边界是：未来会分发给两个独立配置的管线——本次迭代
+负责企业微信消息的 `OutputPipeline`，以及未来迭代负责终端日志的 `LogPipeline`。
+本次迭代不提供 `LOG_*`，不会把活动事件打印到终端，也不会让企业微信的输出过滤
+影响未来日志。
 
 当前实验配置把 `.env` 放在 Codex 工作区内，因此 Codex 可以读取机器人
 Secret。发送到企业微信的内容会脱敏，但这不构成可靠的 Secret 隔离。
