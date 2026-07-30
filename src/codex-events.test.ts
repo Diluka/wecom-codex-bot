@@ -1,6 +1,9 @@
 import { assertEquals } from "@std/assert";
 import { describe, it } from "@std/testing/bdd";
-import { renderCodexNotification } from "./codex-events.ts";
+import {
+  describeCodexNotification,
+  renderCodexNotification,
+} from "./codex-events.ts";
 
 describe("renderCodexNotification", () => {
   it("exposes reasoning summaries but never raw reasoning", () => {
@@ -122,5 +125,136 @@ describe("renderCodexNotification", () => {
       renderCodexNotification({ method: "future/notification", params: {} }),
       null,
     );
+  });
+});
+
+describe("describeCodexNotification", () => {
+  it("classifies lifecycle events with stable item and tool identities", () => {
+    assertEquals(
+      describeCodexNotification({
+        method: "item/started",
+        params: {
+          itemId: "command-param-id",
+          item: {
+            id: "command-item-id",
+            type: "commandExecution",
+            command: "deno test --all",
+          },
+        },
+      }),
+      {
+        category: "tool_started",
+        text: "\n$ deno test --all\n",
+        itemId: "command-param-id",
+        toolKey: "deno test --all",
+      },
+    );
+
+    const cases = [
+      {
+        item: { id: "file-1", type: "fileChange" },
+        toolKey: "fileChange",
+      },
+      {
+        item: {
+          id: "mcp-1",
+          type: "mcpToolCall",
+          server: "dbhub",
+          tool: "execute_sql",
+        },
+        toolKey: "dbhub/execute_sql",
+      },
+      {
+        item: {
+          id: "dynamic-1",
+          type: "dynamicToolCall",
+          namespace: "functions",
+          tool: "exec",
+        },
+        toolKey: "functions/exec",
+      },
+      {
+        item: {
+          id: "collab-1",
+          type: "collabToolCall",
+          tool: "spawn_agent",
+        },
+        toolKey: "spawn_agent",
+      },
+      {
+        item: {
+          id: "search-1",
+          type: "webSearch",
+          query: "Codex app server",
+        },
+        toolKey: "Codex app server",
+      },
+    ];
+
+    for (const { item, toolKey } of cases) {
+      const event = describeCodexNotification({
+        method: "item/started",
+        params: { item },
+      });
+      assertEquals(event?.category, "tool_started");
+      assertEquals(event?.itemId, item.id);
+      assertEquals(event?.toolKey, toolKey);
+    }
+  });
+
+  it("separates content, tool results, turn statuses, and critical events", () => {
+    const cases = [
+      {
+        notification: {
+          method: "item/reasoning/summaryTextDelta",
+          params: { delta: "safe summary" },
+        },
+        category: "content",
+      },
+      {
+        notification: {
+          method: "process/outputDelta",
+          params: { delta: "stdout" },
+        },
+        category: "tool_result",
+      },
+      {
+        notification: { method: "turn/started", params: {} },
+        category: "turn_status",
+      },
+      {
+        notification: {
+          method: "warning",
+          params: { message: "watch out" },
+        },
+        category: "critical",
+      },
+    ] as const;
+
+    for (const { notification, category } of cases) {
+      assertEquals(describeCodexNotification(notification)?.category, category);
+    }
+  });
+
+  it("classifies a web-search completion even when legacy rendering has no text", () => {
+    const notification = {
+      method: "item/completed",
+      params: {
+        item: {
+          id: "search-1",
+          type: "webSearch",
+          query: "Codex app server",
+          status: "completed",
+        },
+      },
+    };
+
+    assertEquals(renderCodexNotification(notification), null);
+    assertEquals(describeCodexNotification(notification), {
+      category: "tool_completed",
+      text: null,
+      itemId: "search-1",
+      toolKey: "Codex app server",
+    });
   });
 });

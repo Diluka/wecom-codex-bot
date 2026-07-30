@@ -3,6 +3,26 @@ export interface CodexNotification {
   params?: Record<string, unknown>;
 }
 
+export type CodexProgressCategory =
+  | "content"
+  | "tool_result"
+  | "turn_status"
+  | "critical"
+  | "tool_started"
+  | "tool_completed";
+
+export interface CodexProgressEvent {
+  category: CodexProgressCategory;
+  text: string | null;
+  itemId?: string;
+  toolKey?: string;
+}
+
+interface ToolIdentity {
+  itemId?: string;
+  toolKey: string;
+}
+
 function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object"
     ? value as Record<string, unknown>
@@ -20,6 +40,44 @@ function status(value: unknown): string {
 function changeKind(value: unknown): string {
   if (typeof value === "string") return value;
   return text(record(value)?.type) ?? "change";
+}
+
+function toolIdentity(
+  item: Record<string, unknown>,
+  params: Record<string, unknown>,
+): ToolIdentity | null {
+  const itemId = text(params.itemId) ?? text(item.id) ?? undefined;
+
+  switch (item.type) {
+    case "commandExecution":
+      return { itemId, toolKey: text(item.command) ?? "commandExecution" };
+    case "fileChange":
+      return { itemId, toolKey: "fileChange" };
+    case "mcpToolCall":
+      return {
+        itemId,
+        toolKey: `${text(item.server) ?? "mcp"}/${
+          text(item.tool) ?? "unknown"
+        }`,
+      };
+    case "dynamicToolCall":
+      return {
+        itemId,
+        toolKey: `${text(item.namespace) ?? "dynamic"}/${
+          text(item.tool) ?? "unknown"
+        }`,
+      };
+    case "collabToolCall":
+    case "collabAgentToolCall":
+      return {
+        itemId,
+        toolKey: text(item.tool) ?? "collaboration",
+      };
+    case "webSearch":
+      return { itemId, toolKey: text(item.query) ?? "webSearch" };
+    default:
+      return null;
+  }
 }
 
 function renderStarted(item: Record<string, unknown>): string | null {
@@ -91,14 +149,31 @@ function renderCompleted(item: Record<string, unknown>): string | null {
   }
 }
 
-export function renderCodexNotification(
+function withToolIdentity(
+  category: "tool_started" | "tool_completed",
+  item: Record<string, unknown>,
+  params: Record<string, unknown>,
+): CodexProgressEvent | null {
+  const identity = toolIdentity(item, params);
+  if (!identity) return null;
+  return {
+    category,
+    text: category === "tool_started"
+      ? renderStarted(item)
+      : renderCompleted(item),
+    ...(identity.itemId ? { itemId: identity.itemId } : {}),
+    toolKey: identity.toolKey,
+  };
+}
+
+export function describeCodexNotification(
   notification: CodexNotification,
-): string | null {
+): CodexProgressEvent | null {
   const params = notification.params ?? {};
 
   switch (notification.method) {
     case "item/reasoning/summaryTextDelta":
-      return text(params.delta);
+      return { category: "content", text: text(params.delta) };
     case "item/reasoning/textDelta":
     case "item/reasoning/summaryPartAdded":
     case "item/agentMessage/delta":
@@ -107,33 +182,57 @@ export function renderCodexNotification(
     case "command/exec/outputDelta":
     case "process/outputDelta":
     case "item/fileChange/outputDelta":
-      return text(params.delta);
+      return { category: "tool_result", text: text(params.delta) };
     case "item/mcpToolCall/progress":
-      return text(params.message) ? `[tool] ${params.message}\n` : null;
+      return {
+        category: "tool_result",
+        text: text(params.message) ? `[tool] ${params.message}\n` : null,
+      };
     case "item/started": {
       const item = record(params.item);
-      return item ? renderStarted(item) : null;
+      return item ? withToolIdentity("tool_started", item, params) : null;
     }
     case "item/completed": {
       const item = record(params.item);
-      return item ? renderCompleted(item) : null;
+      if (!item) return null;
+      const tool = withToolIdentity("tool_completed", item, params);
+      if (tool) return tool;
+      if (item.type === "agentMessage" || item.type === "plan") {
+        return { category: "content", text: renderCompleted(item) };
+      }
+      return null;
     }
     case "turn/started":
-      return "[turn started]\n";
+      return { category: "turn_status", text: "[turn started]\n" };
     case "turn/completed": {
       const turn = record(params.turn);
-      return `[turn ${status(turn?.status)}]\n`;
+      return {
+        category: "turn_status",
+        text: `[turn ${status(turn?.status)}]\n`,
+      };
     }
     case "error": {
       const error = record(params.error);
       const message = text(error?.message);
-      return message ? `[error] ${message}\n` : "[error]\n";
+      return {
+        category: "critical",
+        text: message ? `[error] ${message}\n` : "[error]\n",
+      };
     }
     case "warning":
     case "guardianWarning":
     case "configWarning":
-      return text(params.message) ? `[warning] ${params.message}\n` : null;
+      return {
+        category: "critical",
+        text: text(params.message) ? `[warning] ${params.message}\n` : null,
+      };
     default:
       return null;
   }
+}
+
+export function renderCodexNotification(
+  notification: CodexNotification,
+): string | null {
+  return describeCodexNotification(notification)?.text ?? null;
 }

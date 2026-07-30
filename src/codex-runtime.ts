@@ -7,12 +7,17 @@ import {
   type RequestUserInputEvent,
   type TurnCompletedEvent,
 } from "./codex-app-server.ts";
-import { renderCodexNotification } from "./codex-events.ts";
+import { describeCodexNotification } from "./codex-events.ts";
 import type {
   CodexPort,
   CodexTurnHandle,
   TurnOutcome,
 } from "./orchestrator.ts";
+import {
+  DEFAULT_PROGRESS_SETTINGS,
+  type ProgressSettings,
+} from "./output-settings.ts";
+import { TurnProgressPolicy } from "./progress-policy.ts";
 
 export interface CodexRuntimeClient {
   startThread(): Promise<string>;
@@ -30,6 +35,7 @@ type MaybePromise<T> = T | Promise<T>;
 
 export interface CodexRuntimeOptions {
   workspace: string;
+  progressSettings?: ProgressSettings;
   clientFactory?: CodexRuntimeClientFactory;
   delay?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   onFatal?: (error: Error) => MaybePromise<void>;
@@ -42,7 +48,6 @@ interface ActiveTurn {
 }
 
 const RESTART_DELAYS = [1_000, 2_000, 4_000, 8_000, 16_000] as const;
-
 const defaultClientFactory: CodexRuntimeClientFactory = (options) =>
   CodexAppServerClient.start(options);
 
@@ -71,9 +76,11 @@ export class CodexRuntime implements CodexPort {
   ) => Promise<void>;
   readonly #onFatal?: (error: Error) => MaybePromise<void>;
   readonly #onDiagnostic?: (message: string) => MaybePromise<void>;
+  readonly #progressSettings: ProgressSettings;
   readonly #activeTurns = new Map<string, ActiveTurn>();
   readonly #bufferedProgress = new Map<string, string[]>();
   readonly #bufferedOutcomes = new Map<string, TurnOutcome>();
+  readonly #progressPolicies = new Map<string, TurnProgressPolicy>();
   readonly #connectingTokens = new Set<object>();
   readonly #earlyExits = new Map<object, AppServerProcessStatus>();
 
@@ -94,6 +101,8 @@ export class CodexRuntime implements CodexPort {
     this.#delay = options.delay ?? defaultDelay;
     this.#onFatal = options.onFatal;
     this.#onDiagnostic = options.onDiagnostic;
+    this.#progressSettings = options.progressSettings ??
+      DEFAULT_PROGRESS_SETTINGS;
   }
 
   get ready(): boolean {
@@ -171,6 +180,7 @@ export class CodexRuntime implements CodexPort {
       !this.#ready || client !== this.#client ||
       clientToken !== this.#clientToken
     ) {
+      this.#clearProgressPolicy(key);
       resolve({ status: "runtime_lost" });
       return { turnId, completion };
     }
@@ -245,7 +255,11 @@ export class CodexRuntime implements CodexPort {
     if (token !== this.#clientToken) return;
     const ids = notificationIds(event.params);
     if (!ids) return;
-    const rendered = renderCodexNotification(event);
+    const progressEvent = describeCodexNotification(event);
+    if (!progressEvent) return;
+    const rendered = this.#progressPolicy(
+      turnKey(ids.threadId, ids.turnId),
+    ).apply(progressEvent);
     if (rendered === null) return;
     this.#routeProgress(ids.threadId, ids.turnId, rendered);
   }
@@ -260,6 +274,7 @@ export class CodexRuntime implements CodexPort {
       error: errorMessageOrNull(event.error),
     };
     const key = turnKey(event.threadId, event.turnId);
+    this.#clearProgressPolicy(key);
     if (this.#activeTurns.has(key)) {
       this.#completeTurn(key, outcome);
     } else {
@@ -377,11 +392,13 @@ export class CodexRuntime implements CodexPort {
     const active = this.#activeTurns.get(key);
     if (!active) return;
     this.#activeTurns.delete(key);
+    this.#clearProgressPolicy(key);
     active.resolve(outcome);
   }
 
   #resolveActiveTurnsAsLost(): void {
-    for (const active of this.#activeTurns.values()) {
+    for (const [key, active] of this.#activeTurns) {
+      this.#clearProgressPolicy(key);
       active.resolve({ status: "runtime_lost" });
     }
     this.#activeTurns.clear();
@@ -390,6 +407,22 @@ export class CodexRuntime implements CodexPort {
   #clearBufferedEvents(): void {
     this.#bufferedProgress.clear();
     this.#bufferedOutcomes.clear();
+    this.#progressPolicies.clear();
+  }
+
+  #progressPolicy(key: string): TurnProgressPolicy {
+    let policy = this.#progressPolicies.get(key);
+    if (!policy) {
+      policy = new TurnProgressPolicy(this.#progressSettings);
+      this.#progressPolicies.set(key, policy);
+    }
+    return policy;
+  }
+
+  #clearProgressPolicy(key: string): void {
+    const policy = this.#progressPolicies.get(key);
+    policy?.clear();
+    this.#progressPolicies.delete(key);
   }
 
   #requireClient(): CodexRuntimeClient {

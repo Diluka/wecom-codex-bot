@@ -244,6 +244,66 @@ describe("ConversationOrchestrator", () => {
     });
   });
 
+  it("keeps queue and turn statuses at turn detail but hides passive statuses at none", async () => {
+    const visible = setup({
+      progressSettings: {
+        intermediateOutput: "full",
+        statusDetail: "turn",
+      },
+    });
+    const visibleRunning = visible.orchestrator.handleText(
+      message("single:alice", "visible", "work"),
+    );
+    await waitFor(() => visible.codex.starts.length === 1);
+    visible.codex.starts[0].resolve({
+      status: "completed",
+      finalAnswer: "visible final",
+    });
+    await visibleRunning;
+    assertEquals(visible.output.progress[0].chunks, [
+      "[queued] 已提交给 Codex\n",
+      "[turn completed]\n",
+    ]);
+
+    const hidden = setup({
+      progressSettings: {
+        intermediateOutput: "full",
+        statusDetail: "none",
+      },
+    });
+    const hiddenRunning = hidden.orchestrator.handleText(
+      message("single:alice", "hidden", "work"),
+    );
+    await waitFor(() => hidden.codex.starts.length === 1);
+    hidden.codex.starts[0].resolve({
+      status: "completed",
+      finalAnswer: "hidden final",
+    });
+    await hiddenRunning;
+
+    assertEquals(hidden.output.progress[0].chunks, []);
+    assertEquals(hidden.output.sent, [{
+      msgId: "hidden",
+      text: "hidden final",
+      final: true,
+    }]);
+  });
+
+  it("keeps direct failures visible when passive status is disabled", async () => {
+    const { codex, orchestrator, output } = setup({
+      progressSettings: {
+        intermediateOutput: "none",
+        statusDetail: "none",
+      },
+    });
+    codex.startTurnErrors.push(new Error("start failed"));
+
+    await orchestrator.handleText(message("single:alice", "m1", "work"));
+
+    assertEquals(output.progress[0].chunks, ["[failed] start failed\n"]);
+    assertMatch(output.sent.at(-1)!.text, /任务启动失败：start failed/);
+  });
+
   it("interrupts an active turn and only runs the latest pending message", async () => {
     const { codex, orchestrator } = setup();
     const first = orchestrator.handleText(

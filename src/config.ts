@@ -1,4 +1,11 @@
 import { join, resolve } from "node:path";
+import {
+  DEFAULT_PROGRESS_SETTINGS,
+  INTERMEDIATE_OUTPUT_MODES,
+  type IntermediateOutputMode,
+  STATUS_DETAILS,
+  type StatusDetail,
+} from "./output-settings.ts";
 
 export interface BotConfig {
   botId: string;
@@ -6,6 +13,8 @@ export interface BotConfig {
   workspace: string;
   stateDbPath: string;
   botRoot: string;
+  intermediateOutput: IntermediateOutputMode;
+  statusDetail: StatusDetail;
 }
 
 function required(
@@ -19,6 +28,22 @@ function required(
   return value;
 }
 
+function optionalEnum<T extends string>(
+  env: Record<string, string | undefined>,
+  name: string,
+  values: readonly T[],
+  defaultValue: T,
+): T {
+  const value = env[name]?.trim();
+  if (!value) {
+    return defaultValue;
+  }
+  if ((values as readonly string[]).includes(value)) {
+    return value as T;
+  }
+  throw new Error(`Invalid environment variable: ${name}`);
+}
+
 export async function loadConfig(
   env: Record<string, string | undefined> = Deno.env.toObject(),
   baseDir = Deno.cwd(),
@@ -26,6 +51,18 @@ export async function loadConfig(
   const botId = required(env, "BOT_ID");
   const botSecret = required(env, "BOT_SECRET");
   const workspaceValue = required(env, "CODEX_WORKSPACE");
+  const intermediateOutput = optionalEnum(
+    env,
+    "CODEX_INTERMEDIATE_OUTPUT",
+    INTERMEDIATE_OUTPUT_MODES,
+    DEFAULT_PROGRESS_SETTINGS.intermediateOutput,
+  );
+  const statusDetail = optionalEnum(
+    env,
+    "CODEX_STATUS_DETAIL",
+    STATUS_DETAILS,
+    DEFAULT_PROGRESS_SETTINGS.statusDetail,
+  );
   const botRoot = await Deno.realPath(baseDir);
   const workspace = await Deno.realPath(resolve(botRoot, workspaceValue));
   const stat = await Deno.stat(workspace);
@@ -40,5 +77,7 @@ export async function loadConfig(
     workspace,
     stateDbPath: join(botRoot, ".data", "bot.sqlite"),
     botRoot,
+    intermediateOutput,
+    statusDetail,
   };
 }
