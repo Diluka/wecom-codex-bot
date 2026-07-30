@@ -15,8 +15,8 @@ configuration changes to `ultra`.
 
 Current Codex App Server schemas mark `multiAgentMode` as deprecated and
 ignored. They identify `effort: "ultra"` on `turn/start` as the supported way to
-enable proactive multi-agent behavior. A turn-level effort override also
-becomes the default for subsequent turns on the same thread.
+enable proactive multi-agent behavior. A turn-level effort override also becomes
+the default for subsequent turns on the same thread.
 
 ## Design
 
@@ -42,11 +42,11 @@ threads.
 
 ## Error Handling
 
-If the selected model or provider rejects `ultra`, `turn/start` will fail through
-the existing RPC error path. The orchestrator already reports start failures to
-the conversation and keeps the thread binding intact. No fallback to a less
-capable effort is added because that would silently restore the restriction this
-change is intended to remove.
+If the selected model or provider rejects `ultra`, `turn/start` will fail
+through the existing RPC error path. The orchestrator already reports start
+failures to the conversation and keeps the thread binding intact. No fallback to
+a less capable effort is added because that would silently restore the
+restriction this change is intended to remove.
 
 ## Testing And Documentation
 
