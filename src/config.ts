@@ -1,5 +1,6 @@
 import { join, resolve } from "node:path";
 import {
+  DEFAULT_PROGRESS_SETTINGS,
   INTERMEDIATE_OUTPUT_MODES,
   type IntermediateOutputMode,
   STATUS_DETAILS,
@@ -54,13 +55,13 @@ export async function loadConfig(
     env,
     "CODEX_INTERMEDIATE_OUTPUT",
     INTERMEDIATE_OUTPUT_MODES,
-    "full",
+    DEFAULT_PROGRESS_SETTINGS.intermediateOutput,
   );
   const statusDetail = optionalEnum(
     env,
     "CODEX_STATUS_DETAIL",
     STATUS_DETAILS,
-    "verbose",
+    DEFAULT_PROGRESS_SETTINGS.statusDetail,
   );
   const botRoot = await Deno.realPath(baseDir);
   const workspace = await Deno.realPath(resolve(botRoot, workspaceValue));

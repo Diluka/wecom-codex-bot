@@ -321,6 +321,198 @@ describe("CodexRuntime", () => {
     await runtime.stop();
   });
 
+  it("uses a turn-local reference count when merging matching tool calls", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    client.turnIds.push("turn-merged");
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory, {
+      progressSettings: {
+        intermediateOutput: "merge_same_tool",
+        statusDetail: "verbose",
+      },
+    });
+    await runtime.start();
+
+    const progress: string[] = [];
+    const handle = await runtime.startTurn(
+      "thread-merged",
+      "work",
+      (text) => progress.push(text),
+    );
+    const notification = (method: string, item: Record<string, unknown>) => {
+      client.callbacks.onNotification?.({
+        method,
+        params: { threadId: "thread-merged", turnId: "turn-merged", item },
+      });
+    };
+
+    notification("item/started", {
+      id: "command-1",
+      type: "commandExecution",
+      command: "deno test",
+    });
+    notification("item/started", {
+      id: "command-2",
+      type: "commandExecution",
+      command: "deno test",
+    });
+    client.callbacks.onNotification?.({
+      method: "item/commandExecution/outputDelta",
+      params: {
+        threadId: "thread-merged",
+        turnId: "turn-merged",
+        delta: "ignored",
+      },
+    });
+    notification("item/completed", {
+      id: "command-1",
+      type: "commandExecution",
+      command: "deno test",
+      status: "completed",
+      exitCode: 0,
+    });
+    notification("item/completed", {
+      id: "command-2",
+      type: "commandExecution",
+      command: "deno test",
+      status: "completed",
+      exitCode: 0,
+    });
+
+    assertEquals(progress, [
+      "\n$ deno test\n",
+      "[command completed, exit 0]\n",
+    ]);
+    client.callbacks.onTurnCompleted?.({
+      threadId: "thread-merged",
+      turnId: "turn-merged",
+      status: "completed",
+      error: null,
+    });
+    await handle.completion;
+    await runtime.stop();
+  });
+
+  it("filters early notifications before replay and still forwards input prompts", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    const turnResponse = deferred<string>();
+    client.turnIds.push(turnResponse.promise);
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory, {
+      progressSettings: {
+        intermediateOutput: "none",
+        statusDetail: "none",
+      },
+    });
+    await runtime.start();
+
+    const progress: string[] = [];
+    const starting = runtime.startTurn(
+      "thread-hidden",
+      "work",
+      (text) => progress.push(text),
+    );
+    await waitFor(() => client.startedTurns.length === 1, "pending turn RPC");
+    client.callbacks.onNotification?.({
+      method: "item/reasoning/summaryTextDelta",
+      params: {
+        threadId: "thread-hidden",
+        turnId: "turn-hidden",
+        delta: "hidden summary",
+      },
+    });
+    client.callbacks.onRequestUserInput?.({
+      threadId: "thread-hidden",
+      turnId: "turn-hidden",
+      questions: [{ header: "需要信息", question: "请补充范围" }],
+    });
+    turnResponse.resolve("turn-hidden");
+
+    const handle = await starting;
+    assertEquals(progress.length, 1);
+    assertMatch(progress[0], /Codex 需要用户输入/);
+    assertMatch(progress[0], /请补充范围/);
+    client.callbacks.onTurnCompleted?.({
+      threadId: "thread-hidden",
+      turnId: "turn-hidden",
+      status: "interrupted",
+      error: null,
+    });
+    await handle.completion;
+    await runtime.stop();
+  });
+
+  it("releases cached tool identities after an App Server restart", async () => {
+    const factory = new FakeFactory();
+    const crashed = new FakeClient();
+    const replacement = new FakeClient();
+    crashed.turnIds.push("turn-reused");
+    replacement.turnIds.push("turn-reused");
+    factory.queue.push(crashed, replacement);
+    const runtime = runtimeWith(factory, {
+      delay: async () => {},
+      progressSettings: {
+        intermediateOutput: "merge_same_tool",
+        statusDetail: "verbose",
+      },
+    });
+    await runtime.start();
+
+    const firstProgress: string[] = [];
+    const first = await runtime.startTurn(
+      "thread-reused",
+      "first",
+      (text) => firstProgress.push(text),
+    );
+    crashed.callbacks.onNotification?.({
+      method: "item/started",
+      params: {
+        threadId: "thread-reused",
+        turnId: "turn-reused",
+        item: {
+          id: "command-1",
+          type: "commandExecution",
+          command: "deno test",
+        },
+      },
+    });
+    assertEquals(firstProgress, ["\n$ deno test\n"]);
+
+    crashed.exit();
+    assertEquals(await first.completion, { status: "runtime_lost" });
+    await waitFor(() => runtime.ready && runtime.generation === 2, "restart");
+
+    const secondProgress: string[] = [];
+    const second = await runtime.startTurn(
+      "thread-reused",
+      "second",
+      (text) => secondProgress.push(text),
+    );
+    replacement.callbacks.onNotification?.({
+      method: "item/started",
+      params: {
+        threadId: "thread-reused",
+        turnId: "turn-reused",
+        item: {
+          id: "command-1",
+          type: "commandExecution",
+          command: "deno test",
+        },
+      },
+    });
+    assertEquals(secondProgress, ["\n$ deno test\n"]);
+    replacement.callbacks.onTurnCompleted?.({
+      threadId: "thread-reused",
+      turnId: "turn-reused",
+      status: "completed",
+      error: null,
+    });
+    await second.completion;
+    await runtime.stop();
+  });
+
   it("renders requestUserInput questions and options as readable Markdown", async () => {
     const factory = new FakeFactory();
     const client = new FakeClient();

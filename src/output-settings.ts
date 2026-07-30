@@ -17,6 +17,11 @@ export interface ProgressSettings {
   statusDetail: StatusDetail;
 }
 
+export const DEFAULT_PROGRESS_SETTINGS = {
+  intermediateOutput: "full",
+  statusDetail: "verbose",
+} as const satisfies ProgressSettings;
+
 export function shouldShowStatus(
   settings: ProgressSettings,
   level: "turn" | "verbose",

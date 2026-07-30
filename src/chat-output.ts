@@ -12,6 +12,11 @@ import {
   type StreamControllerOptions,
   WeComSink,
 } from "./output.ts";
+import {
+  DEFAULT_PROGRESS_SETTINGS,
+  type ProgressSettings,
+  shouldShowStatus,
+} from "./output-settings.ts";
 
 export interface WeComReplyGateway {
   reply(frame: unknown, body: Record<string, unknown>): Promise<boolean>;
@@ -26,6 +31,7 @@ export interface WeComReplyGateway {
 export interface WeComChatOutputOptions {
   gateway: WeComReplyGateway;
   secrets: Iterable<string>;
+  progressSettings?: ProgressSettings;
   onError?: (error: Error) => void;
   queue?: ConversationSendQueue;
   streamControllerOptions?: Pick<
@@ -38,6 +44,7 @@ export class WeComChatOutput implements ChatOutput {
   readonly #gateway: WeComReplyGateway;
   readonly #secrets: string[];
   readonly #onError?: (error: Error) => void;
+  readonly #progressSettings: ProgressSettings;
   readonly #streamControllerOptions: WeComChatOutputOptions[
     "streamControllerOptions"
   ];
@@ -49,6 +56,8 @@ export class WeComChatOutput implements ChatOutput {
     this.#gateway = options.gateway;
     this.#secrets = [...options.secrets];
     this.#onError = options.onError;
+    this.#progressSettings = options.progressSettings ??
+      DEFAULT_PROGRESS_SETTINGS;
     this.#queue = options.queue ?? new ConversationSendQueue();
     this.#streamControllerOptions = options.streamControllerOptions;
     this.#sink = new WeComSink({
@@ -144,7 +153,9 @@ export class WeComChatOutput implements ChatOutput {
         [...this.#active].map(async (controller) => {
           try {
             const finished = await controller.finish(
-              "\n[bot shutting down]\n",
+              shouldShowStatus(this.#progressSettings, "verbose")
+                ? "\n[bot shutting down]\n"
+                : "",
             );
             if (!finished) {
               throw new Error(

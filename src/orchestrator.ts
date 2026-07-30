@@ -1,4 +1,9 @@
 import { buildCodexPrompt } from "./prompt.ts";
+import {
+  DEFAULT_PROGRESS_SETTINGS,
+  type ProgressSettings,
+  shouldShowStatus,
+} from "./output-settings.ts";
 import type {
   ChatType,
   ConversationKey,
@@ -82,6 +87,7 @@ export interface ConversationOrchestratorOptions {
   codex: CodexPort;
   output: ChatOutput;
   workspace: string;
+  progressSettings?: ProgressSettings;
   onError?: (error: Error) => void;
   shutdownGraceMs?: number;
   interruptRetryDelaysMs?: readonly number[];
@@ -116,6 +122,7 @@ export class ConversationOrchestrator {
   readonly #codex: CodexPort;
   readonly #output: ChatOutput;
   readonly #workspace: string;
+  readonly #progressSettings: ProgressSettings;
   readonly #onError?: (error: Error) => void;
   readonly #shutdownGraceMs: number;
   readonly #interruptRetryDelaysMs: readonly number[];
@@ -128,6 +135,8 @@ export class ConversationOrchestrator {
     this.#codex = options.codex;
     this.#output = options.output;
     this.#workspace = options.workspace;
+    this.#progressSettings = options.progressSettings ??
+      DEFAULT_PROGRESS_SETTINGS;
     this.#onError = options.onError;
     this.#shutdownGraceMs = options.shutdownGraceMs ?? 30_000;
     this.#interruptRetryDelaysMs = options.interruptRetryDelaysMs ?? [
@@ -325,7 +334,9 @@ export class ConversationOrchestrator {
     if (this.#shuttingDown || slot.resetPending || slot.pending) return;
 
     const progress = await this.#output.startProgress(message);
-    progress.append("[queued] 已提交给 Codex\n");
+    if (shouldShowStatus(this.#progressSettings, "turn")) {
+      progress.append("[queued] 已提交给 Codex\n");
+    }
     const prompt = buildCodexPrompt({
       chatType: message.chatType,
       conversationKey: message.conversationKey,
@@ -390,7 +401,9 @@ export class ConversationOrchestrator {
     let progressAppendFailed = false;
     try {
       try {
-        progress.append(`[turn ${outcome.status}]\n`);
+        if (shouldShowStatus(this.#progressSettings, "turn")) {
+          progress.append(`[turn ${outcome.status}]\n`);
+        }
       } catch (error) {
         progressAppendFailed = true;
         progressAppendFailure = error;

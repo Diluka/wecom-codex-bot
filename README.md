@@ -18,10 +18,38 @@
 BOT_ID=your-bot-id
 BOT_SECRET=your-bot-secret
 CODEX_WORKSPACE=.
+CODEX_INTERMEDIATE_OUTPUT=full
+CODEX_STATUS_DETAIL=verbose
 ```
 
 `CODEX_WORKSPACE` 支持相对路径，按机器人项目目录解析。机器人只将解析后的 `cwd`
 传给 Codex；审批、沙盒、网络、模型等行为全部使用现有 Codex config。
+
+`CODEX_INTERMEDIATE_OUTPUT` 控制 Codex 的中间过程内容，默认 `full`：
+
+| 值                | 行为                                                                             |
+| ----------------- | -------------------------------------------------------------------------------- |
+| `full`            | 输出摘要、工具生命周期和工具结果。                                               |
+| `no_tool_results` | 保留摘要和工具生命周期，不输出命令、进程、文件及 MCP 的结果增量。                |
+| `merge_same_tool` | 同一 turn 内相同且并发执行的工具只显示一次启动；只在最后一个完成时显示完成状态。 |
+| `merge_all_tools` | 同一 turn 的任意工具聚合为一次 `[tools] running` 和一次 `[tools completed]`。    |
+| `none`            | 不输出普通中间过程。错误和警告仍会显示。                                         |
+
+相同工具的合并按活动调用计数，而不是简单布尔缓存：重复的启动会增加计数，只有对应的
+最后一次完成才会释放该工具。计数仅作用于一个 `threadId + turnId`，turn 结束、App
+Server 重启或机器人关闭时会清理。
+
+`CODEX_STATUS_DETAIL` 控制被动状态信息，默认 `verbose`：
+
+| 值        | 行为                                                               |
+| --------- | ------------------------------------------------------------------ |
+| `verbose` | 显示排队、turn 和工具的开始/完成状态；关闭机器人时也显示关闭状态。 |
+| `turn`    | 仅显示排队和 turn 的开始/完成状态。                                |
+| `none`    | 不显示被动状态信息。                                               |
+
+最终回答、直接失败、错误/警告、`/status`
+和需要用户输入的提示不会被这些设置隐藏。 当 `CODEX_INTERMEDIATE_OUTPUT=none`
+时，也不会显示被动状态信息。
 
 当前实验配置把 `.env` 放在 Codex 工作区内，因此 Codex 可以读取机器人
 Secret。发送到企业微信的内容会脱敏，但这不构成可靠的 Secret 隔离。
