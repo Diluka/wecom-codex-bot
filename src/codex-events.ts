@@ -86,7 +86,12 @@ function collaborationStatusUpdates(
       const status = protocolStatus
         ? COLLAB_AGENT_STATUSES[protocolStatus]
         : undefined;
-      if (agentThreadId && status) statuses.set(agentThreadId, status);
+      if (!agentThreadId) continue;
+      if (status) {
+        statuses.set(agentThreadId, status);
+      } else {
+        statuses.delete(agentThreadId);
+      }
     }
   }
 

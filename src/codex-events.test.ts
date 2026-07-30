@@ -281,6 +281,24 @@ describe("describeSubagentStatusUpdates", () => {
     );
   });
 
+  it("omits a receiver whose collaboration state is unknown", () => {
+    assertEquals(
+      describeSubagentStatusUpdates({
+        method: "item/started",
+        params: {
+          threadId: "parent-1",
+          turnId: "turn-1",
+          item: {
+            type: "collabAgentToolCall",
+            receiverThreadIds: ["child-1"],
+            agentsStates: { "child-1": { status: "unknown" } },
+          },
+        },
+      }),
+      [],
+    );
+  });
+
   it("maps collaboration agent states and omits unknown values", () => {
     const cases = [
       ["pendingInit", "starting"],
