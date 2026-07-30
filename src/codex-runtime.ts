@@ -95,6 +95,7 @@ export class CodexRuntime implements CodexPort {
   readonly #bufferedActivities = new Map<string, ActivityEvent[]>();
   readonly #bufferedOutcomes = new Map<string, TurnOutcome>();
   readonly #terminalTurnKeys = new Set<string>();
+  readonly #ambiguousSubagentTurnKeys = new Set<string>();
   readonly #startingThreads = new Map<string, Set<PendingTurnStart>>();
   readonly #connectingTokens = new Set<object>();
   readonly #earlyExits = new Map<object, AppServerProcessStatus>();
@@ -207,7 +208,9 @@ export class CodexRuntime implements CodexPort {
         throw new Error(`Codex turn is already active: ${threadId}/${turnId}`);
       }
 
-      this.#terminalTurnKeys.delete(key);
+      if (this.#terminalTurnKeys.delete(key)) {
+        this.#ambiguousSubagentTurnKeys.add(key);
+      }
       this.#activeTurns.set(key, { onActivity, resolve });
       const activities = this.#bufferedActivities.get(key) ?? [];
       this.#bufferedActivities.delete(key);
@@ -307,7 +310,10 @@ export class CodexRuntime implements CodexPort {
     update: SubagentStatusUpdate,
   ): void {
     const key = turnKey(parentThreadId, parentTurnId);
-    if (this.#terminalTurnKeys.has(key) || this.#bufferedOutcomes.has(key)) {
+    if (
+      this.#terminalTurnKeys.has(key) || this.#bufferedOutcomes.has(key) ||
+      this.#ambiguousSubagentTurnKeys.has(key)
+    ) {
       return;
     }
     const record = this.#subagentRecord(parentThreadId, update.agentThreadId);
@@ -331,6 +337,9 @@ export class CodexRuntime implements CodexPort {
     );
     if (
       !record?.parentTurnId || !record.status ||
+      this.#ambiguousSubagentTurnKeys.has(
+        turnKey(parentThreadId, record.parentTurnId),
+      ) ||
       record.lastEmittedStatus === record.status
     ) {
       return;
@@ -500,6 +509,7 @@ export class CodexRuntime implements CodexPort {
     if (!active) return;
     this.#activeTurns.delete(key);
     this.#terminalTurnKeys.add(key);
+    this.#ambiguousSubagentTurnKeys.delete(key);
     this.#clearBufferedTurn(key);
     this.#clearSubagentTurn(...turnIds(key));
     active.resolve(outcome);
@@ -508,6 +518,7 @@ export class CodexRuntime implements CodexPort {
   #resolveActiveTurnsAsLost(): void {
     for (const [key, active] of this.#activeTurns) {
       this.#terminalTurnKeys.add(key);
+      this.#ambiguousSubagentTurnKeys.delete(key);
       this.#clearBufferedTurn(key);
       this.#clearSubagentTurn(...turnIds(key));
       active.resolve({ status: "runtime_lost" });
@@ -519,6 +530,7 @@ export class CodexRuntime implements CodexPort {
     this.#bufferedActivities.clear();
     this.#bufferedOutcomes.clear();
     this.#terminalTurnKeys.clear();
+    this.#ambiguousSubagentTurnKeys.clear();
     this.#startingThreads.clear();
     this.#subagentsByParentThread.clear();
   }
@@ -713,11 +725,13 @@ function turnIds(key: string): [threadId: string, turnId: string] {
 }
 
 function subagentDisplayName(record: SubagentRecord): string | undefined {
-  const name = record.agentNickname ?? record.name ?? record.agentRole;
-  if (!name) return undefined;
-  return record.agentRole && name !== record.agentRole
-    ? `${name} (${record.agentRole})`
-    : name;
+  const primaryName = record.agentNickname ?? record.name;
+  if (primaryName) {
+    return record.agentRole
+      ? `${primaryName} (${record.agentRole})`
+      : primaryName;
+  }
+  return record.agentRole;
 }
 
 function isTerminalSubagentStatus(status: SubagentStatus): boolean {

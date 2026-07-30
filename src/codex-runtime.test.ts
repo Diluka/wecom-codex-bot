@@ -734,6 +734,63 @@ describe("CodexRuntime", () => {
     await runtime.stop();
   });
 
+  it("includes an equal-valued role when a child name is present", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    client.turnIds.push("turn-equal-name");
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const activities: ActivityEvent[] = [];
+    const handle = await runtime.startTurn(
+      "parent-equal-name",
+      "work",
+      (activity) => {
+        activities.push(activity);
+      },
+    );
+
+    client.callbacks.onNotification?.({
+      method: "item/started",
+      params: {
+        threadId: "parent-equal-name",
+        turnId: "turn-equal-name",
+        item: {
+          type: "collabAgentToolCall",
+          receiverThreadIds: ["child-equal-name"],
+        },
+      },
+    });
+    client.callbacks.onThreadStarted?.({
+      threadId: "child-equal-name",
+      parentThreadId: "parent-equal-name",
+      name: "reviewer",
+      agentRole: "reviewer",
+    });
+
+    assertEquals(
+      activities.filter((activity) => activity.tag === "SUBAGENT"),
+      [{
+        tag: "SUBAGENT",
+        body: "reviewer (reviewer)：已启动",
+        itemId: "child-equal-name",
+        threadId: "parent-equal-name",
+        turnId: "turn-equal-name",
+        delivery: "progress",
+      }],
+    );
+
+    client.callbacks.onTurnCompleted?.({
+      threadId: "parent-equal-name",
+      turnId: "turn-equal-name",
+      status: "completed",
+      error: null,
+    });
+    await handle.completion;
+    await runtime.stop();
+  });
+
   it("clears child metadata when its parent turn completes", async () => {
     const factory = new FakeFactory();
     const client = new FakeClient();
@@ -928,6 +985,67 @@ describe("CodexRuntime", () => {
     client.callbacks.onTurnCompleted?.({
       threadId: "parent-reused",
       turnId: "turn-reused",
+      status: "completed",
+      error: null,
+    });
+    await second.completion;
+    await runtime.stop();
+  });
+
+  it("suppresses ambiguous child status after a parent turn id is reused", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    client.turnIds.push("turn-reused-active", "turn-reused-active");
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const first = await runtime.startTurn(
+      "parent-reused-active",
+      "first",
+      () => {},
+    );
+    client.callbacks.onTurnCompleted?.({
+      threadId: "parent-reused-active",
+      turnId: "turn-reused-active",
+      status: "completed",
+      error: null,
+    });
+    await first.completion;
+
+    const activities: ActivityEvent[] = [];
+    const second = await runtime.startTurn(
+      "parent-reused-active",
+      "second",
+      (activity) => {
+        activities.push(activity);
+      },
+    );
+    client.callbacks.onNotification?.({
+      method: "item/started",
+      params: {
+        threadId: "parent-reused-active",
+        turnId: "turn-reused-active",
+        item: {
+          type: "collabAgentToolCall",
+          receiverThreadIds: ["child-reused-active"],
+        },
+      },
+    });
+    client.callbacks.onThreadStarted?.({
+      threadId: "child-reused-active",
+      parentThreadId: "parent-reused-active",
+      agentNickname: "old-child",
+    });
+
+    assertEquals(
+      activities.filter((activity) => activity.tag === "SUBAGENT"),
+      [],
+    );
+
+    client.callbacks.onTurnCompleted?.({
+      threadId: "parent-reused-active",
+      turnId: "turn-reused-active",
       status: "completed",
       error: null,
     });
