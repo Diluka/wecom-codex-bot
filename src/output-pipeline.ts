@@ -207,7 +207,7 @@ export class TurnOutputPipeline {
 
     if (state.emitted) {
       state.truncated = true;
-      return "...";
+      return null;
     }
 
     const first = lines[firstIndex].trim();

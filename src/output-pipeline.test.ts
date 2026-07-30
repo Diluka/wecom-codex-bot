@@ -240,7 +240,7 @@ describe("TurnOutputPipeline", () => {
     assertEquals(off.apply(progress({ tag: "CONTENT", body: "hidden" })), null);
   });
 
-  it("keeps one logical line per source stream and marks omitted later content once", () => {
+  it("keeps one logical line per source stream and marks inline omitted content", () => {
     const inlineBody = new TurnOutputPipeline(
       outputSettings({ levels: { TOOL_RESULT: "line" } }),
     );
@@ -257,34 +257,6 @@ describe("TurnOutputPipeline", () => {
         tag: "TOOL_RESULT",
         itemId: "inline",
         body: "third line",
-      })),
-      null,
-    );
-
-    const fragments = new TurnOutputPipeline(
-      outputSettings({ levels: { TOOL_RESULT: "line" } }),
-    );
-    assertEquals(
-      fragments.apply(progress({
-        tag: "TOOL_RESULT",
-        itemId: "fragments",
-        body: "first fragment",
-      })),
-      "[tool_result] first fragment",
-    );
-    assertEquals(
-      fragments.apply(progress({
-        tag: "TOOL_RESULT",
-        itemId: "fragments",
-        body: "later fragment",
-      })),
-      "[tool_result] ...",
-    );
-    assertEquals(
-      fragments.apply(progress({
-        tag: "TOOL_RESULT",
-        itemId: "fragments",
-        body: "suppressed fragment",
       })),
       null,
     );
