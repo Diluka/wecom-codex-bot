@@ -5,6 +5,20 @@ export interface CodexNotification {
   params?: Record<string, unknown>;
 }
 
+export type SubagentStatus =
+  | "starting"
+  | "working"
+  | "cancelled"
+  | "completed"
+  | "failed";
+
+export interface SubagentStatusUpdate {
+  threadId?: string;
+  turnId?: string;
+  agentThreadId: string;
+  status: SubagentStatus;
+}
+
 interface ToolIdentity {
   itemId?: string;
   toolId: string;
@@ -19,6 +33,86 @@ function record(value: unknown): Record<string, unknown> | null {
 
 function text(value: unknown): string | undefined {
   return typeof value === "string" && value ? value : undefined;
+}
+
+const COLLAB_AGENT_STATUSES: Readonly<Record<string, SubagentStatus>> = {
+  pendingInit: "starting",
+  running: "working",
+  completed: "completed",
+  errored: "failed",
+  notFound: "failed",
+  shutdown: "cancelled",
+};
+
+const SUBAGENT_ACTIVITY_STATUSES: Readonly<Record<string, SubagentStatus>> = {
+  started: "working",
+  interacted: "working",
+  interrupted: "cancelled",
+};
+
+function subagentStatusUpdate(
+  params: Record<string, unknown>,
+  agentThreadId: string,
+  status: SubagentStatus,
+): SubagentStatusUpdate {
+  const threadId = text(params.threadId);
+  const turnId = text(params.turnId);
+  return {
+    ...(threadId ? { threadId } : {}),
+    ...(turnId ? { turnId } : {}),
+    agentThreadId,
+    status,
+  };
+}
+
+function collaborationStatusUpdates(
+  params: Record<string, unknown>,
+  item: Record<string, unknown>,
+): SubagentStatusUpdate[] {
+  const statuses = new Map<string, SubagentStatus>();
+  const receiverThreadIds = Array.isArray(item.receiverThreadIds)
+    ? item.receiverThreadIds
+    : [];
+
+  for (const receiverThreadId of receiverThreadIds) {
+    const agentThreadId = text(receiverThreadId);
+    if (agentThreadId) statuses.set(agentThreadId, "starting");
+  }
+
+  const agentsStates = record(item.agentsStates);
+  if (agentsStates) {
+    for (const [agentThreadId, agentState] of Object.entries(agentsStates)) {
+      const protocolStatus = text(record(agentState)?.status);
+      const status = protocolStatus
+        ? COLLAB_AGENT_STATUSES[protocolStatus]
+        : undefined;
+      if (agentThreadId && status) statuses.set(agentThreadId, status);
+    }
+  }
+
+  return [...statuses].map(([agentThreadId, status]) =>
+    subagentStatusUpdate(params, agentThreadId, status)
+  );
+}
+
+export function describeSubagentStatusUpdates(
+  notification: CodexNotification,
+): SubagentStatusUpdate[] {
+  const params = notification.params;
+  const item = record(params?.item);
+  if (!params || !item) return [];
+
+  if (item.type === "collabAgentToolCall") {
+    return collaborationStatusUpdates(params, item);
+  }
+  if (item.type !== "subAgentActivity") return [];
+
+  const agentThreadId = text(item.agentThreadId);
+  const kind = text(item.kind);
+  const status = kind ? SUBAGENT_ACTIVITY_STATUSES[kind] : undefined;
+  return agentThreadId && status
+    ? [subagentStatusUpdate(params, agentThreadId, status)]
+    : [];
 }
 
 function status(value: unknown): string {
