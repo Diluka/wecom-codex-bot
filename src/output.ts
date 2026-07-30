@@ -210,7 +210,7 @@ export class ConversationSendQueue {
       this.#assertRegularOpen();
       return await this.#serialize(conversationKey, async () => {
         this.#assertRegularOpen();
-        return await operation();
+        return await this.#runRegularOperation(operation);
       });
     };
     const result = previous.then(run, run);
@@ -242,7 +242,7 @@ export class ConversationSendQueue {
     }
     return this.#serialize(conversationKey, async () => {
       if (this.#regularShutdown) return { accepted: false };
-      return { accepted: true, value: await operation() };
+      return await this.#runTryOperation(operation);
     });
   }
 
@@ -306,6 +306,54 @@ export class ConversationSendQueue {
     } catch (error) {
       if (signal.aborted) throw queueShutdownError();
       throw error;
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+    }
+  }
+
+  async #runRegularOperation<T>(
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const signal = this.#regularAbort.signal;
+    if (signal.aborted) throw queueShutdownError();
+
+    let rejectAborted: ((reason?: unknown) => void) | undefined;
+    const aborted = new Promise<never>((_resolve, reject) => {
+      rejectAborted = reject;
+    });
+    const onAbort = () => rejectAborted?.(queueShutdownError());
+    signal.addEventListener("abort", onAbort, { once: true });
+    try {
+      // Release the queue even if the underlying gateway reply cannot abort.
+      return await Promise.race([operation(), aborted]);
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+    }
+  }
+
+  async #runTryOperation<T>(
+    operation: () => Promise<T>,
+  ): Promise<QueueAttempt<T>> {
+    const signal = this.#regularAbort.signal;
+    if (signal.aborted) return { accepted: false };
+
+    let resolveAborted: (() => void) | undefined;
+    const aborted = new Promise<QueueAttempt<T>>((resolve) => {
+      resolveAborted = () => resolve({ accepted: false });
+    });
+    const onAbort = () => resolveAborted?.();
+    signal.addEventListener("abort", onAbort, { once: true });
+    try {
+      let result: Promise<QueueAttempt<T>>;
+      try {
+        result = Promise.resolve(operation()).then((value) => ({
+          accepted: true as const,
+          value,
+        }));
+      } catch (error) {
+        result = Promise.reject(error);
+      }
+      return await Promise.race([result, aborted]);
     } finally {
       signal.removeEventListener("abort", onAbort);
     }

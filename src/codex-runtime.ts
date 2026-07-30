@@ -7,17 +7,13 @@ import {
   type RequestUserInputEvent,
   type TurnCompletedEvent,
 } from "./codex-app-server.ts";
+import type { ActivityEvent } from "./activity-event.ts";
 import { describeCodexNotification } from "./codex-events.ts";
 import type {
   CodexPort,
   CodexTurnHandle,
   TurnOutcome,
 } from "./orchestrator.ts";
-import {
-  DEFAULT_PROGRESS_SETTINGS,
-  type ProgressSettings,
-} from "./output-settings.ts";
-import { TurnProgressPolicy } from "./progress-policy.ts";
 
 export interface CodexRuntimeClient {
   startThread(): Promise<string>;
@@ -35,7 +31,6 @@ type MaybePromise<T> = T | Promise<T>;
 
 export interface CodexRuntimeOptions {
   workspace: string;
-  progressSettings?: ProgressSettings;
   clientFactory?: CodexRuntimeClientFactory;
   delay?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   onFatal?: (error: Error) => MaybePromise<void>;
@@ -43,8 +38,12 @@ export interface CodexRuntimeOptions {
 }
 
 interface ActiveTurn {
-  onProgress: (text: string) => void;
+  onActivity: (event: ActivityEvent) => void | Promise<void>;
   resolve: (outcome: TurnOutcome) => void;
+}
+
+interface PendingTurnStart {
+  readonly generation: number;
 }
 
 const RESTART_DELAYS = [1_000, 2_000, 4_000, 8_000, 16_000] as const;
@@ -76,11 +75,11 @@ export class CodexRuntime implements CodexPort {
   ) => Promise<void>;
   readonly #onFatal?: (error: Error) => MaybePromise<void>;
   readonly #onDiagnostic?: (message: string) => MaybePromise<void>;
-  readonly #progressSettings: ProgressSettings;
   readonly #activeTurns = new Map<string, ActiveTurn>();
-  readonly #bufferedProgress = new Map<string, string[]>();
+  readonly #bufferedActivities = new Map<string, ActivityEvent[]>();
   readonly #bufferedOutcomes = new Map<string, TurnOutcome>();
-  readonly #progressPolicies = new Map<string, TurnProgressPolicy>();
+  readonly #terminalTurnKeys = new Set<string>();
+  readonly #startingThreads = new Map<string, Set<PendingTurnStart>>();
   readonly #connectingTokens = new Set<object>();
   readonly #earlyExits = new Map<object, AppServerProcessStatus>();
 
@@ -101,8 +100,6 @@ export class CodexRuntime implements CodexPort {
     this.#delay = options.delay ?? defaultDelay;
     this.#onFatal = options.onFatal;
     this.#onDiagnostic = options.onDiagnostic;
-    this.#progressSettings = options.progressSettings ??
-      DEFAULT_PROGRESS_SETTINGS;
   }
 
   get ready(): boolean {
@@ -166,39 +163,47 @@ export class CodexRuntime implements CodexPort {
   async startTurn(
     threadId: string,
     prompt: string,
-    onProgress: (text: string) => void,
+    onActivity: (event: ActivityEvent) => void | Promise<void>,
   ): Promise<CodexTurnHandle> {
     const client = this.#requireClient();
     const clientToken = this.#clientToken;
-    const turnId = await client.startTurn(threadId, prompt);
-    const { promise: completion, resolve } = Promise.withResolvers<
-      TurnOutcome
-    >();
-    const key = turnKey(threadId, turnId);
+    const pendingStart = this.#startPendingTurn(threadId);
+    try {
+      const turnId = await client.startTurn(threadId, prompt);
+      const { promise: completion, resolve } = Promise.withResolvers<
+        TurnOutcome
+      >();
+      const key = turnKey(threadId, turnId);
 
-    if (
-      !this.#ready || client !== this.#client ||
-      clientToken !== this.#clientToken
-    ) {
-      this.#clearProgressPolicy(key);
-      resolve({ status: "runtime_lost" });
+      if (
+        !this.#ready || client !== this.#client ||
+        clientToken !== this.#clientToken
+      ) {
+        // Exit and stop already clear the old generation's buffers.
+        resolve({ status: "runtime_lost" });
+        return { turnId, completion };
+      }
+      if (this.#activeTurns.has(key)) {
+        throw new Error(`Codex turn is already active: ${threadId}/${turnId}`);
+      }
+
+      this.#terminalTurnKeys.delete(key);
+      this.#activeTurns.set(key, { onActivity, resolve });
+      const activities = this.#bufferedActivities.get(key) ?? [];
+      this.#bufferedActivities.delete(key);
+      for (const activity of activities) {
+        this.#deliverActivity(onActivity, activity);
+      }
+
+      const outcome = this.#bufferedOutcomes.get(key);
+      if (outcome) {
+        this.#bufferedOutcomes.delete(key);
+        this.#completeTurn(key, outcome);
+      }
       return { turnId, completion };
+    } finally {
+      this.#finishPendingTurn(threadId, pendingStart);
     }
-    if (this.#activeTurns.has(key)) {
-      throw new Error(`Codex turn is already active: ${threadId}/${turnId}`);
-    }
-
-    this.#activeTurns.set(key, { onProgress, resolve });
-    const progress = this.#bufferedProgress.get(key) ?? [];
-    this.#bufferedProgress.delete(key);
-    for (const text of progress) this.#deliverProgress(onProgress, text);
-
-    const outcome = this.#bufferedOutcomes.get(key);
-    if (outcome) {
-      this.#bufferedOutcomes.delete(key);
-      this.#completeTurn(key, outcome);
-    }
-    return { turnId, completion };
   }
 
   async interruptTurn(threadId: string, turnId: string): Promise<void> {
@@ -255,13 +260,10 @@ export class CodexRuntime implements CodexPort {
     if (token !== this.#clientToken) return;
     const ids = notificationIds(event.params);
     if (!ids) return;
-    const progressEvent = describeCodexNotification(event);
-    if (!progressEvent) return;
-    const rendered = this.#progressPolicy(
-      turnKey(ids.threadId, ids.turnId),
-    ).apply(progressEvent);
-    if (rendered === null) return;
-    this.#routeProgress(ids.threadId, ids.turnId, rendered);
+    const activity = describeCodexNotification(event);
+    // Terminal TURN output is owned by the orchestrator and TurnOutcome.
+    if (!activity || activity.tag === "TURN") return;
+    this.#routeActivity(ids.threadId, ids.turnId, activity);
   }
 
   #handleTurnCompleted(token: object, event: TurnCompletedEvent): void {
@@ -274,20 +276,20 @@ export class CodexRuntime implements CodexPort {
       error: errorMessageOrNull(event.error),
     };
     const key = turnKey(event.threadId, event.turnId);
-    this.#clearProgressPolicy(key);
     if (this.#activeTurns.has(key)) {
       this.#completeTurn(key, outcome);
-    } else {
+    } else if (this.#isPendingTurn(event.threadId)) {
+      this.#terminalTurnKeys.add(key);
       this.#bufferedOutcomes.set(key, outcome);
     }
   }
 
   #handleRequestUserInput(token: object, event: RequestUserInputEvent): void {
     if (token !== this.#clientToken) return;
-    this.#routeProgress(
+    this.#routeActivity(
       event.threadId,
       event.turnId,
-      renderRequestUserInput(event.questions),
+      requestUserInputActivity(event),
     );
   }
 
@@ -366,24 +368,42 @@ export class CodexRuntime implements CodexPort {
     await this.#fatal(lastError);
   }
 
-  #routeProgress(threadId: string, turnId: string, text: string): void {
+  #routeActivity(
+    threadId: string,
+    turnId: string,
+    activity: ActivityEvent,
+  ): void {
     const key = turnKey(threadId, turnId);
+    if (this.#terminalTurnKeys.has(key)) return;
+    // A terminal event observed before startTurn resolves is also terminal.
+    if (this.#bufferedOutcomes.has(key)) return;
     const active = this.#activeTurns.get(key);
     if (active) {
-      this.#deliverProgress(active.onProgress, text);
+      this.#deliverActivity(active.onActivity, activity);
       return;
     }
-    const buffered = this.#bufferedProgress.get(key) ?? [];
-    buffered.push(text);
-    this.#bufferedProgress.set(key, buffered);
+    if (!this.#isPendingTurn(threadId)) return;
+    const buffered = this.#bufferedActivities.get(key) ?? [];
+    buffered.push(activity);
+    this.#bufferedActivities.set(key, buffered);
   }
 
-  #deliverProgress(onProgress: (text: string) => void, text: string): void {
+  #deliverActivity(
+    onActivity: (event: ActivityEvent) => void | Promise<void>,
+    activity: ActivityEvent,
+  ): void {
     try {
-      onProgress(text);
+      const result = onActivity(activity);
+      if (isPromiseLike(result)) {
+        void Promise.resolve(result).catch((error) => {
+          this.#diagnostic(
+            `Codex activity callback failed: ${errorMessage(error)}\n`,
+          );
+        });
+      }
     } catch (error) {
       this.#diagnostic(
-        `Codex progress callback failed: ${errorMessage(error)}\n`,
+        `Codex activity callback failed: ${errorMessage(error)}\n`,
       );
     }
   }
@@ -392,37 +412,69 @@ export class CodexRuntime implements CodexPort {
     const active = this.#activeTurns.get(key);
     if (!active) return;
     this.#activeTurns.delete(key);
-    this.#clearProgressPolicy(key);
+    this.#terminalTurnKeys.add(key);
+    this.#clearBufferedTurn(key);
     active.resolve(outcome);
   }
 
   #resolveActiveTurnsAsLost(): void {
     for (const [key, active] of this.#activeTurns) {
-      this.#clearProgressPolicy(key);
+      this.#terminalTurnKeys.add(key);
+      this.#clearBufferedTurn(key);
       active.resolve({ status: "runtime_lost" });
     }
     this.#activeTurns.clear();
   }
 
   #clearBufferedEvents(): void {
-    this.#bufferedProgress.clear();
+    this.#bufferedActivities.clear();
     this.#bufferedOutcomes.clear();
-    this.#progressPolicies.clear();
+    this.#terminalTurnKeys.clear();
+    this.#startingThreads.clear();
   }
 
-  #progressPolicy(key: string): TurnProgressPolicy {
-    let policy = this.#progressPolicies.get(key);
-    if (!policy) {
-      policy = new TurnProgressPolicy(this.#progressSettings);
-      this.#progressPolicies.set(key, policy);
+  #startPendingTurn(threadId: string): PendingTurnStart {
+    const pendingStart = { generation: this.#generation };
+    const pendingStarts = this.#startingThreads.get(threadId) ?? new Set();
+    pendingStarts.add(pendingStart);
+    this.#startingThreads.set(threadId, pendingStarts);
+    return pendingStart;
+  }
+
+  #finishPendingTurn(
+    threadId: string,
+    pendingStart: PendingTurnStart,
+  ): void {
+    const pendingStarts = this.#startingThreads.get(threadId);
+    if (!pendingStarts?.delete(pendingStart) || pendingStarts.size > 0) return;
+    this.#startingThreads.delete(threadId);
+    if (pendingStart.generation === this.#generation) {
+      this.#clearBufferedThread(threadId);
     }
-    return policy;
   }
 
-  #clearProgressPolicy(key: string): void {
-    const policy = this.#progressPolicies.get(key);
-    policy?.clear();
-    this.#progressPolicies.delete(key);
+  #isPendingTurn(threadId: string): boolean {
+    const pendingStarts = this.#startingThreads.get(threadId);
+    if (!pendingStarts) return false;
+    for (const pendingStart of pendingStarts) {
+      if (pendingStart.generation === this.#generation) return true;
+    }
+    return false;
+  }
+
+  #clearBufferedTurn(key: string): void {
+    this.#bufferedActivities.delete(key);
+    this.#bufferedOutcomes.delete(key);
+  }
+
+  #clearBufferedThread(threadId: string): void {
+    const prefix = `${threadId}\u0000`;
+    for (const key of this.#bufferedActivities.keys()) {
+      if (key.startsWith(prefix)) this.#bufferedActivities.delete(key);
+    }
+    for (const key of this.#bufferedOutcomes.keys()) {
+      if (key.startsWith(prefix)) this.#bufferedOutcomes.delete(key);
+    }
   }
 
   #requireClient(): CodexRuntimeClient {
@@ -463,10 +515,21 @@ function notificationIds(
   return threadId && turnId ? { threadId, turnId } : null;
 }
 
+function requestUserInputActivity(event: RequestUserInputEvent): ActivityEvent {
+  return {
+    tag: "CONTENT",
+    body: renderRequestUserInput(event.questions),
+    threadId: event.threadId,
+    turnId: event.turnId,
+    ...(event.itemId ? { itemId: event.itemId } : {}),
+    delivery: "direct",
+  };
+}
+
 function renderRequestUserInput(questions: readonly unknown[]): string {
-  const lines = ["\n[Codex 需要用户输入]"];
+  const lines = ["Codex 需要用户输入"];
   if (questions.length === 0) {
-    lines.push("", "Codex 请求补充信息。", "", "请直接发送下一条文本继续。\n");
+    lines.push("", "Codex 请求补充信息。", "", "请直接发送下一条文本继续。");
     return lines.join("\n");
   }
 
@@ -478,18 +541,23 @@ function renderRequestUserInput(questions: readonly unknown[]): string {
     lines.push("", `### ${header}`, "", prompt);
 
     if (Array.isArray(question.options)) {
+      let hasOption = false;
       for (const rawOption of question.options) {
         const option = record(rawOption);
         const label = optionalString(option?.label);
         if (!label) continue;
         const description = optionalString(option?.description);
+        if (!hasOption) {
+          lines.push("");
+          hasOption = true;
+        }
         lines.push(
           description ? `- **${label}**：${description}` : `- **${label}**`,
         );
       }
     }
   });
-  lines.push("", "请直接发送下一条文本继续。\n");
+  lines.push("", "请直接发送下一条文本继续。");
   return lines.join("\n");
 }
 
@@ -522,6 +590,12 @@ function errorMessageOrNull(error: unknown): string | null {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return value !== null &&
+    (typeof value === "object" || typeof value === "function") &&
+    typeof (value as PromiseLike<unknown>).then === "function";
 }
 
 function toError(error: unknown): Error {

@@ -3,22 +3,16 @@ import { WeComChatOutput } from "./src/chat-output.ts";
 import { CodexRuntime } from "./src/codex-runtime.ts";
 import { loadConfig } from "./src/config.ts";
 import { BotLifecycle } from "./src/lifecycle.ts";
+import { logTerminal } from "./src/log.ts";
 import { ConversationOrchestrator } from "./src/orchestrator.ts";
-import { redactSecrets } from "./src/output.ts";
 import { StateStore } from "./src/state.ts";
 import { WeComGateway } from "./src/wecom.ts";
 
 const config = await loadConfig();
 await Deno.mkdir(dirname(config.stateDbPath), { recursive: true });
-const progressSettings = {
-  intermediateOutput: config.intermediateOutput,
-  statusDetail: config.statusDetail,
-} as const;
 
 const safeLog = (level: "info" | "error", value: unknown): void => {
-  const message = redactSecrets(errorMessage(value), [config.botSecret]);
-  const logger = level === "error" ? console.error : console.log;
-  logger(`[wecom-codex-bot] ${message}`);
+  logTerminal(level, value, [config.botSecret]);
 };
 
 const state = new StateStore(config.stateDbPath);
@@ -49,7 +43,6 @@ const shutdown = (code: number, reason?: unknown): Promise<void> => {
 
 const runtime = new CodexRuntime({
   workspace: config.workspace,
-  progressSettings,
   onDiagnostic: (message) => safeLog("info", message.trimEnd()),
   onFatal: (error) => shutdown(1, error),
 });
@@ -72,7 +65,6 @@ const gateway = new WeComGateway({
 const output = new WeComChatOutput({
   gateway,
   secrets: [config.botSecret],
-  progressSettings,
   onError: (error) => safeLog("error", error),
 });
 
@@ -81,7 +73,7 @@ const orchestrator = new ConversationOrchestrator({
   codex: runtime,
   output,
   workspace: config.workspace,
-  progressSettings,
+  outputSettings: config.outputSettings,
   onError: (error) => safeLog("error", error),
 });
 context.orchestrator = orchestrator;
@@ -111,9 +103,4 @@ try {
   );
 } catch (error) {
   await shutdown(1, error);
-}
-
-function errorMessage(value: unknown): string {
-  if (value instanceof Error) return value.stack ?? value.message;
-  return String(value);
 }

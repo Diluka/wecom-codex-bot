@@ -289,39 +289,33 @@ describe("WeComChatOutput", () => {
     assertEquals(gateway.replies.length, 0);
   });
 
-  it("only appends the shutdown status at verbose detail", async () => {
-    const verboseGateway = new FakeGateway();
-    const verboseOutput = new WeComChatOutput({
-      gateway: verboseGateway,
-      secrets: [],
-      progressSettings: {
-        intermediateOutput: "full",
-        statusDetail: "verbose",
-      },
-    });
-    const verboseProgress = await verboseOutput.startProgress(
-      message("verbose"),
-    );
-    verboseProgress.append("working");
-    await verboseOutput.finishAll();
-    assertEquals(
-      verboseGateway.streams[0].content,
-      "working\n[bot shutting down]\n",
-    );
+  it("does not reawait a detached in-flight progress finish", async () => {
+    const gate = Promise.withResolvers<void>();
+    const gateway = new FakeGateway();
+    gateway.streamGate = gate.promise;
+    const output = new WeComChatOutput({ gateway, secrets: [] });
+    const progress = await output.startProgress(message());
+    progress.append("working");
+    const finishing = progress.finish();
+    await drainMicrotasks();
+    assertEquals(gateway.streams.length, 1);
 
-    const turnGateway = new FakeGateway();
-    const turnOutput = new WeComChatOutput({
-      gateway: turnGateway,
-      secrets: [],
-      progressSettings: {
-        intermediateOutput: "full",
-        statusDetail: "turn",
-      },
-    });
-    const turnProgress = await turnOutput.startProgress(message("turn"));
-    turnProgress.append("working");
-    await turnOutput.finishAll();
-    assertEquals(turnGateway.streams[0].content, "working");
+    progress.detach();
+    await output.finishAll();
+
+    gate.resolve();
+    await finishing;
+  });
+
+  it("does not append a transport-owned shutdown status", async () => {
+    const gateway = new FakeGateway();
+    const output = new WeComChatOutput({ gateway, secrets: [] });
+    const progress = await output.startProgress(message());
+    progress.append("working");
+
+    await output.finishAll();
+
+    assertEquals(gateway.streams[0].content, "working");
   });
 });
 

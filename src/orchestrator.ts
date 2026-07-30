@@ -1,8 +1,9 @@
+import type { ActivityEvent } from "./activity-event.ts";
+import { TurnOutputPipeline } from "./output-pipeline.ts";
 import { buildCodexPrompt } from "./prompt.ts";
 import {
-  DEFAULT_PROGRESS_SETTINGS,
-  type ProgressSettings,
-  shouldShowStatus,
+  DEFAULT_OUTPUT_SETTINGS,
+  type OutputSettings,
 } from "./output-settings.ts";
 import type {
   ChatType,
@@ -67,7 +68,7 @@ export interface CodexPort {
   startTurn(
     threadId: string,
     prompt: string,
-    onProgress: (text: string) => void,
+    onActivity: (event: ActivityEvent) => void | Promise<void>,
   ): Promise<CodexTurnHandle>;
   interruptTurn(threadId: string, turnId: string): Promise<void>;
 }
@@ -75,6 +76,7 @@ export interface CodexPort {
 export interface ProgressHandle {
   append(text: string): void;
   finish(): Promise<void>;
+  detach(): void;
 }
 
 export interface ChatOutput {
@@ -87,23 +89,51 @@ export interface ConversationOrchestratorOptions {
   codex: CodexPort;
   output: ChatOutput;
   workspace: string;
-  progressSettings?: ProgressSettings;
+  outputSettings?: OutputSettings;
   onError?: (error: Error) => void;
   shutdownGraceMs?: number;
   interruptRetryDelaysMs?: readonly number[];
 }
 
+interface TurnControl {
+  forceComplete: (outcome: TurnOutcome) => void;
+  forceSignal: Promise<TurnOutcome>;
+  forced: boolean;
+}
+
+type ForceRaceResult<T> =
+  | { type: "value"; value: T }
+  | { type: "error"; error: unknown }
+  | { type: "forced" };
+
 interface ActiveTurn {
   threadId: string;
-  turnId: string;
+  turnId?: string;
+  turnOutput: TurnOutput;
+  control: TurnControl;
+  shutdownRequested: boolean;
+  interruptWhenReady: boolean;
+  lateInterruptRequested: boolean;
+}
+
+interface TurnOutput {
+  message: RoutedText;
   progress: ProgressHandle;
-  forceComplete: (outcome: TurnOutcome) => void;
+  progressWritten: boolean;
+  progressEndsWithLineBreak: boolean;
+  pipeline: TurnOutputPipeline;
+  activityTail: Promise<void>;
+  acceptingActivities: boolean;
+  finished: boolean;
+  shutdownActivity?: ActivityEvent;
+  shutdownHandled: boolean;
 }
 
 interface ConversationSlot {
   pending?: RoutedText;
   resetPending?: RoutedText;
   active?: ActiveTurn;
+  control?: TurnControl;
   interruptRequested: boolean;
   interruptFailures: number;
   interruptRetryTimer?: ReturnType<typeof setTimeout>;
@@ -122,7 +152,7 @@ export class ConversationOrchestrator {
   readonly #codex: CodexPort;
   readonly #output: ChatOutput;
   readonly #workspace: string;
-  readonly #progressSettings: ProgressSettings;
+  readonly #outputSettings: OutputSettings;
   readonly #onError?: (error: Error) => void;
   readonly #shutdownGraceMs: number;
   readonly #interruptRetryDelaysMs: readonly number[];
@@ -135,8 +165,7 @@ export class ConversationOrchestrator {
     this.#codex = options.codex;
     this.#output = options.output;
     this.#workspace = options.workspace;
-    this.#progressSettings = options.progressSettings ??
-      DEFAULT_PROGRESS_SETTINGS;
+    this.#outputSettings = options.outputSettings ?? DEFAULT_OUTPUT_SETTINGS;
     this.#onError = options.onError;
     this.#shutdownGraceMs = options.shutdownGraceMs ?? 30_000;
     this.#interruptRetryDelaysMs = options.interruptRetryDelaysMs ?? [
@@ -224,10 +253,8 @@ export class ConversationOrchestrator {
       slot.pending = undefined;
       slot.resetPending = undefined;
       if (slot.drain) drains.push(slot.drain);
-      if (!slot.active || slot.interruptRequested) continue;
-      slot.interruptRequested = true;
-      void this.#codex.interruptTurn(slot.active.threadId, slot.active.turnId)
-        .catch(() => {});
+      if (!slot.active) continue;
+      this.#requestShutdown(slot);
     }
     if (drains.length === 0) return;
 
@@ -243,7 +270,7 @@ export class ConversationOrchestrator {
     if (drained) return;
 
     for (const slot of this.#slots.values()) {
-      slot.active?.forceComplete({
+      slot.control?.forceComplete({
         status: "runtime_lost",
         error: "shutdown grace period expired",
       });
@@ -268,21 +295,28 @@ export class ConversationOrchestrator {
       if (slot.resetPending) {
         const request = slot.resetPending;
         slot.resetPending = undefined;
+        const control = this.#createTurnControl();
+        slot.control = control;
         try {
-          await this.#resetConversation(request);
+          await this.#resetConversation(request, control);
         } catch {
           // Output failures must not strand already-claimed pending work.
+        } finally {
+          if (slot.control === control) slot.control = undefined;
         }
         continue;
       }
 
       const message = slot.pending!;
       slot.pending = undefined;
+      const control = this.#createTurnControl();
+      slot.control = control;
       try {
-        await this.#runTurn(message, slot);
+        await this.#runTurn(message, slot, control);
       } catch (error) {
         try {
-          await this.#output.send(
+          await this.#sendWithForce(
+            control,
             message,
             `任务启动失败：${errorMessage(error)}`,
             true,
@@ -290,26 +324,29 @@ export class ConversationOrchestrator {
         } catch {
           // Continue draining newer work when the fallback cannot be sent.
         }
+      } finally {
+        if (slot.active?.control === control) {
+          this.#clearActive(slot, slot.active);
+        }
+        if (slot.control === control) slot.control = undefined;
       }
     }
 
-    if (!slot.active && !slot.pending && !slot.resetPending) {
+    if (!slot.active && !slot.control && !slot.pending && !slot.resetPending) {
       this.#slots.delete(conversationKey);
     }
   }
 
-  async #resetConversation(message: RoutedText): Promise<void> {
-    let threadId: string;
+  async #resetConversation(
+    message: RoutedText,
+    control: TurnControl,
+  ): Promise<void> {
     try {
-      threadId = await this.#codex.startThread();
-      this.#state.bindConversation(
-        message.conversationKey,
-        message.chatType,
-        threadId,
-      );
-      this.#loadedThreads.set(threadId, this.#codex.generation);
+      const started = await this.#startAndBindThread(message, control);
+      if (started === undefined) return;
     } catch (error) {
-      await this.#output.send(
+      await this.#sendWithForce(
+        control,
         message,
         `新建 Codex 会话失败：${errorMessage(error)}`,
         true,
@@ -317,7 +354,8 @@ export class ConversationOrchestrator {
       return;
     }
 
-    await this.#output.send(
+    await this.#sendWithForce(
+      control,
       message,
       `已新建 Codex 会话。\n\n工作目录：\`${this.#workspace}\``,
     );
@@ -326,16 +364,26 @@ export class ConversationOrchestrator {
   async #runTurn(
     message: RoutedText,
     slot: ConversationSlot,
+    control: TurnControl,
   ): Promise<void> {
-    const threadId = await this.#ensureThread(message);
+    const threadId = await this.#ensureThread(message, control);
+    if (threadId === undefined) return;
 
     // A newer message that arrived while loading the thread wins before any
     // model work is started.
     if (this.#shuttingDown || slot.resetPending || slot.pending) return;
 
     const progress = await this.#output.startProgress(message);
-    if (shouldShowStatus(this.#progressSettings, "turn")) {
-      progress.append("[queued] 已提交给 Codex\n");
+    const turnOutput = this.#createTurnOutput(message, progress);
+    try {
+      await this.#enqueueActivity(turnOutput, {
+        tag: "QUEUE",
+        body: "已提交给 Codex",
+        delivery: "progress",
+      }, control);
+    } catch (error) {
+      await this.#finishTurnOutput(turnOutput, undefined, control);
+      throw error;
     }
     const prompt = buildCodexPrompt({
       chatType: message.chatType,
@@ -345,45 +393,118 @@ export class ConversationOrchestrator {
       content: message.text,
     });
 
-    let handle: CodexTurnHandle;
-    try {
-      handle = await this.#codex.startTurn(
-        threadId,
-        prompt,
-        (text) => progress.append(text),
-      );
-    } catch (error) {
-      progress.append(`[failed] ${errorMessage(error)}\n`);
-      await progress.finish();
-      throw error;
-    }
-
-    const forced = Promise.withResolvers<TurnOutcome>();
-    slot.active = {
+    const active: ActiveTurn = {
       threadId,
-      turnId: handle.turnId,
-      progress,
-      forceComplete: forced.resolve,
+      turnOutput,
+      control,
+      shutdownRequested: false,
+      interruptWhenReady: false,
+      lateInterruptRequested: false,
     };
+    slot.active = active;
     slot.interruptRequested = false;
     slot.interruptFailures = 0;
+    if (this.#shuttingDown) {
+      this.#requestShutdown(slot);
+      control.forceComplete({
+        status: "runtime_lost",
+        error: "shutdown began before turn started",
+      });
+    }
+
+    let start: Promise<CodexTurnHandle>;
     try {
+      start = this.#codex.startTurn(
+        threadId,
+        prompt,
+        (activity) => this.#enqueueActivity(turnOutput, activity, control),
+      );
+    } catch (error) {
+      start = Promise.reject(error);
+    }
+
+    const startResult = await Promise.race([
+      start.then(
+        (handle) => ({ type: "handle" as const, handle }),
+        (error) => ({ type: "error" as const, error }),
+      ),
+      control.forceSignal.then((outcome) => ({
+        type: "forced" as const,
+        outcome,
+      })),
+    ]);
+    if (startResult.type === "forced") {
+      this.#observeLateStart(active, start);
+      try {
+        await this.#finishTurnOutput(turnOutput, {
+          tag: "TURN",
+          body: startResult.outcome.status,
+          delivery: "progress",
+        }, control);
+      } finally {
+        this.#clearActive(slot, active);
+      }
+      return;
+    }
+
+    if (startResult.type === "error") {
+      try {
+        await this.#finishTurnOutput(turnOutput, undefined, control);
+      } finally {
+        this.#clearActive(slot, active);
+      }
+      throw startResult.error;
+    }
+
+    const handle = startResult.handle;
+
+    active.turnId = handle.turnId;
+    if (active.interruptWhenReady) this.#requestInterrupt(slot);
+    if (control.forced) {
+      void handle.completion.catch(() => undefined);
+      const forcedOutcome = await control.forceSignal;
+      try {
+        await this.#finishTurnOutput(turnOutput, {
+          tag: "TURN",
+          body: forcedOutcome.status,
+          delivery: "progress",
+        }, control);
+      } finally {
+        this.#clearActive(slot, active);
+      }
+      return;
+    }
+    try {
+      if (!active.shutdownRequested) {
+        await this.#enqueueActivity(turnOutput, {
+          tag: "TURN",
+          body: "started",
+          delivery: "progress",
+        }, control);
+      }
       this.#state.beginTurn(message.conversationKey, handle.turnId);
     } catch (error) {
       this.#requestInterrupt(slot);
+      let interruptedOutcome: TurnOutcome;
       try {
-        await Promise.race([handle.completion, forced.promise]);
-      } catch {
-        // Rejection also means the old turn can no longer run concurrently.
+        interruptedOutcome = await Promise.race([
+          handle.completion,
+          control.forceSignal,
+        ]);
+      } catch (completionError) {
+        interruptedOutcome = {
+          status: "failed",
+          error: errorMessage(completionError),
+        };
       }
       try {
-        progress.append(`[failed] ${errorMessage(error)}\n`);
-        await progress.finish();
+        await this.#finishTurnOutput(turnOutput, {
+          tag: "TURN",
+          body: interruptedOutcome.status,
+          delivery: "progress",
+        }, control);
       } finally {
-        this.#clearInterruptRetry(slot);
-        slot.active = undefined;
-        slot.interruptRequested = false;
-        slot.interruptFailures = 0;
+        this.#clearActive(slot, active);
       }
       void handle.completion.catch(() => undefined);
       throw error;
@@ -392,29 +513,17 @@ export class ConversationOrchestrator {
 
     let outcome: TurnOutcome;
     try {
-      outcome = await Promise.race([handle.completion, forced.promise]);
+      outcome = await Promise.race([handle.completion, control.forceSignal]);
     } catch (error) {
       outcome = { status: "failed", error: errorMessage(error) };
     }
 
-    let progressAppendFailure: unknown;
-    let progressAppendFailed = false;
     try {
-      try {
-        if (shouldShowStatus(this.#progressSettings, "turn")) {
-          progress.append(`[turn ${outcome.status}]\n`);
-        }
-      } catch (error) {
-        progressAppendFailed = true;
-        progressAppendFailure = error;
-      }
-      if (!progressAppendFailed) {
-        try {
-          await progress.finish();
-        } catch {
-          // Progress finish failures are already reported by ChatOutput.
-        }
-      }
+      await this.#finishTurnOutput(turnOutput, {
+        tag: "TURN",
+        body: outcome.status,
+        delivery: "progress",
+      }, control);
       try {
         this.#state.finishTurn(
           message.conversationKey,
@@ -426,23 +535,20 @@ export class ConversationOrchestrator {
         this.#report(error);
       }
     } finally {
-      this.#clearInterruptRetry(slot);
-      slot.active = undefined;
-      slot.interruptRequested = false;
-      slot.interruptFailures = 0;
+      this.#clearActive(slot, active);
     }
-    if (progressAppendFailed) throw progressAppendFailure;
 
     const superseded = Boolean(slot.resetPending || slot.pending);
     if (
       outcome.status === "completed" && outcome.finalAnswer && !superseded &&
       !this.#shuttingDown
     ) {
-      await this.#output.send(message, outcome.finalAnswer, true);
+      await this.#sendWithForce(control, message, outcome.finalAnswer, true);
     } else if (
       outcome.status === "failed" && !superseded && !this.#shuttingDown
     ) {
-      await this.#output.send(
+      await this.#sendWithForce(
+        control,
         message,
         `Codex 执行失败：${outcome.error ?? "unknown error"}`,
         true,
@@ -450,42 +556,320 @@ export class ConversationOrchestrator {
     }
   }
 
-  async #ensureThread(message: RoutedText): Promise<string> {
+  #createTurnOutput(
+    message: RoutedText,
+    progress: ProgressHandle,
+  ): TurnOutput {
+    return {
+      message,
+      progress,
+      progressWritten: false,
+      progressEndsWithLineBreak: false,
+      pipeline: new TurnOutputPipeline(this.#outputSettings),
+      activityTail: Promise.resolve(),
+      acceptingActivities: true,
+      finished: false,
+      shutdownHandled: false,
+    };
+  }
+
+  #createTurnControl(): TurnControl {
+    const forced = Promise.withResolvers<TurnOutcome>();
+    const control: TurnControl = {
+      forceComplete: () => {},
+      forceSignal: forced.promise,
+      forced: false,
+    };
+    control.forceComplete = (outcome) => {
+      if (control.forced) return;
+      control.forced = true;
+      forced.resolve(outcome);
+    };
+    return control;
+  }
+
+  async #raceWithForce<T>(
+    operation: () => Promise<T>,
+    control: TurnControl,
+  ): Promise<ForceRaceResult<T>> {
+    let pending: Promise<T>;
+    try {
+      pending = Promise.resolve(operation());
+    } catch (error) {
+      pending = Promise.reject(error);
+    }
+    return await Promise.race([
+      pending.then(
+        (value) => ({ type: "value" as const, value }),
+        (error) => ({ type: "error" as const, error }),
+      ),
+      control.forceSignal.then(() => ({ type: "forced" as const })),
+    ]);
+  }
+
+  async #sendWithForce(
+    control: TurnControl,
+    message: RoutedMessage,
+    text: string,
+    final = false,
+  ): Promise<void> {
+    if (control.forced) return;
+    let send: Promise<void>;
+    try {
+      send = this.#output.send(message, text, final);
+    } catch (error) {
+      send = Promise.reject(error);
+    }
+    const result = await Promise.race([
+      send.then(
+        () => ({ type: "sent" as const }),
+        (error) => ({ type: "error" as const, error }),
+      ),
+      control.forceSignal.then(() => ({ type: "forced" as const })),
+    ]);
+    if (result.type === "error") throw result.error;
+  }
+
+  #clearActive(slot: ConversationSlot, active: ActiveTurn): void {
+    this.#clearInterruptRetry(slot);
+    if (slot.active === active) slot.active = undefined;
+    slot.interruptRequested = false;
+    slot.interruptFailures = 0;
+  }
+
+  #enqueueActivity(
+    turnOutput: TurnOutput,
+    activity: ActivityEvent,
+    control?: TurnControl,
+  ): Promise<void> {
+    if (
+      control?.forced || !turnOutput.acceptingActivities ||
+      turnOutput.finished
+    ) {
+      return Promise.resolve();
+    }
+    const result = turnOutput.activityTail.then(async () => {
+      if (
+        turnOutput.finished ||
+        (control?.forced && !turnOutput.acceptingActivities)
+      ) return;
+      await this.#dispatchActivity(turnOutput, activity, control);
+    });
+    turnOutput.activityTail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  async #dispatchActivity(
+    turnOutput: TurnOutput,
+    activity: ActivityEvent,
+    control?: TurnControl,
+  ): Promise<void> {
+    const rendered = turnOutput.pipeline.apply(activity);
+    if (rendered === null) {
+      if (activity.tag === "SHUTDOWN") turnOutput.shutdownHandled = true;
+      return;
+    }
+    if (activity.delivery === "direct") {
+      if (control) {
+        await this.#sendWithForce(control, turnOutput.message, rendered);
+      } else {
+        await this.#output.send(turnOutput.message, rendered);
+      }
+    } else {
+      const startsWithLineBreak = rendered.startsWith("\n") ||
+        rendered.startsWith("\r");
+      if (
+        turnOutput.progressWritten &&
+        !turnOutput.progressEndsWithLineBreak &&
+        !startsWithLineBreak
+      ) {
+        turnOutput.progress.append("\n");
+      }
+      turnOutput.progress.append(rendered);
+      turnOutput.progressWritten = true;
+      turnOutput.progressEndsWithLineBreak = rendered.endsWith("\n") ||
+        rendered.endsWith("\r");
+    }
+    if (activity.tag === "SHUTDOWN") turnOutput.shutdownHandled = true;
+  }
+
+  async #finishTurnOutput(
+    turnOutput: TurnOutput,
+    terminal?: ActivityEvent,
+    control?: TurnControl,
+  ): Promise<void> {
+    if (turnOutput.finished) return;
+    turnOutput.acceptingActivities = false;
+    let forced = control?.forced ?? false;
+    if (!forced && control) {
+      forced = await Promise.race([
+        turnOutput.activityTail.then(() => false),
+        control.forceSignal.then(() => true),
+      ]);
+    } else if (!forced) {
+      await turnOutput.activityTail;
+    }
+    if (
+      (forced || control?.forced) && turnOutput.shutdownActivity &&
+      !turnOutput.shutdownHandled
+    ) {
+      try {
+        await this.#dispatchActivity(
+          turnOutput,
+          turnOutput.shutdownActivity,
+          control,
+        );
+      } catch (error) {
+        this.#report(error);
+      }
+    }
+    if (terminal) {
+      try {
+        await this.#dispatchActivity(turnOutput, terminal, control);
+      } catch (error) {
+        this.#report(error);
+      }
+    }
+    let finish: Promise<void>;
+    try {
+      finish = Promise.resolve(turnOutput.progress.finish());
+    } catch (error) {
+      finish = Promise.reject(error);
+    }
+    if (control) {
+      const finishResult = await Promise.race([
+        finish.then(
+          () => "finished" as const,
+          () => "finished" as const,
+        ),
+        control.forceSignal.then(() => "forced" as const),
+      ]);
+      if (finishResult === "forced") {
+        try {
+          turnOutput.progress.detach();
+        } catch (error) {
+          this.#report(error);
+        }
+      }
+    } else {
+      try {
+        await finish;
+      } catch {
+        // Progress finish failures are already reported by ChatOutput.
+      }
+    }
+    try {
+      turnOutput.pipeline.clear();
+    } finally {
+      turnOutput.finished = true;
+    }
+  }
+
+  async #startAndBindThread(
+    message: RoutedText,
+    control: TurnControl,
+  ): Promise<string | undefined> {
+    const started = await this.#raceWithForce(
+      () => this.#codex.startThread(),
+      control,
+    );
+    if (
+      started.type === "forced" || control.forced || this.#shuttingDown
+    ) return undefined;
+    if (started.type === "error") throw started.error;
+
+    this.#state.bindConversation(
+      message.conversationKey,
+      message.chatType,
+      started.value,
+    );
+    this.#loadedThreads.set(started.value, this.#codex.generation);
+    return started.value;
+  }
+
+  async #ensureThread(
+    message: RoutedText,
+    control: TurnControl,
+  ): Promise<string | undefined> {
     const existing = this.#state.getConversation(message.conversationKey);
     if (!existing) {
-      const threadId = await this.#codex.startThread();
-      this.#state.bindConversation(
-        message.conversationKey,
-        message.chatType,
-        threadId,
-      );
-      this.#loadedThreads.set(threadId, this.#codex.generation);
-      return threadId;
+      return await this.#startAndBindThread(message, control);
     }
 
     if (
       this.#loadedThreads.get(existing.threadId) !== this.#codex.generation
     ) {
-      await this.#codex.resumeThread(existing.threadId);
+      const resumed = await this.#raceWithForce(
+        () => this.#codex.resumeThread(existing.threadId),
+        control,
+      );
+      if (
+        resumed.type === "forced" || control.forced || this.#shuttingDown
+      ) return undefined;
+      if (resumed.type === "error") throw resumed.error;
       this.#loadedThreads.set(existing.threadId, this.#codex.generation);
     }
     return existing.threadId;
   }
 
+  #requestShutdown(slot: ConversationSlot): void {
+    const active = slot.active;
+    if (!active) return;
+    if (!active.shutdownRequested) {
+      active.shutdownRequested = true;
+      const activity: ActivityEvent = {
+        tag: "SHUTDOWN",
+        body: "shutting down",
+        delivery: "progress",
+      };
+      active.turnOutput.shutdownActivity = activity;
+      void this.#enqueueActivity(active.turnOutput, activity, active.control)
+        .catch((error) => this.#report(error));
+    }
+    this.#requestInterrupt(slot);
+  }
+
+  #observeLateStart(
+    active: ActiveTurn,
+    start: Promise<CodexTurnHandle>,
+  ): void {
+    void start.then(
+      (handle) => {
+        void handle.completion.catch(() => undefined);
+        if (
+          !active.interruptWhenReady || active.lateInterruptRequested
+        ) return;
+        active.lateInterruptRequested = true;
+        void this.#codex.interruptTurn(active.threadId, handle.turnId)
+          .catch((error) => this.#report(error));
+      },
+      () => undefined,
+    );
+  }
+
   #requestInterrupt(slot: ConversationSlot): void {
-    if (!slot.active || slot.interruptRequested) return;
+    const active = slot.active;
+    if (!active) return;
+    if (!active.turnId) {
+      active.interruptWhenReady = true;
+      return;
+    }
+    if (slot.interruptRequested) return;
     this.#clearInterruptRetry(slot);
     slot.interruptRequested = true;
-    const active = slot.active;
-    void this.#codex.interruptTurn(active.threadId, active.turnId).catch(
+    const turnId = active.turnId;
+    void this.#codex.interruptTurn(active.threadId, turnId).catch(
       (error) => {
-        try {
-          active.progress.append(
-            `[interrupt failed] ${errorMessage(error)}\n`,
-          );
-        } catch {
-          // The progress stream may have completed while the RPC was pending.
-        }
+        void this.#enqueueActivity(active.turnOutput, {
+          tag: "ERROR",
+          body: `interrupt failed: ${errorMessage(error)}`,
+          delivery: "progress",
+        }, active.control).catch((activityError) =>
+          this.#report(activityError)
+        );
         if (slot.active !== active) return;
         slot.interruptRequested = false;
         if (this.#shuttingDown || (!slot.pending && !slot.resetPending)) return;

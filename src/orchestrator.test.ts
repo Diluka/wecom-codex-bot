@@ -11,6 +11,10 @@ import {
   type RoutedText,
   type TurnOutcome,
 } from "./orchestrator.ts";
+import type { ActivityEvent } from "./activity-event.ts";
+import { WeComChatOutput } from "./chat-output.ts";
+import { OUTPUT_TAGS, type OutputSettings } from "./output-settings.ts";
+import { ConversationSendQueue } from "./output.ts";
 
 function message(
   conversationKey: `single:${string}` | `group:${string}`,
@@ -27,6 +31,22 @@ function message(
     msgId,
     text: content,
     frame: { id: msgId },
+  };
+}
+
+function outputSettings(
+  level: OutputSettings["level"] = "full",
+): OutputSettings {
+  return {
+    level,
+    levels: Object.fromEntries(
+      OUTPUT_TAGS.map((tag) => [tag, level]),
+    ) as OutputSettings["levels"],
+    label: "show",
+    labels: Object.fromEntries(
+      OUTPUT_TAGS.map((tag) => [tag, "show"]),
+    ) as OutputSettings["labels"],
+    toolFormat: "individual",
   };
 }
 
@@ -102,7 +122,7 @@ class FakeState implements OrchestratorState {
 interface StartedTurn {
   threadId: string;
   prompt: string;
-  onProgress: (text: string) => void;
+  onActivity: (event: ActivityEvent) => void | Promise<void>;
   turnId: string;
   resolve: (outcome: TurnOutcome) => void;
 }
@@ -111,29 +131,36 @@ class FakeCodex implements CodexPort {
   ready = true;
   generation = 1;
   readonly starts: StartedTurn[] = [];
+  readonly startThreadGates: Promise<void>[] = [];
   readonly startTurnGates: Promise<void>[] = [];
   readonly startTurnErrors: Error[] = [];
   readonly interrupts: Array<{ threadId: string; turnId: string }> = [];
   readonly resumed: string[] = [];
+  readonly resumeThreadGates: Promise<void>[] = [];
   readonly interruptGates: Promise<void>[] = [];
   readonly interruptErrors: Error[] = [];
   threadSequence = 0;
   turnSequence = 0;
+  startThreadAttempts = 0;
   startTurnAttempts = 0;
 
-  startThread(): Promise<string> {
-    return Promise.resolve(`thread-${++this.threadSequence}`);
+  async startThread(): Promise<string> {
+    this.startThreadAttempts++;
+    const gate = this.startThreadGates.shift();
+    if (gate) await gate;
+    return `thread-${++this.threadSequence}`;
   }
 
-  resumeThread(threadId: string): Promise<void> {
+  async resumeThread(threadId: string): Promise<void> {
     this.resumed.push(threadId);
-    return Promise.resolve();
+    const gate = this.resumeThreadGates.shift();
+    if (gate) await gate;
   }
 
   async startTurn(
     threadId: string,
     prompt: string,
-    onProgress: (text: string) => void,
+    onActivity: (event: ActivityEvent) => void | Promise<void>,
   ): Promise<CodexTurnHandle> {
     this.startTurnAttempts++;
     const gate = this.startTurnGates.shift();
@@ -142,7 +169,7 @@ class FakeCodex implements CodexPort {
     if (error) throw error;
     const { promise, resolve } = Promise.withResolvers<TurnOutcome>();
     const turnId = `turn-${++this.turnSequence}`;
-    this.starts.push({ threadId, prompt, onProgress, turnId, resolve });
+    this.starts.push({ threadId, prompt, onActivity, turnId, resolve });
     return { turnId, completion: promise };
   }
 
@@ -161,6 +188,7 @@ class FakeOutput implements ChatOutput {
     { msgId: string; chunks: string[]; finished: boolean }
   > = [];
   readonly sendErrors: Error[] = [];
+  readonly lateProgressAppends: Array<{ msgId: string; text: string }> = [];
   failNextProgressFinish = false;
 
   send(message: RoutedMessage, text: string, final = false): Promise<void> {
@@ -178,7 +206,13 @@ class FakeOutput implements ChatOutput {
     };
     this.progress.push(entry);
     return Promise.resolve({
-      append: (text: string) => entry.chunks.push(text),
+      append: (text: string) => {
+        if (entry.finished) {
+          this.lateProgressAppends.push({ msgId: message.msgId, text });
+          return;
+        }
+        entry.chunks.push(text);
+      },
       finish: () => {
         entry.finished = true;
         if (this.failNextProgressFinish) {
@@ -187,7 +221,88 @@ class FakeOutput implements ChatOutput {
         }
         return Promise.resolve();
       },
+      detach: () => {},
     });
+  }
+}
+
+class PendingFinalOutput extends FakeOutput {
+  readonly finalStarted = Promise.withResolvers<void>();
+  readonly finalGate = Promise.withResolvers<void>();
+
+  override send(
+    message: RoutedMessage,
+    text: string,
+    final = false,
+  ): Promise<void> {
+    this.sent.push({ msgId: message.msgId, text, final });
+    const error = this.sendErrors.shift();
+    if (error) return Promise.reject(error);
+    if (final) {
+      this.finalStarted.resolve();
+      return this.finalGate.promise;
+    }
+    return Promise.resolve();
+  }
+}
+
+class QueueBlockedOutput implements ChatOutput {
+  readonly directStarted = Promise.withResolvers<void>();
+  readonly directGate = Promise.withResolvers<void>();
+  readonly afterShutdownGate = Promise.withResolvers<void>();
+  afterShutdownWaiters = 0;
+  readonly progress: Array<
+    { msgId: string; chunks: string[]; finished: boolean }
+  > = [];
+  readonly lateProgressAppends: Array<{ msgId: string; text: string }> = [];
+  readonly #queue = new ConversationSendQueue();
+
+  async send(message: RoutedMessage): Promise<void> {
+    try {
+      await this.#queue.enqueue(message.conversationKey, async () => {
+        this.directStarted.resolve();
+        await this.directGate.promise;
+      });
+    } catch {
+      // Keep the ChatOutput callback pending after its queue slot is released.
+      this.afterShutdownWaiters++;
+      await this.afterShutdownGate.promise;
+    }
+  }
+
+  startProgress(message: RoutedText) {
+    const entry = {
+      msgId: message.msgId,
+      chunks: [] as string[],
+      finished: false,
+    };
+    this.progress.push(entry);
+    return Promise.resolve({
+      append: (text: string) => {
+        if (entry.finished) {
+          this.lateProgressAppends.push({ msgId: message.msgId, text });
+          return;
+        }
+        entry.chunks.push(text);
+      },
+      finish: async () => {
+        const attempt = await this.#queue.enqueueCritical(
+          message.conversationKey,
+          () => {
+            entry.finished = true;
+            return Promise.resolve();
+          },
+        );
+        if (!attempt.accepted) {
+          throw new Error("progress finish was not accepted");
+        }
+      },
+      detach: () => {},
+    });
+  }
+
+  beginShutdown(): void {
+    this.#queue.beginShutdown();
   }
 }
 
@@ -224,7 +339,11 @@ describe("ConversationOrchestrator", () => {
     assertEquals(codex.starts[0].threadId, "thread-1");
     assertMatch(codex.starts[0].prompt, /sender_userid: bob/);
     assertMatch(codex.starts[0].prompt, /conversation_key: group:engineering/);
-    codex.starts[0].onProgress("正在检查");
+    await codex.starts[0].onActivity({
+      tag: "CONTENT",
+      body: "正在检查",
+      delivery: "progress",
+    });
     codex.starts[0].resolve({ status: "completed", finalAnswer: "测试正常" });
     await running;
 
@@ -232,11 +351,15 @@ describe("ConversationOrchestrator", () => {
       state.getConversation("group:engineering")?.threadId,
       "thread-1",
     );
-    assertEquals(output.progress[0].chunks.includes("正在检查"), true);
-    assertEquals(
-      output.progress[0].chunks.includes("[turn completed]\n"),
-      true,
-    );
+    assertEquals(output.progress[0].chunks, [
+      "[queue] 已提交给 Codex",
+      "\n",
+      "[turn] started",
+      "\n",
+      "[content] 正在检查",
+      "\n",
+      "[turn] completed",
+    ]);
     assertEquals(output.sent.at(-1), {
       msgId: "m1",
       text: "测试正常",
@@ -244,64 +367,116 @@ describe("ConversationOrchestrator", () => {
     });
   });
 
-  it("keeps queue and turn statuses at turn detail but hides passive statuses at none", async () => {
-    const visible = setup({
-      progressSettings: {
-        intermediateOutput: "full",
-        statusDetail: "turn",
+  it("separates consecutive progress events in the final stream text", async () => {
+    const state = new FakeState();
+    const codex = new FakeCodex();
+    const streams: Array<{ content: string; finish: boolean }> = [];
+    const output = new WeComChatOutput({
+      secrets: [],
+      gateway: {
+        reply: () => Promise.resolve(true),
+        replyStream: (_frame, _streamId, content, finish = false) => {
+          streams.push({ content, finish });
+          return Promise.resolve(true);
+        },
       },
     });
-    const visibleRunning = visible.orchestrator.handleText(
-      message("single:alice", "visible", "work"),
+    const orchestrator = new ConversationOrchestrator({
+      state,
+      codex,
+      output,
+      workspace: "/workspace",
+    });
+    const running = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
     );
-    await waitFor(() => visible.codex.starts.length === 1);
-    visible.codex.starts[0].resolve({
-      status: "completed",
-      finalAnswer: "visible final",
-    });
-    await visibleRunning;
-    assertEquals(visible.output.progress[0].chunks, [
-      "[queued] 已提交给 Codex\n",
-      "[turn completed]\n",
-    ]);
+    await waitFor(() => codex.starts.length === 1);
 
-    const hidden = setup({
-      progressSettings: {
-        intermediateOutput: "full",
-        statusDetail: "none",
-      },
+    await codex.starts[0].onActivity({
+      tag: "CONTENT",
+      body: "first line\n",
+      delivery: "progress",
     });
-    const hiddenRunning = hidden.orchestrator.handleText(
-      message("single:alice", "hidden", "work"),
-    );
-    await waitFor(() => hidden.codex.starts.length === 1);
-    hidden.codex.starts[0].resolve({
-      status: "completed",
-      finalAnswer: "hidden final",
+    await codex.starts[0].onActivity({
+      tag: "CONTENT",
+      body: "second line",
+      delivery: "progress",
     });
-    await hiddenRunning;
+    codex.starts[0].resolve({ status: "completed" });
+    await running;
 
-    assertEquals(hidden.output.progress[0].chunks, []);
-    assertEquals(hidden.output.sent, [{
-      msgId: "hidden",
-      text: "hidden final",
-      final: true,
+    assertEquals(streams, [{
+      content: [
+        "[queue] 已提交给 Codex",
+        "[turn] started",
+        "[content] first line",
+        "[content] second line",
+        "[turn] completed",
+      ].join("\n"),
+      finish: true,
     }]);
   });
 
-  it("keeps direct failures visible when passive status is disabled", async () => {
+  it("routes direct user input and final answers when every output level is off", async () => {
     const { codex, orchestrator, output } = setup({
-      progressSettings: {
-        intermediateOutput: "none",
-        statusDetail: "none",
+      outputSettings: outputSettings("off"),
+    });
+    const running = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await waitFor(() => codex.starts.length === 1);
+
+    await codex.starts[0].onActivity({
+      tag: "CONTENT",
+      body: "Codex 需要用户输入\n\n请补充范围。",
+      delivery: "direct",
+    });
+    await waitFor(() => output.sent.length === 1);
+    codex.starts[0].resolve({ status: "completed", finalAnswer: "final" });
+    await running;
+
+    assertEquals(output.progress[0].chunks, []);
+    assertEquals(output.sent, [
+      {
+        msgId: "m1",
+        text: "Codex 需要用户输入\n\n请补充范围。",
+        final: false,
       },
+      { msgId: "m1", text: "final", final: true },
+    ]);
+  });
+
+  it("keeps help, status, unsupported notices, and start failures direct when levels are off", async () => {
+    const { codex, orchestrator, output } = setup({
+      outputSettings: outputSettings("off"),
     });
     codex.startTurnErrors.push(new Error("start failed"));
 
-    await orchestrator.handleText(message("single:alice", "m1", "work"));
+    await orchestrator.handleText(message("single:alice", "help", "/help"));
+    await orchestrator.handleText(message("single:alice", "status", "/status"));
+    await orchestrator.handleUnsupported(
+      message("single:alice", "image", ""),
+      "image",
+    );
+    await orchestrator.handleText(message("single:alice", "work", "work"));
 
-    assertEquals(output.progress[0].chunks, ["[failed] start failed\n"]);
-    assertMatch(output.sent.at(-1)!.text, /任务启动失败：start failed/);
+    assertEquals(output.progress[0].chunks, []);
+    assertMatch(
+      output.sent.find((entry) => entry.msgId === "help")!.text,
+      /\/new/,
+    );
+    assertMatch(
+      output.sent.find((entry) => entry.msgId === "status")!.text,
+      /idle/,
+    );
+    assertMatch(
+      output.sent.find((entry) => entry.msgId === "image")!.text,
+      /暂不支持/,
+    );
+    assertMatch(
+      output.sent.find((entry) => entry.msgId === "work")!.text,
+      /任务启动失败：start failed/,
+    );
   });
 
   it("interrupts an active turn and only runs the latest pending message", async () => {
@@ -513,6 +688,437 @@ describe("ConversationOrchestrator", () => {
     assertEquals(stopped, true);
   });
 
+  it("bounds shutdown while an initial startThread RPC never settles", async () => {
+    const startGate = Promise.withResolvers<void>();
+    const { codex, orchestrator, state } = setup({ shutdownGraceMs: 1 });
+    codex.startThreadGates.push(startGate.promise);
+    const running = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await waitFor(() => codex.startThreadAttempts === 1);
+
+    const stopping = orchestrator.interruptAll();
+    const stoppedWithinDeadline = await Promise.race([
+      stopping.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
+    ]);
+
+    if (!stoppedWithinDeadline) startGate.resolve();
+    await Promise.all([running, stopping]);
+    assertEquals(stoppedWithinDeadline, true);
+    assertEquals(state.getConversation("single:alice"), null);
+
+    startGate.reject(new Error("late startThread failure"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEquals(state.getConversation("single:alice"), null);
+  });
+
+  it("does not bind a startThread result that arrives after shutdown begins", async () => {
+    const startGate = Promise.withResolvers<void>();
+    const { codex, orchestrator, state } = setup({ shutdownGraceMs: 50 });
+    codex.startThreadGates.push(startGate.promise);
+    const running = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await waitFor(() => codex.startThreadAttempts === 1);
+
+    const stopping = orchestrator.interruptAll();
+    startGate.resolve();
+    await Promise.all([running, stopping]);
+
+    assertEquals(state.getConversation("single:alice"), null);
+    assertEquals(codex.starts.length, 0);
+  });
+
+  it("bounds shutdown while a resumeThread RPC never settles", async () => {
+    const resumeGate = Promise.withResolvers<void>();
+    const { codex, orchestrator, state } = setup({ shutdownGraceMs: 1 });
+    state.bindConversation("single:alice", "single", "thread-existing");
+    codex.resumeThreadGates.push(resumeGate.promise);
+    const running = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await waitFor(() => codex.resumed.length === 1);
+
+    const stopping = orchestrator.interruptAll();
+    const stoppedWithinDeadline = await Promise.race([
+      stopping.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
+    ]);
+
+    if (!stoppedWithinDeadline) resumeGate.resolve();
+    await Promise.all([running, stopping]);
+    assertEquals(stoppedWithinDeadline, true);
+    assertEquals(codex.starts.length, 0);
+    assertEquals(
+      state.getConversation("single:alice")?.threadId,
+      "thread-existing",
+    );
+
+    resumeGate.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEquals(codex.starts.length, 0);
+  });
+
+  it("bounds shutdown while a /new startThread RPC never settles", async () => {
+    const startGate = Promise.withResolvers<void>();
+    const { codex, orchestrator, state } = setup({ shutdownGraceMs: 1 });
+    codex.startThreadGates.push(startGate.promise);
+    const resetting = orchestrator.handleText(
+      message("single:alice", "m1", "/new"),
+    );
+    await waitFor(() => codex.startThreadAttempts === 1);
+
+    const stopping = orchestrator.interruptAll();
+    const stoppedWithinDeadline = await Promise.race([
+      stopping.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
+    ]);
+
+    if (!stoppedWithinDeadline) startGate.resolve();
+    await Promise.all([resetting, stopping]);
+    assertEquals(stoppedWithinDeadline, true);
+    assertEquals(state.getConversation("single:alice"), null);
+
+    startGate.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEquals(state.getConversation("single:alice"), null);
+  });
+
+  it("bounds shutdown and finishAll while a critical progress finish never settles", async () => {
+    const finishStarted = Promise.withResolvers<void>();
+    const finishGate = Promise.withResolvers<void>();
+    const outputErrors: Error[] = [];
+    const state = new FakeState();
+    const codex = new FakeCodex();
+    const output = new WeComChatOutput({
+      secrets: [],
+      onError: (error) => outputErrors.push(error),
+      streamControllerOptions: { maxFinishAttempts: 1 },
+      gateway: {
+        reply: () => Promise.resolve(true),
+        replyStream: async () => {
+          finishStarted.resolve();
+          await finishGate.promise;
+          return true;
+        },
+      },
+    });
+    const orchestrator = new ConversationOrchestrator({
+      state,
+      codex,
+      output,
+      workspace: "/workspace",
+      shutdownGraceMs: 1,
+    });
+    const running = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await waitFor(() => codex.starts.length === 1);
+    codex.starts[0].resolve({ status: "completed" });
+    await finishStarted.promise;
+
+    const interrupting = orchestrator.interruptAll();
+    output.beginShutdown();
+    const stopping = interrupting.then(() => output.finishAll());
+    const stoppedWithinDeadline = await Promise.race([
+      stopping.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
+    ]);
+
+    if (stoppedWithinDeadline) {
+      finishGate.reject(new Error("late progress finish failure"));
+      await waitFor(() => outputErrors.length === 1);
+    } else {
+      finishGate.resolve();
+    }
+    await Promise.all([running, stopping]);
+    assertEquals(stoppedWithinDeadline, true);
+    assertEquals(
+      state.getConversation("single:alice")?.lastStatus,
+      "completed",
+    );
+    assertEquals(
+      outputErrors.map((error) => error.message),
+      ["late progress finish failure"],
+    );
+  });
+
+  it("forces shutdown past a pending terminal final reply", async () => {
+    const state = new FakeState();
+    const codex = new FakeCodex();
+    const output = new PendingFinalOutput();
+    const orchestrator = new ConversationOrchestrator({
+      state,
+      codex,
+      output,
+      workspace: "/workspace",
+      shutdownGraceMs: 1,
+    });
+    const running = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await waitFor(() => codex.starts.length === 1);
+    codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
+    await output.finalStarted.promise;
+
+    const stopping = orchestrator.interruptAll();
+    const stoppedWithinDeadline = await Promise.race([
+      stopping.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
+    ]);
+
+    // Keep the old implementation from leaving this test with a live drain.
+    if (!stoppedWithinDeadline) output.finalGate.resolve();
+    await Promise.all([running, stopping]);
+
+    assertEquals(stoppedWithinDeadline, true);
+    assertEquals(output.progress[0].finished, true);
+    assertEquals(
+      state.getConversation("single:alice")?.lastStatus,
+      "completed",
+    );
+  });
+
+  it("forces shutdown past a pending start-failure fallback", async () => {
+    const state = new FakeState();
+    const codex = new FakeCodex();
+    const output = new PendingFinalOutput();
+    const orchestrator = new ConversationOrchestrator({
+      state,
+      codex,
+      output,
+      workspace: "/workspace",
+      shutdownGraceMs: 1,
+    });
+    codex.startTurnErrors.push(new Error("start failed"));
+    const running = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await output.finalStarted.promise;
+
+    const stopping = orchestrator.interruptAll();
+    const stoppedWithinDeadline = await Promise.race([
+      stopping.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
+    ]);
+
+    // Keep the old implementation from leaving this test with a live drain.
+    if (!stoppedWithinDeadline) output.finalGate.resolve();
+    await Promise.all([running, stopping]);
+
+    assertEquals(stoppedWithinDeadline, true);
+    assertEquals(output.progress[0].finished, true);
+    assertMatch(output.sent[0].text, /任务启动失败：start failed/);
+  });
+
+  it("propagates a direct activity send error before shutdown", async () => {
+    const { codex, orchestrator, output } = setup();
+    const running = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await waitFor(() => codex.starts.length === 1);
+    output.sendErrors.push(new Error("direct send failed"));
+
+    const result = await Promise.resolve(codex.starts[0].onActivity({
+      tag: "CONTENT",
+      body: "Codex needs input",
+      delivery: "direct",
+    })).then(
+      () => null,
+      (error) => error,
+    );
+
+    assertMatch(String(result), /direct send failed/);
+    codex.starts[0].resolve({ status: "interrupted" });
+    await running;
+  });
+
+  it("settles a direct activity callback while its sender remains pending after force", async () => {
+    const state = new FakeState();
+    const codex = new FakeCodex();
+    const output = new QueueBlockedOutput();
+    const orchestrator = new ConversationOrchestrator({
+      state,
+      codex,
+      output,
+      workspace: "/workspace",
+      shutdownGraceMs: 1,
+    });
+    const running = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await waitFor(() => codex.starts.length === 1);
+
+    const direct = codex.starts[0].onActivity({
+      tag: "CONTENT",
+      body: "Codex needs input",
+      delivery: "direct",
+    });
+    void Promise.resolve(direct).catch(() => {});
+    await output.directStarted.promise;
+
+    const stopping = orchestrator.interruptAll();
+    output.beginShutdown();
+    const stoppedWithinDeadline = await Promise.race([
+      stopping.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
+    ]);
+    const directResult = await Promise.race([
+      Promise.resolve(direct).then(
+        () => "resolved" as const,
+        () => "rejected" as const,
+      ),
+      new Promise<"pending">((resolve) =>
+        setTimeout(() => resolve("pending"), 20)
+      ),
+    ]);
+    await waitFor(() => output.afterShutdownWaiters === 1);
+
+    if (!stoppedWithinDeadline) output.directGate.resolve();
+    if (directResult === "pending") output.afterShutdownGate.resolve();
+    codex.starts[0].resolve({ status: "interrupted" });
+    await Promise.all([running, stopping]);
+
+    assertEquals(stoppedWithinDeadline, true);
+    assertEquals(directResult, "resolved");
+    assertEquals(output.afterShutdownWaiters, 1);
+    assertEquals(output.progress[0].finished, true);
+    await codex.starts[0].onActivity({
+      tag: "CONTENT",
+      body: "late activity",
+      delivery: "progress",
+    });
+    assertEquals(output.lateProgressAppends, []);
+  });
+
+  it("finishes shutdown when start RPC never settles and only interrupts a late handle once", async () => {
+    const startGate = Promise.withResolvers<void>();
+    const { codex, orchestrator, output } = setup({ shutdownGraceMs: 1 });
+    codex.startTurnGates.push(startGate.promise);
+    const running = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await waitFor(() => codex.startTurnAttempts === 1);
+
+    const stopping = orchestrator.interruptAll();
+    const stoppedWithinDeadline = await Promise.race([
+      stopping.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
+    ]);
+
+    // Keep the old implementation from leaving this test with a live drain.
+    if (!stoppedWithinDeadline) {
+      startGate.resolve();
+      await waitFor(() => codex.starts.length === 1);
+      codex.starts[0].resolve({ status: "interrupted" });
+    }
+    await Promise.all([running, stopping]);
+
+    assertEquals(stoppedWithinDeadline, true);
+    assertEquals(
+      output.progress[0].chunks.includes("[shutdown] shutting down"),
+      true,
+    );
+    assertEquals(
+      output.progress[0].chunks.includes("[turn] started"),
+      false,
+    );
+    assertEquals(
+      output.progress[0].chunks.includes("[turn] runtime_lost"),
+      true,
+    );
+    assertEquals(output.progress[0].finished, true);
+
+    startGate.resolve();
+    await waitFor(() => codex.starts.length === 1);
+    await waitFor(() => codex.interrupts.length === 1);
+    assertEquals(codex.interrupts, [{
+      threadId: "thread-1",
+      turnId: "turn-1",
+    }]);
+
+    const terminalChunks = [...output.progress[0].chunks];
+    await codex.starts[0].onActivity({
+      tag: "CONTENT",
+      body: "late activity",
+      delivery: "progress",
+    });
+    codex.starts[0].resolve({ status: "interrupted" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEquals(output.progress[0].chunks, terminalChunks);
+  });
+
+  it("renders shutdown through the active pipeline and rejects late activity after finish", async () => {
+    const { codex, orchestrator, output } = setup();
+    const running = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await waitFor(() => codex.starts.length === 1);
+
+    const stopping = orchestrator.interruptAll();
+    await waitFor(() => codex.interrupts.length === 1);
+    codex.starts[0].resolve({ status: "interrupted" });
+    await Promise.all([running, stopping]);
+
+    await codex.starts[0].onActivity({
+      tag: "CONTENT",
+      body: "late activity",
+      delivery: "progress",
+    });
+    assertEquals(output.progress[0].chunks, [
+      "[queue] 已提交给 Codex",
+      "\n",
+      "[turn] started",
+      "\n",
+      "[shutdown] shutting down",
+      "\n",
+      "[turn] interrupted",
+    ]);
+    assertEquals(output.lateProgressAppends, []);
+  });
+
+  it("filters shutdown only through its output level", async () => {
+    const settings = outputSettings();
+    settings.levels.SHUTDOWN = "off";
+    const { codex, orchestrator, output } = setup({ outputSettings: settings });
+    const running = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await waitFor(() => codex.starts.length === 1);
+
+    const stopping = orchestrator.interruptAll();
+    await waitFor(() => codex.interrupts.length === 1);
+    codex.starts[0].resolve({ status: "interrupted" });
+    await Promise.all([running, stopping]);
+
+    assertEquals(
+      output.progress[0].chunks.includes("[shutdown] shutting down"),
+      false,
+    );
+  });
+
+  it("respects the shutdown label setting without changing its visibility", async () => {
+    const settings = outputSettings();
+    settings.labels.SHUTDOWN = "hide";
+    const { codex, orchestrator, output } = setup({ outputSettings: settings });
+    const running = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await waitFor(() => codex.starts.length === 1);
+
+    const stopping = orchestrator.interruptAll();
+    await waitFor(() => codex.interrupts.length === 1);
+    codex.starts[0].resolve({ status: "interrupted" });
+    await Promise.all([running, stopping]);
+
+    assertEquals(output.progress[0].chunks.includes("shutting down"), true);
+    assertEquals(
+      output.progress[0].chunks.includes("[shutdown] shutting down"),
+      false,
+    );
+  });
+
   it("bounds shutdown when an interrupted turn never reaches terminal state", async () => {
     const { codex, orchestrator, output, state } = setup({
       shutdownGraceMs: 1,
@@ -566,6 +1172,10 @@ describe("ConversationOrchestrator", () => {
       turnId: "turn-1",
     }]);
     assertEquals(output.progress[0].finished, true);
+    assertEquals(
+      output.progress[0].chunks.includes("[turn] interrupted"),
+      true,
+    );
     assertMatch(output.sent.at(-1)!.text, /beginTurn failed/);
   });
 

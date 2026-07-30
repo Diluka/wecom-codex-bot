@@ -1,31 +1,45 @@
 import { assertEquals } from "@std/assert";
 import { describe, it } from "@std/testing/bdd";
-import {
-  describeCodexNotification,
-  renderCodexNotification,
-} from "./codex-events.ts";
+import { describeCodexNotification } from "./codex-events.ts";
 
-describe("renderCodexNotification", () => {
-  it("exposes reasoning summaries but never raw reasoning", () => {
+describe("describeCodexNotification", () => {
+  it("keeps safe reasoning summaries as raw content and omits private deltas", () => {
     assertEquals(
-      renderCodexNotification({
+      describeCodexNotification({
         method: "item/reasoning/summaryTextDelta",
-        params: { delta: "正在定位调用链" },
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          delta: "正在定位调用链",
+        },
       }),
-      "正在定位调用链",
+      {
+        tag: "CONTENT",
+        body: "正在定位调用链",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        delivery: "progress",
+      },
     );
     assertEquals(
-      renderCodexNotification({
+      describeCodexNotification({
         method: "item/reasoning/textDelta",
         params: { delta: "private chain of thought" },
       }),
       null,
     );
+    assertEquals(
+      describeCodexNotification({
+        method: "item/agentMessage/delta",
+        params: { delta: "draft answer" },
+      }),
+      null,
+    );
   });
 
-  it("shows commentary but reserves final answers", () => {
+  it("keeps commentary raw and reserves final answers for turn outcomes", () => {
     assertEquals(
-      renderCodexNotification({
+      describeCodexNotification({
         method: "item/completed",
         params: {
           item: {
@@ -35,10 +49,15 @@ describe("renderCodexNotification", () => {
           },
         },
       }),
-      "\n[Codex] 我在运行测试。\n",
+      {
+        tag: "CONTENT",
+        summary: "Codex",
+        body: "我在运行测试。",
+        delivery: "progress",
+      },
     );
     assertEquals(
-      renderCodexNotification({
+      describeCodexNotification({
         method: "item/completed",
         params: {
           item: { type: "agentMessage", phase: "final_answer", text: "完成" },
@@ -48,92 +67,13 @@ describe("renderCodexNotification", () => {
     );
   });
 
-  it("renders command lifecycle and output", () => {
-    assertEquals(
-      renderCodexNotification({
-        method: "item/started",
-        params: { item: { type: "commandExecution", command: "deno test" } },
-      }),
-      "\n$ deno test\n",
-    );
-    assertEquals(
-      renderCodexNotification({
-        method: "item/commandExecution/outputDelta",
-        params: { delta: "3 passed\n" },
-      }),
-      "3 passed\n",
-    );
-    assertEquals(
-      renderCodexNotification({
-        method: "item/completed",
-        params: {
-          item: { type: "commandExecution", status: "completed", exitCode: 0 },
-        },
-      }),
-      "[command completed, exit 0]\n",
-    );
-  });
-
-  it("summarizes file and tool changes", () => {
-    assertEquals(
-      renderCodexNotification({
-        method: "item/completed",
-        params: {
-          item: {
-            type: "fileChange",
-            status: "completed",
-            changes: [
-              { path: "/repo/a.ts", kind: "update" },
-              { path: "/repo/b.ts", kind: "add" },
-            ],
-          },
-        },
-      }),
-      "[files completed] update /repo/a.ts, add /repo/b.ts\n",
-    );
-    assertEquals(
-      renderCodexNotification({
-        method: "item/mcpToolCall/progress",
-        params: { message: "正在查询" },
-      }),
-      "[tool] 正在查询\n",
-    );
-    assertEquals(
-      renderCodexNotification({
-        method: "item/started",
-        params: { item: { type: "collabToolCall", tool: "spawnAgent" } },
-      }),
-      "\n[agent] spawnAgent\n",
-    );
-    assertEquals(
-      renderCodexNotification({
-        method: "item/completed",
-        params: {
-          item: {
-            type: "collabToolCall",
-            tool: "spawnAgent",
-            status: "completed",
-          },
-        },
-      }),
-      "[agent spawnAgent completed]\n",
-    );
-  });
-
-  it("ignores unknown notifications", () => {
-    assertEquals(
-      renderCodexNotification({ method: "future/notification", params: {} }),
-      null,
-    );
-  });
-});
-
-describe("describeCodexNotification", () => {
-  it("classifies lifecycle events with stable item and tool identities", () => {
+  it("adapts tool lifecycle events with raw identities and state", () => {
     assertEquals(
       describeCodexNotification({
         method: "item/started",
         params: {
+          threadId: "thread-2",
+          turnId: "turn-2",
           itemId: "command-param-id",
           item: {
             id: "command-item-id",
@@ -143,17 +83,21 @@ describe("describeCodexNotification", () => {
         },
       }),
       {
-        category: "tool_started",
-        text: "\n$ deno test --all\n",
+        tag: "TOOL",
+        summary: "deno test --all",
+        threadId: "thread-2",
+        turnId: "turn-2",
         itemId: "command-param-id",
-        toolKey: "deno test --all",
+        toolId: "command:deno test --all",
+        toolState: "started",
+        delivery: "progress",
       },
     );
 
     const cases = [
       {
         item: { id: "file-1", type: "fileChange" },
-        toolKey: "fileChange",
+        toolId: "file:fileChange",
       },
       {
         item: {
@@ -162,7 +106,7 @@ describe("describeCodexNotification", () => {
           server: "dbhub",
           tool: "execute_sql",
         },
-        toolKey: "dbhub/execute_sql",
+        toolId: "mcp:dbhub/execute_sql",
       },
       {
         item: {
@@ -171,7 +115,7 @@ describe("describeCodexNotification", () => {
           namespace: "functions",
           tool: "exec",
         },
-        toolKey: "functions/exec",
+        toolId: "dynamic:functions/exec",
       },
       {
         item: {
@@ -179,7 +123,7 @@ describe("describeCodexNotification", () => {
           type: "collabToolCall",
           tool: "spawn_agent",
         },
-        toolKey: "spawn_agent",
+        toolId: "collaboration:spawn_agent",
       },
       {
         item: {
@@ -187,57 +131,92 @@ describe("describeCodexNotification", () => {
           type: "webSearch",
           query: "Codex app server",
         },
-        toolKey: "Codex app server",
+        toolId: "web-search:Codex app server",
       },
     ];
 
-    for (const { item, toolKey } of cases) {
+    for (const { item, toolId } of cases) {
       const event = describeCodexNotification({
         method: "item/started",
         params: { item },
       });
-      assertEquals(event?.category, "tool_started");
+      assertEquals(event?.tag, "TOOL");
       assertEquals(event?.itemId, item.id);
-      assertEquals(event?.toolKey, toolKey);
+      assertEquals(event?.toolId, toolId);
+      assertEquals(event?.toolState, "started");
+      assertEquals(event?.delivery, "progress");
     }
   });
 
-  it("separates content, tool results, turn statuses, and critical events", () => {
-    const cases = [
-      {
-        notification: {
-          method: "item/reasoning/summaryTextDelta",
-          params: { delta: "safe summary" },
+  it("classifies plans, turn statuses, warnings, errors, and raw tool deltas", () => {
+    assertEquals(
+      describeCodexNotification({
+        method: "item/commandExecution/outputDelta",
+        params: {
+          threadId: "thread-3",
+          turnId: "turn-3",
+          itemId: "command-3",
+          delta: "stdout\\n",
         },
-        category: "content",
-      },
+      }),
       {
-        notification: {
-          method: "process/outputDelta",
-          params: { delta: "stdout" },
-        },
-        category: "tool_result",
+        tag: "TOOL_RESULT",
+        body: "stdout\\n",
+        threadId: "thread-3",
+        turnId: "turn-3",
+        itemId: "command-3",
+        delivery: "progress",
       },
+    );
+    assertEquals(
+      describeCodexNotification({
+        method: "item/mcpToolCall/progress",
+        params: { itemId: "mcp-3", message: "正在查询" },
+      }),
       {
-        notification: { method: "turn/started", params: {} },
-        category: "turn_status",
+        tag: "TOOL_RESULT",
+        body: "正在查询",
+        itemId: "mcp-3",
+        toolId: "mcpToolCall",
+        delivery: "progress",
       },
-      {
-        notification: {
-          method: "warning",
-          params: { message: "watch out" },
-        },
-        category: "critical",
-      },
-    ] as const;
-
-    for (const { notification, category } of cases) {
-      assertEquals(describeCodexNotification(notification)?.category, category);
-    }
+    );
+    assertEquals(
+      describeCodexNotification({
+        method: "item/completed",
+        params: { item: { type: "plan", text: "1. Run tests" } },
+      }),
+      { tag: "PLAN", body: "1. Run tests", delivery: "progress" },
+    );
+    assertEquals(
+      describeCodexNotification({ method: "turn/started", params: {} }),
+      { tag: "TURN", body: "started", delivery: "progress" },
+    );
+    assertEquals(
+      describeCodexNotification({
+        method: "turn/completed",
+        params: { turn: { status: "completed" } },
+      }),
+      { tag: "TURN", body: "completed", delivery: "progress" },
+    );
+    assertEquals(
+      describeCodexNotification({
+        method: "warning",
+        params: { message: "watch out" },
+      }),
+      { tag: "WARNING", body: "watch out", delivery: "progress" },
+    );
+    assertEquals(
+      describeCodexNotification({
+        method: "error",
+        params: { error: { message: "failed" } },
+      }),
+      { tag: "ERROR", body: "failed", delivery: "progress" },
+    );
   });
 
-  it("classifies a web-search completion even when legacy rendering has no text", () => {
-    const notification = {
+  it("preserves a textless web-search completion so aggregation can release it", () => {
+    const event = describeCodexNotification({
       method: "item/completed",
       params: {
         item: {
@@ -247,14 +226,23 @@ describe("describeCodexNotification", () => {
           status: "completed",
         },
       },
-    };
-
-    assertEquals(renderCodexNotification(notification), null);
-    assertEquals(describeCodexNotification(notification), {
-      category: "tool_completed",
-      text: null,
-      itemId: "search-1",
-      toolKey: "Codex app server",
     });
+
+    assertEquals(event, {
+      tag: "TOOL",
+      summary: "Codex app server",
+      itemId: "search-1",
+      toolId: "web-search:Codex app server",
+      toolState: "completed",
+      delivery: "progress",
+    });
+    assertEquals(event?.body, undefined);
+  });
+
+  it("ignores unknown notifications", () => {
+    assertEquals(
+      describeCodexNotification({ method: "future/notification", params: {} }),
+      null,
+    );
   });
 });
