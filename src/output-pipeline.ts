@@ -3,6 +3,10 @@ import type { OutputSettings } from "./output-settings.ts";
 
 const EXCERPT_LIMIT = 800;
 const LINE_LIMIT = 160;
+const FALLBACK_ITEM = Symbol("fallback item");
+
+type StreamItemKey = string | typeof FALLBACK_ITEM;
+type StreamStates<T> = Map<string, Map<StreamItemKey, T>>;
 
 interface ExcerptState {
   used: number;
@@ -20,8 +24,8 @@ export class TurnOutputPipeline {
   readonly #sameToolCounts = new Map<string, number>();
   readonly #sameFallbackCounts = new Map<string, number>();
   readonly #allToolItems = new Set<string>();
-  readonly #excerpts = new Map<string, ExcerptState>();
-  readonly #lines = new Map<string, LineState>();
+  readonly #excerpts: StreamStates<ExcerptState> = new Map();
+  readonly #lines: StreamStates<LineState> = new Map();
   #allFallbackCount = 0;
 
   constructor(settings: OutputSettings) {
@@ -167,9 +171,12 @@ export class TurnOutputPipeline {
   }
 
   #excerpt(event: ActivityEvent, source: string): string | null {
-    const key = sourceKey(event.tag, event.itemId);
-    const state = this.#excerpts.get(key) ?? { used: 0, truncated: false };
-    this.#excerpts.set(key, state);
+    const state = streamState(
+      this.#excerpts,
+      event.tag,
+      event.itemId,
+      () => ({ used: 0, truncated: false }),
+    );
     if (state.truncated) return null;
 
     const codePoints = Array.from(source);
@@ -185,9 +192,12 @@ export class TurnOutputPipeline {
   }
 
   #line(event: ActivityEvent, source: string): string | null {
-    const key = sourceKey(event.tag, event.itemId);
-    const state = this.#lines.get(key) ?? { emitted: false, truncated: false };
-    this.#lines.set(key, state);
+    const state = streamState(
+      this.#lines,
+      event.tag,
+      event.itemId,
+      () => ({ emitted: false, truncated: false }),
+    );
     if (state.truncated) return null;
 
     const lines = source.split(/\r?\n/);
@@ -218,9 +228,8 @@ export class TurnOutputPipeline {
     ) {
       return;
     }
-    const key = sourceKey("TOOL_RESULT", event.itemId);
-    this.#excerpts.delete(key);
-    this.#lines.delete(key);
+    deleteStreamState(this.#excerpts, "TOOL_RESULT", event.itemId);
+    deleteStreamState(this.#lines, "TOOL_RESULT", event.itemId);
   }
 }
 
@@ -231,6 +240,35 @@ function sourceText(event: ActivityEvent): string | null {
   return parts.length === 0 ? null : parts.join("\n");
 }
 
-function sourceKey(tag: string, itemId: string | undefined): string {
-  return `${tag}:${itemId ?? `fallback:${tag}`}`;
+function streamState<T>(
+  states: StreamStates<T>,
+  tag: string,
+  itemId: string | undefined,
+  create: () => T,
+): T {
+  let items = states.get(tag);
+  if (!items) {
+    items = new Map();
+    states.set(tag, items);
+  }
+
+  const key = itemId ?? FALLBACK_ITEM;
+  let state = items.get(key);
+  if (!state) {
+    state = create();
+    items.set(key, state);
+  }
+  return state;
+}
+
+function deleteStreamState<T>(
+  states: StreamStates<T>,
+  tag: string,
+  itemId: string,
+): void {
+  const items = states.get(tag);
+  if (!items) return;
+
+  items.delete(itemId);
+  if (items.size === 0) states.delete(tag);
 }

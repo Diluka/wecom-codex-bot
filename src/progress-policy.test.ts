@@ -65,6 +65,13 @@ describe("TurnProgressPolicy", () => {
       })),
       "stdout\n",
     );
+    assertEquals(
+      policy.apply(eventFor({
+        method: "item/mcpToolCall/progress",
+        params: { message: "querying" },
+      })),
+      "[tool] querying\n",
+    );
     assertEquals(policy.apply(commandStarted("command-1")), "\n$ deno test\n");
     assertEquals(
       policy.apply(commandCompleted("command-1")),

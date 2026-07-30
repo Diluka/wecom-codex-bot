@@ -358,6 +358,50 @@ describe("TurnOutputPipeline", () => {
     );
   });
 
+  it("keeps excerpt fallback streams separate from real fallback-shaped item ids", () => {
+    const pipeline = new TurnOutputPipeline(
+      outputSettings({ levels: { TOOL_RESULT: "excerpt" } }),
+    );
+
+    assertEquals(
+      pipeline.apply(progress({
+        tag: "TOOL_RESULT",
+        body: "a".repeat(799),
+      })),
+      `[tool_result] ${"a".repeat(799)}`,
+    );
+    assertEquals(
+      pipeline.apply(progress({
+        tag: "TOOL_RESULT",
+        itemId: "fallback:TOOL_RESULT",
+        body: "real item",
+      })),
+      "[tool_result] real item",
+    );
+  });
+
+  it("keeps line fallback streams separate from real fallback-shaped item ids", () => {
+    const pipeline = new TurnOutputPipeline(
+      outputSettings({ levels: { TOOL_RESULT: "line" } }),
+    );
+
+    assertEquals(
+      pipeline.apply(progress({
+        tag: "TOOL_RESULT",
+        body: "fallback item",
+      })),
+      "[tool_result] fallback item",
+    );
+    assertEquals(
+      pipeline.apply(progress({
+        tag: "TOOL_RESULT",
+        itemId: "fallback:TOOL_RESULT",
+        body: "real item",
+      })),
+      "[tool_result] real item",
+    );
+  });
+
   it("releases tool-result source state at item completion and clear", () => {
     const excerpt = new TurnOutputPipeline(
       outputSettings({ levels: { TOOL_RESULT: "excerpt" } }),

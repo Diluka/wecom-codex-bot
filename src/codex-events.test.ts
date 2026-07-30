@@ -177,6 +177,7 @@ describe("describeCodexNotification", () => {
         tag: "TOOL_RESULT",
         body: "正在查询",
         itemId: "mcp-3",
+        toolId: "mcpToolCall",
         delivery: "progress",
       },
     );

@@ -141,6 +141,7 @@ function toolLifecycle(
 function toolResult(
   params: Record<string, unknown>,
   value: unknown,
+  toolId?: string,
 ): ActivityEvent {
   const body = text(value);
   const id = itemId(params);
@@ -148,6 +149,7 @@ function toolResult(
     tag: "TOOL_RESULT",
     ...(body !== undefined ? { body } : {}),
     ...(id ? { itemId: id } : {}),
+    ...(toolId ? { toolId } : {}),
   });
 }
 
@@ -174,7 +176,7 @@ export function describeCodexNotification(
     case "item/fileChange/outputDelta":
       return toolResult(params, params.delta);
     case "item/mcpToolCall/progress":
-      return toolResult(params, params.message);
+      return toolResult(params, params.message, "mcpToolCall");
     case "item/started": {
       const item = record(params.item);
       return item ? toolLifecycle("started", item, params) : null;

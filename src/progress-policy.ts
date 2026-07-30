@@ -21,7 +21,7 @@ export class TurnProgressPolicy {
           : legacyContent(event);
       case "TOOL_RESULT":
         return this.#settings.intermediateOutput === "full"
-          ? event.body ?? null
+          ? legacyToolResult(event)
           : null;
       case "TURN":
         return shouldShowStatus(this.#settings, "turn")
@@ -146,6 +146,11 @@ function legacyContent(event: ActivityEvent): string | null {
     return event.body === undefined ? null : `\n[Codex] ${event.body}\n`;
   }
   return event.body ?? event.summary ?? null;
+}
+
+function legacyToolResult(event: ActivityEvent): string | null {
+  if (event.body === undefined) return null;
+  return event.toolId === "mcpToolCall" ? `[tool] ${event.body}\n` : event.body;
 }
 
 function legacyTurn(event: ActivityEvent): string {
