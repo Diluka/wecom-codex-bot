@@ -570,6 +570,171 @@ describe("CodexRuntime", () => {
     await runtime.stop();
   });
 
+  it("replays distinct pending subagent statuses when metadata arrives", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    client.turnIds.push("turn-pending");
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const activities: ActivityEvent[] = [];
+    const handle = await runtime.startTurn(
+      "parent-pending",
+      "work",
+      (activity) => {
+        activities.push(activity);
+      },
+    );
+
+    client.callbacks.onNotification?.({
+      method: "item/started",
+      params: {
+        threadId: "parent-pending",
+        turnId: "turn-pending",
+        item: {
+          type: "collabAgentToolCall",
+          receiverThreadIds: ["child-pending"],
+        },
+      },
+    });
+    client.callbacks.onThreadStarted?.({
+      threadId: "child-pending",
+      parentThreadId: "parent-pending",
+    });
+    for (const method of ["item/completed", "item/updated"] as const) {
+      client.callbacks.onNotification?.({
+        method,
+        params: {
+          threadId: "parent-pending",
+          turnId: "turn-pending",
+          item: {
+            type: "subAgentActivity",
+            agentThreadId: "child-pending",
+            kind: "started",
+          },
+        },
+      });
+    }
+    client.callbacks.onThreadStarted?.({
+      threadId: "child-pending",
+      parentThreadId: "parent-pending",
+      agentNickname: "queue-name",
+    });
+
+    assertEquals(
+      activities.filter((activity) => activity.tag === "SUBAGENT"),
+      [
+        {
+          tag: "SUBAGENT",
+          body: "queue-name：已启动",
+          itemId: "child-pending",
+          threadId: "parent-pending",
+          turnId: "turn-pending",
+          delivery: "progress",
+        },
+        {
+          tag: "SUBAGENT",
+          body: "queue-name：正在工作",
+          itemId: "child-pending",
+          threadId: "parent-pending",
+          turnId: "turn-pending",
+          delivery: "progress",
+        },
+      ],
+    );
+
+    client.callbacks.onTurnCompleted?.({
+      threadId: "parent-pending",
+      turnId: "turn-pending",
+      status: "completed",
+      error: null,
+    });
+    await handle.completion;
+    await runtime.stop();
+  });
+
+  it("does not replay pending statuses after an anonymous terminal fallback", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    client.turnIds.push("turn-terminal-pending");
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const activities: ActivityEvent[] = [];
+    const handle = await runtime.startTurn(
+      "parent-terminal-pending",
+      "work",
+      (activity) => {
+        activities.push(activity);
+      },
+    );
+
+    client.callbacks.onNotification?.({
+      method: "item/started",
+      params: {
+        threadId: "parent-terminal-pending",
+        turnId: "turn-terminal-pending",
+        item: {
+          type: "collabAgentToolCall",
+          receiverThreadIds: ["child-terminal-pending"],
+        },
+      },
+    });
+    client.callbacks.onNotification?.({
+      method: "item/completed",
+      params: {
+        threadId: "parent-terminal-pending",
+        turnId: "turn-terminal-pending",
+        item: {
+          type: "subAgentActivity",
+          agentThreadId: "child-terminal-pending",
+          kind: "started",
+        },
+      },
+    });
+    client.callbacks.onNotification?.({
+      method: "item/updated",
+      params: {
+        threadId: "parent-terminal-pending",
+        turnId: "turn-terminal-pending",
+        item: {
+          type: "collabAgentToolCall",
+          agentsStates: {
+            "child-terminal-pending": { status: "completed" },
+          },
+        },
+      },
+    });
+    client.callbacks.onThreadStarted?.({
+      threadId: "child-terminal-pending",
+      parentThreadId: "parent-terminal-pending",
+      agentNickname: "queue-name",
+    });
+
+    assertEquals(
+      activities.filter((activity) => activity.tag === "SUBAGENT"),
+      [{
+        tag: "SUBAGENT",
+        body: "child-te：已完成",
+        itemId: "child-terminal-pending",
+        threadId: "parent-terminal-pending",
+        turnId: "turn-terminal-pending",
+        delivery: "progress",
+      }],
+    );
+
+    client.callbacks.onTurnCompleted?.({
+      threadId: "parent-terminal-pending",
+      turnId: "turn-terminal-pending",
+      status: "completed",
+      error: null,
+    });
+    await handle.completion;
+    await runtime.stop();
+  });
+
   it("uses a child thread prefix for terminal subagent status without metadata", async () => {
     const factory = new FakeFactory();
     const client = new FakeClient();

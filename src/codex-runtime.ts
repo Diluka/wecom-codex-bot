@@ -59,6 +59,8 @@ interface SubagentRecord {
   name?: string;
   status?: SubagentStatus;
   lastEmittedStatus?: SubagentStatus;
+  pendingStatuses?: SubagentStatus[];
+  terminalFallbackEmitted?: boolean;
 }
 
 const RESTART_DELAYS = [1_000, 2_000, 4_000, 8_000, 16_000] as const;
@@ -322,7 +324,10 @@ export class CodexRuntime implements CodexPort {
     ) {
       record.status = undefined;
       record.lastEmittedStatus = undefined;
+      record.pendingStatuses = undefined;
+      record.terminalFallbackEmitted = undefined;
     }
+    if (record.status === update.status) return;
     record.parentTurnId = parentTurnId;
     record.status = update.status;
     this.#emitSubagentStatus(parentThreadId, update.agentThreadId);
@@ -339,27 +344,68 @@ export class CodexRuntime implements CodexPort {
       !record?.parentTurnId || !record.status ||
       this.#ambiguousSubagentTurnKeys.has(
         turnKey(parentThreadId, record.parentTurnId),
-      ) ||
-      record.lastEmittedStatus === record.status
+      )
     ) {
       return;
     }
 
-    const displayName = subagentDisplayName(record) ??
-      (isTerminalSubagentStatus(record.status)
-        ? childThreadId.slice(0, 8)
-        : undefined);
-    if (!displayName) return;
+    const displayName = subagentDisplayName(record);
+    if (!displayName) {
+      if (!isTerminalSubagentStatus(record.status)) {
+        (record.pendingStatuses ??= []).push(record.status);
+        return;
+      }
 
+      record.pendingStatuses = undefined;
+      record.terminalFallbackEmitted = true;
+      this.#routeSubagentStatus(
+        parentThreadId,
+        childThreadId,
+        record,
+        childThreadId.slice(0, 8),
+        record.status,
+      );
+      return;
+    }
+
+    if (record.terminalFallbackEmitted) return;
+    const pendingStatuses = record.pendingStatuses ?? [];
+    record.pendingStatuses = undefined;
+    for (const status of pendingStatuses) {
+      this.#routeSubagentStatus(
+        parentThreadId,
+        childThreadId,
+        record,
+        displayName,
+        status,
+      );
+    }
+    this.#routeSubagentStatus(
+      parentThreadId,
+      childThreadId,
+      record,
+      displayName,
+      record.status,
+    );
+  }
+
+  #routeSubagentStatus(
+    parentThreadId: string,
+    childThreadId: string,
+    record: SubagentRecord,
+    displayName: string,
+    status: SubagentStatus,
+  ): void {
+    if (!record.parentTurnId || record.lastEmittedStatus === status) return;
     this.#routeActivity(parentThreadId, record.parentTurnId, {
       tag: "SUBAGENT",
-      body: `${displayName}：${subagentStatusLabel(record.status)}`,
+      body: `${displayName}：${subagentStatusLabel(status)}`,
       threadId: parentThreadId,
       turnId: record.parentTurnId,
       itemId: childThreadId,
       delivery: "progress",
     });
-    record.lastEmittedStatus = record.status;
+    record.lastEmittedStatus = status;
   }
 
   #handleTurnCompleted(token: object, event: TurnCompletedEvent): void {
