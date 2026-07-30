@@ -241,6 +241,7 @@ class QueueBlockedOutput implements ChatOutput {
   readonly directStarted = Promise.withResolvers<void>();
   readonly directGate = Promise.withResolvers<void>();
   readonly afterShutdownGate = Promise.withResolvers<void>();
+  afterShutdownWaiters = 0;
   readonly progress: Array<
     { msgId: string; chunks: string[]; finished: boolean }
   > = [];
@@ -255,6 +256,7 @@ class QueueBlockedOutput implements ChatOutput {
       });
     } catch {
       // Keep the ChatOutput callback pending after its queue slot is released.
+      this.afterShutdownWaiters++;
       await this.afterShutdownGate.promise;
     }
   }
@@ -691,7 +693,29 @@ describe("ConversationOrchestrator", () => {
     assertMatch(output.sent[0].text, /任务启动失败：start failed/);
   });
 
-  it("forces shutdown past a permanently pending direct callback and releases the progress queue", async () => {
+  it("propagates a direct activity send error before shutdown", async () => {
+    const { codex, orchestrator, output } = setup();
+    const running = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await waitFor(() => codex.starts.length === 1);
+    output.sendErrors.push(new Error("direct send failed"));
+
+    const result = await Promise.resolve(codex.starts[0].onActivity({
+      tag: "CONTENT",
+      body: "Codex needs input",
+      delivery: "direct",
+    })).then(
+      () => null,
+      (error) => error,
+    );
+
+    assertMatch(String(result), /direct send failed/);
+    codex.starts[0].resolve({ status: "interrupted" });
+    await running;
+  });
+
+  it("settles a direct activity callback while its sender remains pending after force", async () => {
     const state = new FakeState();
     const codex = new FakeCodex();
     const output = new QueueBlockedOutput();
@@ -730,6 +754,7 @@ describe("ConversationOrchestrator", () => {
         setTimeout(() => resolve("pending"), 20)
       ),
     ]);
+    await waitFor(() => output.afterShutdownWaiters === 1);
 
     if (!stoppedWithinDeadline) output.directGate.resolve();
     if (directResult === "pending") output.afterShutdownGate.resolve();
@@ -738,6 +763,7 @@ describe("ConversationOrchestrator", () => {
 
     assertEquals(stoppedWithinDeadline, true);
     assertEquals(directResult, "resolved");
+    assertEquals(output.afterShutdownWaiters, 1);
     assertEquals(output.progress[0].finished, true);
     await codex.starts[0].onActivity({
       tag: "CONTENT",

@@ -616,20 +616,23 @@ export class ConversationOrchestrator {
       return Promise.resolve();
     }
     const result = turnOutput.activityTail.then(async () => {
-      if (turnOutput.finished) return;
-      await this.#dispatchActivity(turnOutput, activity);
+      if (
+        turnOutput.finished ||
+        (control?.forced && !turnOutput.acceptingActivities)
+      ) return;
+      await this.#dispatchActivity(turnOutput, activity, control);
     });
     turnOutput.activityTail = result.then(
       () => undefined,
       () => undefined,
     );
-    if (!control) return result;
-    return Promise.race([result, control.forceSignal.then(() => undefined)]);
+    return result;
   }
 
   async #dispatchActivity(
     turnOutput: TurnOutput,
     activity: ActivityEvent,
+    control?: TurnControl,
   ): Promise<void> {
     const rendered = turnOutput.pipeline.apply(activity);
     if (rendered === null) {
@@ -637,7 +640,11 @@ export class ConversationOrchestrator {
       return;
     }
     if (activity.delivery === "direct") {
-      await this.#output.send(turnOutput.message, rendered);
+      if (control) {
+        await this.#sendWithForce(control, turnOutput.message, rendered);
+      } else {
+        await this.#output.send(turnOutput.message, rendered);
+      }
     } else {
       turnOutput.progress.append(rendered);
     }
@@ -665,14 +672,18 @@ export class ConversationOrchestrator {
       !turnOutput.shutdownHandled
     ) {
       try {
-        await this.#dispatchActivity(turnOutput, turnOutput.shutdownActivity);
+        await this.#dispatchActivity(
+          turnOutput,
+          turnOutput.shutdownActivity,
+          control,
+        );
       } catch (error) {
         this.#report(error);
       }
     }
     if (terminal) {
       try {
-        await this.#dispatchActivity(turnOutput, terminal);
+        await this.#dispatchActivity(turnOutput, terminal, control);
       } catch (error) {
         this.#report(error);
       }
