@@ -1,4 +1,9 @@
-import { assertEquals, assertMatch, assertStrictEquals } from "@std/assert";
+import {
+  assertEquals,
+  assertMatch,
+  assertRejects,
+  assertStrictEquals,
+} from "@std/assert";
 import { describe, it } from "@std/testing/bdd";
 
 import type {
@@ -287,6 +292,239 @@ describe("CodexRuntime", () => {
       finalAnswer: "early answer",
       error: null,
     });
+    await runtime.stop();
+  });
+
+  it("clears early subagent state when a turn start rejects before activation", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    let rejectFirstTurn!: (reason?: unknown) => void;
+    const firstTurn = new Promise<string>((_resolve, reject) => {
+      rejectFirstTurn = reject;
+    });
+    client.turnIds.push(firstTurn, "turn-retry");
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const failedStart = runtime.startTurn("parent-retry", "first", () => {});
+    await waitFor(() => client.startedTurns.length === 1, "first turn RPC");
+    client.callbacks.onNotification?.({
+      method: "item/started",
+      params: {
+        threadId: "parent-retry",
+        turnId: "turn-retry",
+        item: {
+          type: "collabAgentToolCall",
+          receiverThreadIds: ["child-retry"],
+        },
+      },
+    });
+    rejectFirstTurn(new Error("first turn failed"));
+    await assertRejects(() => failedStart, Error, "first turn failed");
+
+    const activities: ActivityEvent[] = [];
+    const retry = await runtime.startTurn(
+      "parent-retry",
+      "retry",
+      (activity) => {
+        activities.push(activity);
+      },
+    );
+    client.callbacks.onThreadStarted?.({
+      threadId: "child-retry",
+      parentThreadId: "parent-retry",
+      agentNickname: "stale-name",
+    });
+
+    assertEquals(
+      activities.filter((activity) => activity.tag === "SUBAGENT"),
+      [],
+    );
+
+    client.callbacks.onTurnCompleted?.({
+      threadId: "parent-retry",
+      turnId: "turn-retry",
+      status: "completed",
+      error: null,
+    });
+    await retry.completion;
+    await runtime.stop();
+  });
+
+  it("keeps active subagent state when another turn start rejects", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    let rejectFailedTurn!: (reason?: unknown) => void;
+    const failedTurn = new Promise<string>((_resolve, reject) => {
+      rejectFailedTurn = reject;
+    });
+    client.turnIds.push("turn-active", failedTurn);
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const activities: ActivityEvent[] = [];
+    const active = await runtime.startTurn(
+      "parent-active",
+      "active",
+      (activity) => {
+        activities.push(activity);
+      },
+    );
+    client.callbacks.onNotification?.({
+      method: "item/started",
+      params: {
+        threadId: "parent-active",
+        turnId: "turn-active",
+        item: {
+          type: "collabAgentToolCall",
+          receiverThreadIds: ["child-active"],
+        },
+      },
+    });
+
+    const failedStart = runtime.startTurn("parent-active", "failed", () => {});
+    await waitFor(() => client.startedTurns.length === 2, "failed turn RPC");
+    client.callbacks.onNotification?.({
+      method: "item/started",
+      params: {
+        threadId: "parent-active",
+        turnId: "turn-failed",
+        item: {
+          type: "collabAgentToolCall",
+          receiverThreadIds: ["child-failed"],
+        },
+      },
+    });
+    rejectFailedTurn(new Error("failed turn"));
+    await assertRejects(() => failedStart, Error, "failed turn");
+
+    client.callbacks.onThreadStarted?.({
+      threadId: "child-active",
+      parentThreadId: "parent-active",
+      agentNickname: "active-name",
+    });
+    client.callbacks.onThreadStarted?.({
+      threadId: "child-failed",
+      parentThreadId: "parent-active",
+      agentNickname: "stale-name",
+    });
+
+    assertEquals(
+      activities.filter((activity) => activity.tag === "SUBAGENT"),
+      [{
+        tag: "SUBAGENT",
+        body: "active-name：已启动",
+        itemId: "child-active",
+        threadId: "parent-active",
+        turnId: "turn-active",
+        delivery: "progress",
+      }],
+    );
+
+    client.callbacks.onTurnCompleted?.({
+      threadId: "parent-active",
+      turnId: "turn-active",
+      status: "completed",
+      error: null,
+    });
+    await active.completion;
+    await runtime.stop();
+  });
+
+  it("drops unactivated subagent state when a concurrent start rejects", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    const failedResponse = Promise.withResolvers<string>();
+    const pendingResponse = Promise.withResolvers<string>();
+    client.turnIds.push(
+      failedResponse.promise,
+      pendingResponse.promise,
+      "turn-concurrent-a",
+    );
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const failedStart = runtime.startTurn(
+      "parent-concurrent",
+      "first",
+      () => {},
+    );
+    await waitFor(() => client.startedTurns.length === 1, "first turn RPC");
+    const pendingActivities: ActivityEvent[] = [];
+    const pendingStart = runtime.startTurn(
+      "parent-concurrent",
+      "second",
+      (activity) => {
+        pendingActivities.push(activity);
+      },
+    );
+    await waitFor(() => client.startedTurns.length === 2, "second turn RPC");
+    client.callbacks.onNotification?.({
+      method: "item/started",
+      params: {
+        threadId: "parent-concurrent",
+        turnId: "turn-concurrent-a",
+        item: {
+          type: "collabAgentToolCall",
+          receiverThreadIds: ["child-concurrent"],
+        },
+      },
+    });
+    client.callbacks.onThreadStarted?.({
+      threadId: "child-concurrent",
+      parentThreadId: "parent-concurrent",
+      agentNickname: "stale-name",
+    });
+    client.callbacks.onNotification?.({
+      method: "item/reasoning/summaryTextDelta",
+      params: {
+        threadId: "parent-concurrent",
+        turnId: "turn-concurrent-a",
+        delta: "safe early progress",
+      },
+    });
+    failedResponse.reject(new Error("first concurrent turn failed"));
+    await assertRejects(
+      () => failedStart,
+      Error,
+      "first concurrent turn failed",
+    );
+
+    pendingResponse.resolve("turn-concurrent-a");
+    const pending = await pendingStart;
+    assertEquals(
+      pendingActivities.filter((activity) => activity.tag === "SUBAGENT"),
+      [],
+    );
+    assertEquals(pendingActivities, [
+      {
+        tag: "TOOL",
+        summary: "collaboration",
+        toolId: "collaboration:collaboration",
+        toolState: "started",
+        threadId: "parent-concurrent",
+        turnId: "turn-concurrent-a",
+        delivery: "progress",
+      },
+      {
+        tag: "CONTENT",
+        body: "safe early progress",
+        threadId: "parent-concurrent",
+        turnId: "turn-concurrent-a",
+        delivery: "progress",
+      },
+    ]);
+
+    client.callbacks.onTurnCompleted?.({
+      threadId: "parent-concurrent",
+      turnId: "turn-concurrent-a",
+      status: "completed",
+      error: null,
+    });
+    await pending.completion;
     await runtime.stop();
   });
 

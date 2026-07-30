@@ -191,6 +191,7 @@ export class CodexRuntime implements CodexPort {
     const client = this.#requireClient();
     const clientToken = this.#clientToken;
     const pendingStart = this.#startPendingTurn(threadId);
+    let activated = false;
     try {
       const turnId = await client.startTurn(threadId, prompt);
       const { promise: completion, resolve } = Promise.withResolvers<
@@ -214,6 +215,7 @@ export class CodexRuntime implements CodexPort {
         this.#ambiguousSubagentTurnKeys.add(key);
       }
       this.#activeTurns.set(key, { onActivity, resolve });
+      activated = true;
       const activities = this.#bufferedActivities.get(key) ?? [];
       this.#bufferedActivities.delete(key);
       for (const activity of activities) {
@@ -227,7 +229,7 @@ export class CodexRuntime implements CodexPort {
       }
       return { turnId, completion };
     } finally {
-      this.#finishPendingTurn(threadId, pendingStart);
+      this.#finishPendingTurn(threadId, pendingStart, activated);
     }
   }
 
@@ -634,12 +636,55 @@ export class CodexRuntime implements CodexPort {
   #finishPendingTurn(
     threadId: string,
     pendingStart: PendingTurnStart,
+    activated: boolean,
   ): void {
     const pendingStarts = this.#startingThreads.get(threadId);
-    if (!pendingStarts?.delete(pendingStart) || pendingStarts.size > 0) return;
+    if (!pendingStarts?.delete(pendingStart)) return;
+    const isCurrentGeneration = pendingStart.generation === this.#generation;
+    if (isCurrentGeneration && !activated) {
+      // Early child events cannot be assigned to one concurrent pending RPC.
+      this.#clearUnactivatedSubagentThread(threadId);
+    }
+    if (pendingStarts.size > 0) return;
     this.#startingThreads.delete(threadId);
-    if (pendingStart.generation === this.#generation) {
+    if (isCurrentGeneration) {
       this.#clearBufferedThread(threadId);
+    }
+  }
+
+  #clearUnactivatedSubagentThread(parentThreadId: string): void {
+    const records = this.#subagentsByParentThread.get(parentThreadId);
+    if (!records) return;
+
+    const activeTurnIds = new Set<string>();
+    for (const key of this.#activeTurns.keys()) {
+      const [threadId, turnId] = turnIds(key);
+      if (threadId === parentThreadId) activeTurnIds.add(turnId);
+    }
+    const unactivatedTurnIds = new Set<string>();
+    for (const [childThreadId, record] of records) {
+      const belongsToActiveTurn = record.parentTurnId
+        ? activeTurnIds.has(record.parentTurnId)
+        : activeTurnIds.size > 0;
+      if (belongsToActiveTurn) continue;
+      if (record.parentTurnId) unactivatedTurnIds.add(record.parentTurnId);
+      records.delete(childThreadId);
+    }
+    if (records.size === 0) {
+      this.#subagentsByParentThread.delete(parentThreadId);
+    }
+    for (const turnId of unactivatedTurnIds) {
+      const key = turnKey(parentThreadId, turnId);
+      const buffered = this.#bufferedActivities.get(key);
+      if (!buffered) continue;
+      const retained = buffered.filter((activity) =>
+        activity.tag !== "SUBAGENT"
+      );
+      if (retained.length > 0) {
+        this.#bufferedActivities.set(key, retained);
+      } else {
+        this.#bufferedActivities.delete(key);
+      }
     }
   }
 
