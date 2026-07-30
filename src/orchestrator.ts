@@ -76,6 +76,7 @@ export interface CodexPort {
 export interface ProgressHandle {
   append(text: string): void;
   finish(): Promise<void>;
+  detach(): void;
 }
 
 export interface ChatOutput {
@@ -100,6 +101,11 @@ interface TurnControl {
   forced: boolean;
 }
 
+type ForceRaceResult<T> =
+  | { type: "value"; value: T }
+  | { type: "error"; error: unknown }
+  | { type: "forced" };
+
 interface ActiveTurn {
   threadId: string;
   turnId?: string;
@@ -113,6 +119,8 @@ interface ActiveTurn {
 interface TurnOutput {
   message: RoutedText;
   progress: ProgressHandle;
+  progressWritten: boolean;
+  progressEndsWithLineBreak: boolean;
   pipeline: TurnOutputPipeline;
   activityTail: Promise<void>;
   acceptingActivities: boolean;
@@ -287,10 +295,14 @@ export class ConversationOrchestrator {
       if (slot.resetPending) {
         const request = slot.resetPending;
         slot.resetPending = undefined;
+        const control = this.#createTurnControl();
+        slot.control = control;
         try {
-          await this.#resetConversation(request);
+          await this.#resetConversation(request, control);
         } catch {
           // Output failures must not strand already-claimed pending work.
+        } finally {
+          if (slot.control === control) slot.control = undefined;
         }
         continue;
       }
@@ -325,18 +337,16 @@ export class ConversationOrchestrator {
     }
   }
 
-  async #resetConversation(message: RoutedText): Promise<void> {
-    let threadId: string;
+  async #resetConversation(
+    message: RoutedText,
+    control: TurnControl,
+  ): Promise<void> {
     try {
-      threadId = await this.#codex.startThread();
-      this.#state.bindConversation(
-        message.conversationKey,
-        message.chatType,
-        threadId,
-      );
-      this.#loadedThreads.set(threadId, this.#codex.generation);
+      const started = await this.#startAndBindThread(message, control);
+      if (started === undefined) return;
     } catch (error) {
-      await this.#output.send(
+      await this.#sendWithForce(
+        control,
         message,
         `新建 Codex 会话失败：${errorMessage(error)}`,
         true,
@@ -344,7 +354,8 @@ export class ConversationOrchestrator {
       return;
     }
 
-    await this.#output.send(
+    await this.#sendWithForce(
+      control,
       message,
       `已新建 Codex 会话。\n\n工作目录：\`${this.#workspace}\``,
     );
@@ -355,7 +366,8 @@ export class ConversationOrchestrator {
     slot: ConversationSlot,
     control: TurnControl,
   ): Promise<void> {
-    const threadId = await this.#ensureThread(message);
+    const threadId = await this.#ensureThread(message, control);
+    if (threadId === undefined) return;
 
     // A newer message that arrived while loading the thread wins before any
     // model work is started.
@@ -370,7 +382,7 @@ export class ConversationOrchestrator {
         delivery: "progress",
       }, control);
     } catch (error) {
-      await this.#finishTurnOutput(turnOutput);
+      await this.#finishTurnOutput(turnOutput, undefined, control);
       throw error;
     }
     const prompt = buildCodexPrompt({
@@ -551,6 +563,8 @@ export class ConversationOrchestrator {
     return {
       message,
       progress,
+      progressWritten: false,
+      progressEndsWithLineBreak: false,
       pipeline: new TurnOutputPipeline(this.#outputSettings),
       activityTail: Promise.resolve(),
       acceptingActivities: true,
@@ -572,6 +586,25 @@ export class ConversationOrchestrator {
       forced.resolve(outcome);
     };
     return control;
+  }
+
+  async #raceWithForce<T>(
+    operation: () => Promise<T>,
+    control: TurnControl,
+  ): Promise<ForceRaceResult<T>> {
+    let pending: Promise<T>;
+    try {
+      pending = Promise.resolve(operation());
+    } catch (error) {
+      pending = Promise.reject(error);
+    }
+    return await Promise.race([
+      pending.then(
+        (value) => ({ type: "value" as const, value }),
+        (error) => ({ type: "error" as const, error }),
+      ),
+      control.forceSignal.then(() => ({ type: "forced" as const })),
+    ]);
   }
 
   async #sendWithForce(
@@ -646,7 +679,19 @@ export class ConversationOrchestrator {
         await this.#output.send(turnOutput.message, rendered);
       }
     } else {
+      const startsWithLineBreak = rendered.startsWith("\n") ||
+        rendered.startsWith("\r");
+      if (
+        turnOutput.progressWritten &&
+        !turnOutput.progressEndsWithLineBreak &&
+        !startsWithLineBreak
+      ) {
+        turnOutput.progress.append("\n");
+      }
       turnOutput.progress.append(rendered);
+      turnOutput.progressWritten = true;
+      turnOutput.progressEndsWithLineBreak = rendered.endsWith("\n") ||
+        rendered.endsWith("\r");
     }
     if (activity.tag === "SHUTDOWN") turnOutput.shutdownHandled = true;
   }
@@ -688,33 +733,83 @@ export class ConversationOrchestrator {
         this.#report(error);
       }
     }
+    let finish: Promise<void>;
     try {
-      await turnOutput.progress.finish();
-    } catch {
-      // Progress finish failures are already reported by ChatOutput.
-    } finally {
+      finish = Promise.resolve(turnOutput.progress.finish());
+    } catch (error) {
+      finish = Promise.reject(error);
+    }
+    if (control) {
+      const finishResult = await Promise.race([
+        finish.then(
+          () => "finished" as const,
+          () => "finished" as const,
+        ),
+        control.forceSignal.then(() => "forced" as const),
+      ]);
+      if (finishResult === "forced") {
+        try {
+          turnOutput.progress.detach();
+        } catch (error) {
+          this.#report(error);
+        }
+      }
+    } else {
+      try {
+        await finish;
+      } catch {
+        // Progress finish failures are already reported by ChatOutput.
+      }
+    }
+    try {
       turnOutput.pipeline.clear();
+    } finally {
       turnOutput.finished = true;
     }
   }
 
-  async #ensureThread(message: RoutedText): Promise<string> {
+  async #startAndBindThread(
+    message: RoutedText,
+    control: TurnControl,
+  ): Promise<string | undefined> {
+    const started = await this.#raceWithForce(
+      () => this.#codex.startThread(),
+      control,
+    );
+    if (
+      started.type === "forced" || control.forced || this.#shuttingDown
+    ) return undefined;
+    if (started.type === "error") throw started.error;
+
+    this.#state.bindConversation(
+      message.conversationKey,
+      message.chatType,
+      started.value,
+    );
+    this.#loadedThreads.set(started.value, this.#codex.generation);
+    return started.value;
+  }
+
+  async #ensureThread(
+    message: RoutedText,
+    control: TurnControl,
+  ): Promise<string | undefined> {
     const existing = this.#state.getConversation(message.conversationKey);
     if (!existing) {
-      const threadId = await this.#codex.startThread();
-      this.#state.bindConversation(
-        message.conversationKey,
-        message.chatType,
-        threadId,
-      );
-      this.#loadedThreads.set(threadId, this.#codex.generation);
-      return threadId;
+      return await this.#startAndBindThread(message, control);
     }
 
     if (
       this.#loadedThreads.get(existing.threadId) !== this.#codex.generation
     ) {
-      await this.#codex.resumeThread(existing.threadId);
+      const resumed = await this.#raceWithForce(
+        () => this.#codex.resumeThread(existing.threadId),
+        control,
+      );
+      if (
+        resumed.type === "forced" || control.forced || this.#shuttingDown
+      ) return undefined;
+      if (resumed.type === "error") throw resumed.error;
       this.#loadedThreads.set(existing.threadId, this.#codex.generation);
     }
     return existing.threadId;

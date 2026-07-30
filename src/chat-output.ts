@@ -130,6 +130,9 @@ export class WeComChatOutput implements ChatOutput {
           this.#active.delete(controller);
         }
       },
+      detach: () => {
+        this.#active.delete(controller);
+      },
     });
   }
 

@@ -289,6 +289,24 @@ describe("WeComChatOutput", () => {
     assertEquals(gateway.replies.length, 0);
   });
 
+  it("does not reawait a detached in-flight progress finish", async () => {
+    const gate = Promise.withResolvers<void>();
+    const gateway = new FakeGateway();
+    gateway.streamGate = gate.promise;
+    const output = new WeComChatOutput({ gateway, secrets: [] });
+    const progress = await output.startProgress(message());
+    progress.append("working");
+    const finishing = progress.finish();
+    await drainMicrotasks();
+    assertEquals(gateway.streams.length, 1);
+
+    progress.detach();
+    await output.finishAll();
+
+    gate.resolve();
+    await finishing;
+  });
+
   it("does not append a transport-owned shutdown status", async () => {
     const gateway = new FakeGateway();
     const output = new WeComChatOutput({ gateway, secrets: [] });

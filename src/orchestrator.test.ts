@@ -12,6 +12,7 @@ import {
   type TurnOutcome,
 } from "./orchestrator.ts";
 import type { ActivityEvent } from "./activity-event.ts";
+import { WeComChatOutput } from "./chat-output.ts";
 import { OUTPUT_TAGS, type OutputSettings } from "./output-settings.ts";
 import { ConversationSendQueue } from "./output.ts";
 
@@ -130,23 +131,30 @@ class FakeCodex implements CodexPort {
   ready = true;
   generation = 1;
   readonly starts: StartedTurn[] = [];
+  readonly startThreadGates: Promise<void>[] = [];
   readonly startTurnGates: Promise<void>[] = [];
   readonly startTurnErrors: Error[] = [];
   readonly interrupts: Array<{ threadId: string; turnId: string }> = [];
   readonly resumed: string[] = [];
+  readonly resumeThreadGates: Promise<void>[] = [];
   readonly interruptGates: Promise<void>[] = [];
   readonly interruptErrors: Error[] = [];
   threadSequence = 0;
   turnSequence = 0;
+  startThreadAttempts = 0;
   startTurnAttempts = 0;
 
-  startThread(): Promise<string> {
-    return Promise.resolve(`thread-${++this.threadSequence}`);
+  async startThread(): Promise<string> {
+    this.startThreadAttempts++;
+    const gate = this.startThreadGates.shift();
+    if (gate) await gate;
+    return `thread-${++this.threadSequence}`;
   }
 
-  resumeThread(threadId: string): Promise<void> {
+  async resumeThread(threadId: string): Promise<void> {
     this.resumed.push(threadId);
-    return Promise.resolve();
+    const gate = this.resumeThreadGates.shift();
+    if (gate) await gate;
   }
 
   async startTurn(
@@ -213,6 +221,7 @@ class FakeOutput implements ChatOutput {
         }
         return Promise.resolve();
       },
+      detach: () => {},
     });
   }
 }
@@ -288,6 +297,7 @@ class QueueBlockedOutput implements ChatOutput {
           throw new Error("progress finish was not accepted");
         }
       },
+      detach: () => {},
     });
   }
 
@@ -343,8 +353,11 @@ describe("ConversationOrchestrator", () => {
     );
     assertEquals(output.progress[0].chunks, [
       "[queue] 已提交给 Codex",
+      "\n",
       "[turn] started",
+      "\n",
       "[content] 正在检查",
+      "\n",
       "[turn] completed",
     ]);
     assertEquals(output.sent.at(-1), {
@@ -352,6 +365,56 @@ describe("ConversationOrchestrator", () => {
       text: "测试正常",
       final: true,
     });
+  });
+
+  it("separates consecutive progress events in the final stream text", async () => {
+    const state = new FakeState();
+    const codex = new FakeCodex();
+    const streams: Array<{ content: string; finish: boolean }> = [];
+    const output = new WeComChatOutput({
+      secrets: [],
+      gateway: {
+        reply: () => Promise.resolve(true),
+        replyStream: (_frame, _streamId, content, finish = false) => {
+          streams.push({ content, finish });
+          return Promise.resolve(true);
+        },
+      },
+    });
+    const orchestrator = new ConversationOrchestrator({
+      state,
+      codex,
+      output,
+      workspace: "/workspace",
+    });
+    const running = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await waitFor(() => codex.starts.length === 1);
+
+    await codex.starts[0].onActivity({
+      tag: "CONTENT",
+      body: "first line\n",
+      delivery: "progress",
+    });
+    await codex.starts[0].onActivity({
+      tag: "CONTENT",
+      body: "second line",
+      delivery: "progress",
+    });
+    codex.starts[0].resolve({ status: "completed" });
+    await running;
+
+    assertEquals(streams, [{
+      content: [
+        "[queue] 已提交给 Codex",
+        "[turn] started",
+        "[content] first line",
+        "[content] second line",
+        "[turn] completed",
+      ].join("\n"),
+      finish: true,
+    }]);
   });
 
   it("routes direct user input and final answers when every output level is off", async () => {
@@ -625,6 +688,162 @@ describe("ConversationOrchestrator", () => {
     assertEquals(stopped, true);
   });
 
+  it("bounds shutdown while an initial startThread RPC never settles", async () => {
+    const startGate = Promise.withResolvers<void>();
+    const { codex, orchestrator, state } = setup({ shutdownGraceMs: 1 });
+    codex.startThreadGates.push(startGate.promise);
+    const running = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await waitFor(() => codex.startThreadAttempts === 1);
+
+    const stopping = orchestrator.interruptAll();
+    const stoppedWithinDeadline = await Promise.race([
+      stopping.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
+    ]);
+
+    if (!stoppedWithinDeadline) startGate.resolve();
+    await Promise.all([running, stopping]);
+    assertEquals(stoppedWithinDeadline, true);
+    assertEquals(state.getConversation("single:alice"), null);
+
+    startGate.reject(new Error("late startThread failure"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEquals(state.getConversation("single:alice"), null);
+  });
+
+  it("does not bind a startThread result that arrives after shutdown begins", async () => {
+    const startGate = Promise.withResolvers<void>();
+    const { codex, orchestrator, state } = setup({ shutdownGraceMs: 50 });
+    codex.startThreadGates.push(startGate.promise);
+    const running = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await waitFor(() => codex.startThreadAttempts === 1);
+
+    const stopping = orchestrator.interruptAll();
+    startGate.resolve();
+    await Promise.all([running, stopping]);
+
+    assertEquals(state.getConversation("single:alice"), null);
+    assertEquals(codex.starts.length, 0);
+  });
+
+  it("bounds shutdown while a resumeThread RPC never settles", async () => {
+    const resumeGate = Promise.withResolvers<void>();
+    const { codex, orchestrator, state } = setup({ shutdownGraceMs: 1 });
+    state.bindConversation("single:alice", "single", "thread-existing");
+    codex.resumeThreadGates.push(resumeGate.promise);
+    const running = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await waitFor(() => codex.resumed.length === 1);
+
+    const stopping = orchestrator.interruptAll();
+    const stoppedWithinDeadline = await Promise.race([
+      stopping.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
+    ]);
+
+    if (!stoppedWithinDeadline) resumeGate.resolve();
+    await Promise.all([running, stopping]);
+    assertEquals(stoppedWithinDeadline, true);
+    assertEquals(codex.starts.length, 0);
+    assertEquals(
+      state.getConversation("single:alice")?.threadId,
+      "thread-existing",
+    );
+
+    resumeGate.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEquals(codex.starts.length, 0);
+  });
+
+  it("bounds shutdown while a /new startThread RPC never settles", async () => {
+    const startGate = Promise.withResolvers<void>();
+    const { codex, orchestrator, state } = setup({ shutdownGraceMs: 1 });
+    codex.startThreadGates.push(startGate.promise);
+    const resetting = orchestrator.handleText(
+      message("single:alice", "m1", "/new"),
+    );
+    await waitFor(() => codex.startThreadAttempts === 1);
+
+    const stopping = orchestrator.interruptAll();
+    const stoppedWithinDeadline = await Promise.race([
+      stopping.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
+    ]);
+
+    if (!stoppedWithinDeadline) startGate.resolve();
+    await Promise.all([resetting, stopping]);
+    assertEquals(stoppedWithinDeadline, true);
+    assertEquals(state.getConversation("single:alice"), null);
+
+    startGate.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEquals(state.getConversation("single:alice"), null);
+  });
+
+  it("bounds shutdown and finishAll while a critical progress finish never settles", async () => {
+    const finishStarted = Promise.withResolvers<void>();
+    const finishGate = Promise.withResolvers<void>();
+    const outputErrors: Error[] = [];
+    const state = new FakeState();
+    const codex = new FakeCodex();
+    const output = new WeComChatOutput({
+      secrets: [],
+      onError: (error) => outputErrors.push(error),
+      streamControllerOptions: { maxFinishAttempts: 1 },
+      gateway: {
+        reply: () => Promise.resolve(true),
+        replyStream: async () => {
+          finishStarted.resolve();
+          await finishGate.promise;
+          return true;
+        },
+      },
+    });
+    const orchestrator = new ConversationOrchestrator({
+      state,
+      codex,
+      output,
+      workspace: "/workspace",
+      shutdownGraceMs: 1,
+    });
+    const running = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await waitFor(() => codex.starts.length === 1);
+    codex.starts[0].resolve({ status: "completed" });
+    await finishStarted.promise;
+
+    const interrupting = orchestrator.interruptAll();
+    output.beginShutdown();
+    const stopping = interrupting.then(() => output.finishAll());
+    const stoppedWithinDeadline = await Promise.race([
+      stopping.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
+    ]);
+
+    if (stoppedWithinDeadline) {
+      finishGate.reject(new Error("late progress finish failure"));
+      await waitFor(() => outputErrors.length === 1);
+    } else {
+      finishGate.resolve();
+    }
+    await Promise.all([running, stopping]);
+    assertEquals(stoppedWithinDeadline, true);
+    assertEquals(
+      state.getConversation("single:alice")?.lastStatus,
+      "completed",
+    );
+    assertEquals(
+      outputErrors.map((error) => error.message),
+      ["late progress finish failure"],
+    );
+  });
+
   it("forces shutdown past a pending terminal final reply", async () => {
     const state = new FakeState();
     const codex = new FakeCodex();
@@ -849,8 +1068,11 @@ describe("ConversationOrchestrator", () => {
     });
     assertEquals(output.progress[0].chunks, [
       "[queue] 已提交给 Codex",
+      "\n",
       "[turn] started",
+      "\n",
       "[shutdown] shutting down",
+      "\n",
       "[turn] interrupted",
     ]);
     assertEquals(output.lateProgressAppends, []);
