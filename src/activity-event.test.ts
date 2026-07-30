@@ -8,18 +8,22 @@ describe("ActivityEvent", () => {
       tag: "TOOL",
       summary: "Run project tests",
       body: "Test output\nsecond output line",
+      threadId: "thread-789",
       turnId: "turn-123",
       itemId: "item-456",
       toolId: "command:deno-test",
+      toolState: "started",
       delivery: "progress",
     };
 
     assertEquals(event.tag, "TOOL");
     assertEquals(event.summary, "Run project tests");
     assertEquals(event.body, "Test output\nsecond output line");
+    assertEquals(event.threadId, "thread-789");
     assertEquals(event.turnId, "turn-123");
     assertEquals(event.itemId, "item-456");
     assertEquals(event.toolId, "command:deno-test");
+    assertEquals(event.toolState, "started");
     assertEquals(event.delivery, "progress");
   });
 

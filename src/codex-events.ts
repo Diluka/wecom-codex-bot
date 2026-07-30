@@ -1,26 +1,14 @@
+import type { ActivityEvent, ActivityToolState } from "./activity-event.ts";
+
 export interface CodexNotification {
   method: string;
   params?: Record<string, unknown>;
 }
 
-export type CodexProgressCategory =
-  | "content"
-  | "tool_result"
-  | "turn_status"
-  | "critical"
-  | "tool_started"
-  | "tool_completed";
-
-export interface CodexProgressEvent {
-  category: CodexProgressCategory;
-  text: string | null;
-  itemId?: string;
-  toolKey?: string;
-}
-
 interface ToolIdentity {
   itemId?: string;
-  toolKey: string;
+  toolId: string;
+  summary: string;
 }
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -29,8 +17,8 @@ function record(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function text(value: unknown): string | null {
-  return typeof value === "string" && value ? value : null;
+function text(value: unknown): string | undefined {
+  return typeof value === "string" && value ? value : undefined;
 }
 
 function status(value: unknown): string {
@@ -42,81 +30,71 @@ function changeKind(value: unknown): string {
   return text(record(value)?.type) ?? "change";
 }
 
+function scopedEvent(
+  params: Record<string, unknown>,
+  event: Omit<ActivityEvent, "delivery" | "threadId" | "turnId">,
+): ActivityEvent {
+  const turn = record(params.turn);
+  const threadId = text(params.threadId);
+  const turnId = text(params.turnId) ?? text(turn?.id);
+  return {
+    ...event,
+    ...(threadId ? { threadId } : {}),
+    ...(turnId ? { turnId } : {}),
+    delivery: "progress",
+  };
+}
+
+function itemId(params: Record<string, unknown>): string | undefined {
+  return text(params.itemId) ?? text(record(params.item)?.id);
+}
+
 function toolIdentity(
   item: Record<string, unknown>,
   params: Record<string, unknown>,
 ): ToolIdentity | null {
-  const itemId = text(params.itemId) ?? text(item.id) ?? undefined;
+  const id = text(params.itemId) ?? text(item.id);
 
   switch (item.type) {
-    case "commandExecution":
-      return { itemId, toolKey: text(item.command) ?? "commandExecution" };
+    case "commandExecution": {
+      const command = text(item.command) ?? "commandExecution";
+      return { itemId: id, toolId: `command:${command}`, summary: command };
+    }
     case "fileChange":
-      return { itemId, toolKey: "fileChange" };
-    case "mcpToolCall":
-      return {
-        itemId,
-        toolKey: `${text(item.server) ?? "mcp"}/${
-          text(item.tool) ?? "unknown"
-        }`,
-      };
-    case "dynamicToolCall":
-      return {
-        itemId,
-        toolKey: `${text(item.namespace) ?? "dynamic"}/${
-          text(item.tool) ?? "unknown"
-        }`,
-      };
+      return { itemId: id, toolId: "file:fileChange", summary: "file change" };
+    case "mcpToolCall": {
+      const tool = `${text(item.server) ?? "mcp"}/${
+        text(item.tool) ?? "unknown"
+      }`;
+      return { itemId: id, toolId: `mcp:${tool}`, summary: tool };
+    }
+    case "dynamicToolCall": {
+      const tool = `${text(item.namespace) ?? "dynamic"}/${
+        text(item.tool) ?? "unknown"
+      }`;
+      return { itemId: id, toolId: `dynamic:${tool}`, summary: tool };
+    }
     case "collabToolCall":
-    case "collabAgentToolCall":
-      return {
-        itemId,
-        toolKey: text(item.tool) ?? "collaboration",
-      };
-    case "webSearch":
-      return { itemId, toolKey: text(item.query) ?? "webSearch" };
+    case "collabAgentToolCall": {
+      const tool = text(item.tool) ?? "collaboration";
+      return { itemId: id, toolId: `collaboration:${tool}`, summary: tool };
+    }
+    case "webSearch": {
+      const query = text(item.query) ?? "web search";
+      return { itemId: id, toolId: `web-search:${query}`, summary: query };
+    }
     default:
       return null;
   }
 }
 
-function renderStarted(item: Record<string, unknown>): string | null {
+function completedToolBody(item: Record<string, unknown>): string | undefined {
   switch (item.type) {
-    case "commandExecution":
-      return text(item.command) ? `\n$ ${item.command}\n` : null;
-    case "fileChange":
-      return "\n[files] applying changes\n";
-    case "mcpToolCall":
-      return `\n[tool] ${String(item.server ?? "mcp")}/${
-        String(item.tool ?? "unknown")
-      }\n`;
-    case "dynamicToolCall":
-      return `\n[tool] ${String(item.namespace ?? "dynamic")}/${
-        String(item.tool ?? "unknown")
-      }\n`;
-    case "collabToolCall":
-    case "collabAgentToolCall":
-      return `\n[agent] ${String(item.tool ?? "collaboration")}\n`;
-    case "webSearch":
-      return text(item.query)
-        ? `\n[web search] ${item.query}\n`
-        : "\n[web search]\n";
-    default:
-      return null;
-  }
-}
-
-function renderCompleted(item: Record<string, unknown>): string | null {
-  switch (item.type) {
-    case "agentMessage":
-      return item.phase === "commentary" && text(item.text)
-        ? `\n[Codex] ${item.text}\n`
-        : null;
     case "commandExecution": {
       const exit = typeof item.exitCode === "number"
         ? `, exit ${item.exitCode}`
         : "";
-      return `[command ${status(item.status)}${exit}]\n`;
+      return `${status(item.status)}${exit}`;
     }
     case "fileChange": {
       const changes = Array.isArray(item.changes)
@@ -126,54 +104,66 @@ function renderCompleted(item: Record<string, unknown>): string | null {
           return path ? [`${changeKind(change?.kind)} ${path}`] : [];
         })
         : [];
-      const suffix = changes.length ? ` ${changes.join(", ")}` : "";
-      return `[files ${status(item.status)}]${suffix}\n`;
+      return [status(item.status), ...changes].join("\n");
     }
     case "mcpToolCall":
-      return `[tool ${String(item.server ?? "mcp")}/${
-        String(item.tool ?? "unknown")
-      } ${status(item.status)}]\n`;
     case "dynamicToolCall":
-      return `[tool ${String(item.namespace ?? "dynamic")}/${
-        String(item.tool ?? "unknown")
-      } ${status(item.status)}]\n`;
     case "collabToolCall":
     case "collabAgentToolCall":
-      return `[agent ${String(item.tool ?? "collaboration")} ${
-        status(item.status)
-      }]\n`;
-    case "plan":
-      return text(item.text) ? `\n[plan]\n${item.text}\n` : null;
+      return status(item.status);
+    // Web-search completion is intentionally textless but still closes a tool.
+    case "webSearch":
+      return undefined;
     default:
-      return null;
+      return undefined;
   }
 }
 
-function withToolIdentity(
-  category: "tool_started" | "tool_completed",
+function toolLifecycle(
+  state: ActivityToolState,
   item: Record<string, unknown>,
   params: Record<string, unknown>,
-): CodexProgressEvent | null {
+): ActivityEvent | null {
   const identity = toolIdentity(item, params);
   if (!identity) return null;
-  return {
-    category,
-    text: category === "tool_started"
-      ? renderStarted(item)
-      : renderCompleted(item),
+  const body = state === "completed" ? completedToolBody(item) : undefined;
+
+  return scopedEvent(params, {
+    tag: "TOOL",
+    summary: identity.summary,
+    ...(body !== undefined ? { body } : {}),
     ...(identity.itemId ? { itemId: identity.itemId } : {}),
-    toolKey: identity.toolKey,
-  };
+    toolId: identity.toolId,
+    toolState: state,
+  });
+}
+
+function toolResult(
+  params: Record<string, unknown>,
+  value: unknown,
+): ActivityEvent {
+  const body = text(value);
+  const id = itemId(params);
+  return scopedEvent(params, {
+    tag: "TOOL_RESULT",
+    ...(body !== undefined ? { body } : {}),
+    ...(id ? { itemId: id } : {}),
+  });
 }
 
 export function describeCodexNotification(
   notification: CodexNotification,
-): CodexProgressEvent | null {
+): ActivityEvent | null {
   const params = notification.params ?? {};
 
   switch (notification.method) {
-    case "item/reasoning/summaryTextDelta":
-      return { category: "content", text: text(params.delta) };
+    case "item/reasoning/summaryTextDelta": {
+      const body = text(params.delta);
+      return scopedEvent(params, {
+        tag: "CONTENT",
+        ...(body !== undefined ? { body } : {}),
+      });
+    }
     case "item/reasoning/textDelta":
     case "item/reasoning/summaryPartAdded":
     case "item/agentMessage/delta":
@@ -182,57 +172,65 @@ export function describeCodexNotification(
     case "command/exec/outputDelta":
     case "process/outputDelta":
     case "item/fileChange/outputDelta":
-      return { category: "tool_result", text: text(params.delta) };
+      return toolResult(params, params.delta);
     case "item/mcpToolCall/progress":
-      return {
-        category: "tool_result",
-        text: text(params.message) ? `[tool] ${params.message}\n` : null,
-      };
+      return toolResult(params, params.message);
     case "item/started": {
       const item = record(params.item);
-      return item ? withToolIdentity("tool_started", item, params) : null;
+      return item ? toolLifecycle("started", item, params) : null;
     }
     case "item/completed": {
       const item = record(params.item);
       if (!item) return null;
-      const tool = withToolIdentity("tool_completed", item, params);
+      const tool = toolLifecycle("completed", item, params);
       if (tool) return tool;
-      if (item.type === "agentMessage" || item.type === "plan") {
-        return { category: "content", text: renderCompleted(item) };
+      if (item.type === "agentMessage" && item.phase === "commentary") {
+        const body = text(item.text);
+        return scopedEvent(params, {
+          tag: "CONTENT",
+          summary: "Codex",
+          ...(body !== undefined ? { body } : {}),
+        });
+      }
+      if (item.type === "plan") {
+        const body = text(item.text);
+        return scopedEvent(params, {
+          tag: "PLAN",
+          ...(body !== undefined ? { body } : {}),
+        });
       }
       return null;
     }
     case "turn/started":
-      return { category: "turn_status", text: "[turn started]\n" };
+      return scopedEvent(params, {
+        tag: "TURN",
+        body: "started",
+      });
     case "turn/completed": {
       const turn = record(params.turn);
-      return {
-        category: "turn_status",
-        text: `[turn ${status(turn?.status)}]\n`,
-      };
+      return scopedEvent(params, {
+        tag: "TURN",
+        body: status(turn?.status),
+      });
     }
     case "error": {
       const error = record(params.error);
-      const message = text(error?.message);
-      return {
-        category: "critical",
-        text: message ? `[error] ${message}\n` : "[error]\n",
-      };
+      const body = text(error?.message);
+      return scopedEvent(params, {
+        tag: "ERROR",
+        ...(body !== undefined ? { body } : {}),
+      });
     }
     case "warning":
     case "guardianWarning":
-    case "configWarning":
-      return {
-        category: "critical",
-        text: text(params.message) ? `[warning] ${params.message}\n` : null,
-      };
+    case "configWarning": {
+      const body = text(params.message);
+      return scopedEvent(params, {
+        tag: "WARNING",
+        ...(body !== undefined ? { body } : {}),
+      });
+    }
     default:
       return null;
   }
-}
-
-export function renderCodexNotification(
-  notification: CodexNotification,
-): string | null {
-  return describeCodexNotification(notification)?.text ?? null;
 }
