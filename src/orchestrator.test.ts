@@ -217,6 +217,26 @@ class FakeOutput implements ChatOutput {
   }
 }
 
+class PendingFinalOutput extends FakeOutput {
+  readonly finalStarted = Promise.withResolvers<void>();
+  readonly finalGate = Promise.withResolvers<void>();
+
+  override send(
+    message: RoutedMessage,
+    text: string,
+    final = false,
+  ): Promise<void> {
+    this.sent.push({ msgId: message.msgId, text, final });
+    const error = this.sendErrors.shift();
+    if (error) return Promise.reject(error);
+    if (final) {
+      this.finalStarted.resolve();
+      return this.finalGate.promise;
+    }
+    return Promise.resolve();
+  }
+}
+
 class QueueBlockedOutput implements ChatOutput {
   readonly directStarted = Promise.withResolvers<void>();
   readonly directGate = Promise.withResolvers<void>();
@@ -603,7 +623,75 @@ describe("ConversationOrchestrator", () => {
     assertEquals(stopped, true);
   });
 
-  it("forces shutdown past a permanently pending direct reply and releases the progress queue", async () => {
+  it("forces shutdown past a pending terminal final reply", async () => {
+    const state = new FakeState();
+    const codex = new FakeCodex();
+    const output = new PendingFinalOutput();
+    const orchestrator = new ConversationOrchestrator({
+      state,
+      codex,
+      output,
+      workspace: "/workspace",
+      shutdownGraceMs: 1,
+    });
+    const running = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await waitFor(() => codex.starts.length === 1);
+    codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
+    await output.finalStarted.promise;
+
+    const stopping = orchestrator.interruptAll();
+    const stoppedWithinDeadline = await Promise.race([
+      stopping.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
+    ]);
+
+    // Keep the old implementation from leaving this test with a live drain.
+    if (!stoppedWithinDeadline) output.finalGate.resolve();
+    await Promise.all([running, stopping]);
+
+    assertEquals(stoppedWithinDeadline, true);
+    assertEquals(output.progress[0].finished, true);
+    assertEquals(
+      state.getConversation("single:alice")?.lastStatus,
+      "completed",
+    );
+  });
+
+  it("forces shutdown past a pending start-failure fallback", async () => {
+    const state = new FakeState();
+    const codex = new FakeCodex();
+    const output = new PendingFinalOutput();
+    const orchestrator = new ConversationOrchestrator({
+      state,
+      codex,
+      output,
+      workspace: "/workspace",
+      shutdownGraceMs: 1,
+    });
+    codex.startTurnErrors.push(new Error("start failed"));
+    const running = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await output.finalStarted.promise;
+
+    const stopping = orchestrator.interruptAll();
+    const stoppedWithinDeadline = await Promise.race([
+      stopping.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
+    ]);
+
+    // Keep the old implementation from leaving this test with a live drain.
+    if (!stoppedWithinDeadline) output.finalGate.resolve();
+    await Promise.all([running, stopping]);
+
+    assertEquals(stoppedWithinDeadline, true);
+    assertEquals(output.progress[0].finished, true);
+    assertMatch(output.sent[0].text, /任务启动失败：start failed/);
+  });
+
+  it("forces shutdown past a permanently pending direct callback and releases the progress queue", async () => {
     const state = new FakeState();
     const codex = new FakeCodex();
     const output = new QueueBlockedOutput();
@@ -633,15 +721,24 @@ describe("ConversationOrchestrator", () => {
       stopping.then(() => true),
       new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
     ]);
+    const directResult = await Promise.race([
+      Promise.resolve(direct).then(
+        () => "resolved" as const,
+        () => "rejected" as const,
+      ),
+      new Promise<"pending">((resolve) =>
+        setTimeout(() => resolve("pending"), 20)
+      ),
+    ]);
 
     if (!stoppedWithinDeadline) output.directGate.resolve();
+    if (directResult === "pending") output.afterShutdownGate.resolve();
     codex.starts[0].resolve({ status: "interrupted" });
     await Promise.all([running, stopping]);
 
     assertEquals(stoppedWithinDeadline, true);
+    assertEquals(directResult, "resolved");
     assertEquals(output.progress[0].finished, true);
-    output.afterShutdownGate.resolve();
-    await direct;
     await codex.starts[0].onActivity({
       tag: "CONTENT",
       body: "late activity",
@@ -650,7 +747,7 @@ describe("ConversationOrchestrator", () => {
     assertEquals(output.lateProgressAppends, []);
   });
 
-  it("shuts down a turn whose start RPC resolves after the grace deadline without rendering started", async () => {
+  it("finishes shutdown when start RPC never settles and only interrupts a late handle once", async () => {
     const startGate = Promise.withResolvers<void>();
     const { codex, orchestrator, output } = setup({ shutdownGraceMs: 1 });
     codex.startTurnGates.push(startGate.promise);
@@ -660,18 +757,20 @@ describe("ConversationOrchestrator", () => {
     await waitFor(() => codex.startTurnAttempts === 1);
 
     const stopping = orchestrator.interruptAll();
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    startGate.resolve();
-    await waitFor(() => codex.starts.length === 1);
-    const interrupted = await Promise.race([
-      waitFor(() => codex.interrupts.length === 1).then(() => true),
+    const stoppedWithinDeadline = await Promise.race([
+      stopping.then(() => true),
       new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
     ]);
 
-    if (!interrupted) codex.starts[0].resolve({ status: "interrupted" });
+    // Keep the old implementation from leaving this test with a live drain.
+    if (!stoppedWithinDeadline) {
+      startGate.resolve();
+      await waitFor(() => codex.starts.length === 1);
+      codex.starts[0].resolve({ status: "interrupted" });
+    }
     await Promise.all([running, stopping]);
 
-    assertEquals(interrupted, true);
+    assertEquals(stoppedWithinDeadline, true);
     assertEquals(
       output.progress[0].chunks.includes("[shutdown] shutting down"),
       true,
@@ -685,6 +784,24 @@ describe("ConversationOrchestrator", () => {
       true,
     );
     assertEquals(output.progress[0].finished, true);
+
+    startGate.resolve();
+    await waitFor(() => codex.starts.length === 1);
+    await waitFor(() => codex.interrupts.length === 1);
+    assertEquals(codex.interrupts, [{
+      threadId: "thread-1",
+      turnId: "turn-1",
+    }]);
+
+    const terminalChunks = [...output.progress[0].chunks];
+    await codex.starts[0].onActivity({
+      tag: "CONTENT",
+      body: "late activity",
+      delivery: "progress",
+    });
+    codex.starts[0].resolve({ status: "interrupted" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEquals(output.progress[0].chunks, terminalChunks);
   });
 
   it("renders shutdown through the active pipeline and rejects late activity after finish", async () => {

@@ -94,15 +94,20 @@ export interface ConversationOrchestratorOptions {
   interruptRetryDelaysMs?: readonly number[];
 }
 
+interface TurnControl {
+  forceComplete: (outcome: TurnOutcome) => void;
+  forceSignal: Promise<TurnOutcome>;
+  forced: boolean;
+}
+
 interface ActiveTurn {
   threadId: string;
   turnId?: string;
   turnOutput: TurnOutput;
-  forceComplete: (outcome: TurnOutcome) => void;
-  forceSignal: Promise<TurnOutcome>;
-  forced: boolean;
+  control: TurnControl;
   shutdownRequested: boolean;
   interruptWhenReady: boolean;
+  lateInterruptRequested: boolean;
 }
 
 interface TurnOutput {
@@ -120,6 +125,7 @@ interface ConversationSlot {
   pending?: RoutedText;
   resetPending?: RoutedText;
   active?: ActiveTurn;
+  control?: TurnControl;
   interruptRequested: boolean;
   interruptFailures: number;
   interruptRetryTimer?: ReturnType<typeof setTimeout>;
@@ -256,7 +262,7 @@ export class ConversationOrchestrator {
     if (drained) return;
 
     for (const slot of this.#slots.values()) {
-      slot.active?.forceComplete({
+      slot.control?.forceComplete({
         status: "runtime_lost",
         error: "shutdown grace period expired",
       });
@@ -291,11 +297,14 @@ export class ConversationOrchestrator {
 
       const message = slot.pending!;
       slot.pending = undefined;
+      const control = this.#createTurnControl();
+      slot.control = control;
       try {
-        await this.#runTurn(message, slot);
+        await this.#runTurn(message, slot, control);
       } catch (error) {
         try {
-          await this.#output.send(
+          await this.#sendWithForce(
+            control,
             message,
             `任务启动失败：${errorMessage(error)}`,
             true,
@@ -303,10 +312,15 @@ export class ConversationOrchestrator {
         } catch {
           // Continue draining newer work when the fallback cannot be sent.
         }
+      } finally {
+        if (slot.active?.control === control) {
+          this.#clearActive(slot, slot.active);
+        }
+        if (slot.control === control) slot.control = undefined;
       }
     }
 
-    if (!slot.active && !slot.pending && !slot.resetPending) {
+    if (!slot.active && !slot.control && !slot.pending && !slot.resetPending) {
       this.#slots.delete(conversationKey);
     }
   }
@@ -339,6 +353,7 @@ export class ConversationOrchestrator {
   async #runTurn(
     message: RoutedText,
     slot: ConversationSlot,
+    control: TurnControl,
   ): Promise<void> {
     const threadId = await this.#ensureThread(message);
 
@@ -353,7 +368,7 @@ export class ConversationOrchestrator {
         tag: "QUEUE",
         body: "已提交给 Codex",
         delivery: "progress",
-      });
+      }, control);
     } catch (error) {
       await this.#finishTurnOutput(turnOutput);
       throw error;
@@ -366,59 +381,94 @@ export class ConversationOrchestrator {
       content: message.text,
     });
 
-    const forced = Promise.withResolvers<TurnOutcome>();
     const active: ActiveTurn = {
       threadId,
       turnOutput,
-      forceComplete: () => {},
-      forceSignal: forced.promise,
-      forced: false,
+      control,
       shutdownRequested: false,
       interruptWhenReady: false,
-    };
-    active.forceComplete = (outcome) => {
-      active.forced = true;
-      forced.resolve(outcome);
+      lateInterruptRequested: false,
     };
     slot.active = active;
     slot.interruptRequested = false;
     slot.interruptFailures = 0;
     if (this.#shuttingDown) {
       this.#requestShutdown(slot);
-      active.forceComplete({
+      control.forceComplete({
         status: "runtime_lost",
         error: "shutdown began before turn started",
       });
     }
 
-    let handle: CodexTurnHandle;
+    let start: Promise<CodexTurnHandle>;
     try {
-      handle = await this.#codex.startTurn(
+      start = this.#codex.startTurn(
         threadId,
         prompt,
-        (activity) => this.#enqueueActivity(turnOutput, activity),
+        (activity) => this.#enqueueActivity(turnOutput, activity, control),
       );
     } catch (error) {
-      try {
-        await this.#finishTurnOutput(turnOutput, undefined, active);
-      } finally {
-        this.#clearInterruptRetry(slot);
-        if (slot.active === active) slot.active = undefined;
-        slot.interruptRequested = false;
-        slot.interruptFailures = 0;
-      }
-      throw error;
+      start = Promise.reject(error);
     }
+
+    const startResult = await Promise.race([
+      start.then(
+        (handle) => ({ type: "handle" as const, handle }),
+        (error) => ({ type: "error" as const, error }),
+      ),
+      control.forceSignal.then((outcome) => ({
+        type: "forced" as const,
+        outcome,
+      })),
+    ]);
+    if (startResult.type === "forced") {
+      this.#observeLateStart(active, start);
+      try {
+        await this.#finishTurnOutput(turnOutput, {
+          tag: "TURN",
+          body: startResult.outcome.status,
+          delivery: "progress",
+        }, control);
+      } finally {
+        this.#clearActive(slot, active);
+      }
+      return;
+    }
+
+    if (startResult.type === "error") {
+      try {
+        await this.#finishTurnOutput(turnOutput, undefined, control);
+      } finally {
+        this.#clearActive(slot, active);
+      }
+      throw startResult.error;
+    }
+
+    const handle = startResult.handle;
 
     active.turnId = handle.turnId;
     if (active.interruptWhenReady) this.#requestInterrupt(slot);
+    if (control.forced) {
+      void handle.completion.catch(() => undefined);
+      const forcedOutcome = await control.forceSignal;
+      try {
+        await this.#finishTurnOutput(turnOutput, {
+          tag: "TURN",
+          body: forcedOutcome.status,
+          delivery: "progress",
+        }, control);
+      } finally {
+        this.#clearActive(slot, active);
+      }
+      return;
+    }
     try {
       if (!active.shutdownRequested) {
         await this.#enqueueActivity(turnOutput, {
           tag: "TURN",
           body: "started",
           delivery: "progress",
-        });
+        }, control);
       }
       this.#state.beginTurn(message.conversationKey, handle.turnId);
     } catch (error) {
@@ -427,7 +477,7 @@ export class ConversationOrchestrator {
       try {
         interruptedOutcome = await Promise.race([
           handle.completion,
-          forced.promise,
+          control.forceSignal,
         ]);
       } catch (completionError) {
         interruptedOutcome = {
@@ -440,12 +490,9 @@ export class ConversationOrchestrator {
           tag: "TURN",
           body: interruptedOutcome.status,
           delivery: "progress",
-        }, active);
+        }, control);
       } finally {
-        this.#clearInterruptRetry(slot);
-        if (slot.active === active) slot.active = undefined;
-        slot.interruptRequested = false;
-        slot.interruptFailures = 0;
+        this.#clearActive(slot, active);
       }
       void handle.completion.catch(() => undefined);
       throw error;
@@ -454,7 +501,7 @@ export class ConversationOrchestrator {
 
     let outcome: TurnOutcome;
     try {
-      outcome = await Promise.race([handle.completion, forced.promise]);
+      outcome = await Promise.race([handle.completion, control.forceSignal]);
     } catch (error) {
       outcome = { status: "failed", error: errorMessage(error) };
     }
@@ -464,7 +511,7 @@ export class ConversationOrchestrator {
         tag: "TURN",
         body: outcome.status,
         delivery: "progress",
-      }, active);
+      }, control);
       try {
         this.#state.finishTurn(
           message.conversationKey,
@@ -476,10 +523,7 @@ export class ConversationOrchestrator {
         this.#report(error);
       }
     } finally {
-      this.#clearInterruptRetry(slot);
-      if (slot.active === active) slot.active = undefined;
-      slot.interruptRequested = false;
-      slot.interruptFailures = 0;
+      this.#clearActive(slot, active);
     }
 
     const superseded = Boolean(slot.resetPending || slot.pending);
@@ -487,11 +531,12 @@ export class ConversationOrchestrator {
       outcome.status === "completed" && outcome.finalAnswer && !superseded &&
       !this.#shuttingDown
     ) {
-      await this.#output.send(message, outcome.finalAnswer, true);
+      await this.#sendWithForce(control, message, outcome.finalAnswer, true);
     } else if (
       outcome.status === "failed" && !superseded && !this.#shuttingDown
     ) {
-      await this.#output.send(
+      await this.#sendWithForce(
+        control,
         message,
         `Codex 执行失败：${outcome.error ?? "unknown error"}`,
         true,
@@ -514,11 +559,60 @@ export class ConversationOrchestrator {
     };
   }
 
+  #createTurnControl(): TurnControl {
+    const forced = Promise.withResolvers<TurnOutcome>();
+    const control: TurnControl = {
+      forceComplete: () => {},
+      forceSignal: forced.promise,
+      forced: false,
+    };
+    control.forceComplete = (outcome) => {
+      if (control.forced) return;
+      control.forced = true;
+      forced.resolve(outcome);
+    };
+    return control;
+  }
+
+  async #sendWithForce(
+    control: TurnControl,
+    message: RoutedMessage,
+    text: string,
+    final = false,
+  ): Promise<void> {
+    if (control.forced) return;
+    let send: Promise<void>;
+    try {
+      send = this.#output.send(message, text, final);
+    } catch (error) {
+      send = Promise.reject(error);
+    }
+    const result = await Promise.race([
+      send.then(
+        () => ({ type: "sent" as const }),
+        (error) => ({ type: "error" as const, error }),
+      ),
+      control.forceSignal.then(() => ({ type: "forced" as const })),
+    ]);
+    if (result.type === "error") throw result.error;
+  }
+
+  #clearActive(slot: ConversationSlot, active: ActiveTurn): void {
+    this.#clearInterruptRetry(slot);
+    if (slot.active === active) slot.active = undefined;
+    slot.interruptRequested = false;
+    slot.interruptFailures = 0;
+  }
+
   #enqueueActivity(
     turnOutput: TurnOutput,
     activity: ActivityEvent,
+    control?: TurnControl,
   ): Promise<void> {
-    if (!turnOutput.acceptingActivities || turnOutput.finished) {
+    if (
+      control?.forced || !turnOutput.acceptingActivities ||
+      turnOutput.finished
+    ) {
       return Promise.resolve();
     }
     const result = turnOutput.activityTail.then(async () => {
@@ -529,7 +623,8 @@ export class ConversationOrchestrator {
       () => undefined,
       () => undefined,
     );
-    return result;
+    if (!control) return result;
+    return Promise.race([result, control.forceSignal.then(() => undefined)]);
   }
 
   async #dispatchActivity(
@@ -552,21 +647,21 @@ export class ConversationOrchestrator {
   async #finishTurnOutput(
     turnOutput: TurnOutput,
     terminal?: ActivityEvent,
-    active?: ActiveTurn,
+    control?: TurnControl,
   ): Promise<void> {
     if (turnOutput.finished) return;
     turnOutput.acceptingActivities = false;
-    let forced = active?.forced ?? false;
-    if (!forced && active) {
+    let forced = control?.forced ?? false;
+    if (!forced && control) {
       forced = await Promise.race([
         turnOutput.activityTail.then(() => false),
-        active.forceSignal.then(() => true),
+        control.forceSignal.then(() => true),
       ]);
     } else if (!forced) {
       await turnOutput.activityTail;
     }
     if (
-      (forced || active?.forced) && turnOutput.shutdownActivity &&
+      (forced || control?.forced) && turnOutput.shutdownActivity &&
       !turnOutput.shutdownHandled
     ) {
       try {
@@ -625,10 +720,28 @@ export class ConversationOrchestrator {
         delivery: "progress",
       };
       active.turnOutput.shutdownActivity = activity;
-      void this.#enqueueActivity(active.turnOutput, activity)
+      void this.#enqueueActivity(active.turnOutput, activity, active.control)
         .catch((error) => this.#report(error));
     }
     this.#requestInterrupt(slot);
+  }
+
+  #observeLateStart(
+    active: ActiveTurn,
+    start: Promise<CodexTurnHandle>,
+  ): void {
+    void start.then(
+      (handle) => {
+        void handle.completion.catch(() => undefined);
+        if (
+          !active.interruptWhenReady || active.lateInterruptRequested
+        ) return;
+        active.lateInterruptRequested = true;
+        void this.#codex.interruptTurn(active.threadId, handle.turnId)
+          .catch((error) => this.#report(error));
+      },
+      () => undefined,
+    );
   }
 
   #requestInterrupt(slot: ConversationSlot): void {
@@ -648,7 +761,9 @@ export class ConversationOrchestrator {
           tag: "ERROR",
           body: `interrupt failed: ${errorMessage(error)}`,
           delivery: "progress",
-        }).catch((activityError) => this.#report(activityError));
+        }, active.control).catch((activityError) =>
+          this.#report(activityError)
+        );
         if (slot.active !== active) return;
         slot.interruptRequested = false;
         if (this.#shuttingDown || (!slot.pending && !slot.resetPending)) return;

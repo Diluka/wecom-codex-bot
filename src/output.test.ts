@@ -347,6 +347,48 @@ describe("WeComSink", () => {
 });
 
 describe("StreamController", () => {
+  it("finishes during shutdown when a pending non-critical flush holds the send queue", async () => {
+    const queue = new ConversationSendQueue();
+    const flushStarted = Promise.withResolvers<void>();
+    const flushGate = Promise.withResolvers<void>();
+    const calls: boolean[] = [];
+    const sink = new WeComSink({
+      queue,
+      send: async (_frame, _streamId, _content, finish) => {
+        calls.push(finish);
+        if (!finish) {
+          flushStarted.resolve();
+          await flushGate.promise;
+        }
+      },
+    });
+    const controller = new StreamController({
+      conversationKey: "single:alice",
+      frame: { key: "single:alice" },
+      sink,
+      streamIdFactory: () => "stream-1",
+    });
+    controller.append("working");
+
+    const flushing = controller.flush();
+    await flushStarted.promise;
+    queue.beginShutdown();
+    const finishing = controller.finish();
+    const finishedWithinDeadline = await Promise.race([
+      finishing.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
+    ]);
+
+    // Keep the old implementation from leaving this test with a live stream.
+    if (!finishedWithinDeadline) flushGate.resolve();
+    const [flushed, finished] = await Promise.all([flushing, finishing]);
+
+    assertEquals(finishedWithinDeadline, true);
+    assertEquals(flushed, false);
+    assertEquals(finished, true);
+    assertEquals(calls, [false, true]);
+  });
+
   it("coalesces updates for 2.5 seconds and keeps one stream id", async () => {
     const calls: SendCall[] = [];
     const timers = new FakeTimers();
