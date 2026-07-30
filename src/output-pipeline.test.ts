@@ -91,6 +91,33 @@ describe("TurnOutputPipeline", () => {
     );
   });
 
+  it("renders subagent status independently from tool aggregation settings", () => {
+    const event = progress({
+      tag: "SUBAGENT",
+      body: "amber-otter：正在工作",
+      itemId: "child-1",
+    });
+
+    assertEquals(
+      new TurnOutputPipeline(outputSettings({ toolFormat: "merge_all" })).apply(
+        event,
+      ),
+      "[subagent] amber-otter：正在工作",
+    );
+    assertEquals(
+      new TurnOutputPipeline(
+        outputSettings({ labels: { SUBAGENT: "hide" } }),
+      ).apply(event),
+      "amber-otter：正在工作",
+    );
+    assertEquals(
+      new TurnOutputPipeline(
+        outputSettings({ levels: { SUBAGENT: "off" } }),
+      ).apply(event),
+      null,
+    );
+  });
+
   it("merges matching concurrent tool lifecycles by their tool identity", () => {
     const pipeline = new TurnOutputPipeline(
       outputSettings({ toolFormat: "merge_same" }),

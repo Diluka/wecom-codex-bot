@@ -8,6 +8,7 @@ export const OUTPUT_TAGS = [
   "WARNING",
   "ERROR",
   "SHUTDOWN",
+  "SUBAGENT",
 ] as const;
 
 export type OutputTag = (typeof OUTPUT_TAGS)[number];
