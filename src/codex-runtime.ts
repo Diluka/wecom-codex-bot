@@ -42,6 +42,10 @@ interface ActiveTurn {
   resolve: (outcome: TurnOutcome) => void;
 }
 
+interface PendingTurnStart {
+  readonly generation: number;
+}
+
 const RESTART_DELAYS = [1_000, 2_000, 4_000, 8_000, 16_000] as const;
 const defaultClientFactory: CodexRuntimeClientFactory = (options) =>
   CodexAppServerClient.start(options);
@@ -75,7 +79,7 @@ export class CodexRuntime implements CodexPort {
   readonly #bufferedActivities = new Map<string, ActivityEvent[]>();
   readonly #bufferedOutcomes = new Map<string, TurnOutcome>();
   readonly #terminalTurnKeys = new Set<string>();
-  readonly #startingThreads = new Map<string, number>();
+  readonly #startingThreads = new Map<string, Set<PendingTurnStart>>();
   readonly #connectingTokens = new Set<object>();
   readonly #earlyExits = new Map<object, AppServerProcessStatus>();
 
@@ -163,7 +167,7 @@ export class CodexRuntime implements CodexPort {
   ): Promise<CodexTurnHandle> {
     const client = this.#requireClient();
     const clientToken = this.#clientToken;
-    this.#startPendingTurn(threadId);
+    const pendingStart = this.#startPendingTurn(threadId);
     try {
       const turnId = await client.startTurn(threadId, prompt);
       const { promise: completion, resolve } = Promise.withResolvers<
@@ -175,7 +179,7 @@ export class CodexRuntime implements CodexPort {
         !this.#ready || client !== this.#client ||
         clientToken !== this.#clientToken
       ) {
-        this.#clearBufferedTurn(key);
+        // Exit and stop already clear the old generation's buffers.
         resolve({ status: "runtime_lost" });
         return { turnId, completion };
       }
@@ -198,7 +202,7 @@ export class CodexRuntime implements CodexPort {
       }
       return { turnId, completion };
     } finally {
-      this.#finishPendingTurn(threadId);
+      this.#finishPendingTurn(threadId, pendingStart);
     }
   }
 
@@ -429,25 +433,33 @@ export class CodexRuntime implements CodexPort {
     this.#startingThreads.clear();
   }
 
-  #startPendingTurn(threadId: string): void {
-    this.#startingThreads.set(
-      threadId,
-      (this.#startingThreads.get(threadId) ?? 0) + 1,
-    );
+  #startPendingTurn(threadId: string): PendingTurnStart {
+    const pendingStart = { generation: this.#generation };
+    const pendingStarts = this.#startingThreads.get(threadId) ?? new Set();
+    pendingStarts.add(pendingStart);
+    this.#startingThreads.set(threadId, pendingStarts);
+    return pendingStart;
   }
 
-  #finishPendingTurn(threadId: string): void {
-    const count = this.#startingThreads.get(threadId) ?? 0;
-    if (count <= 1) {
-      this.#startingThreads.delete(threadId);
+  #finishPendingTurn(
+    threadId: string,
+    pendingStart: PendingTurnStart,
+  ): void {
+    const pendingStarts = this.#startingThreads.get(threadId);
+    if (!pendingStarts?.delete(pendingStart) || pendingStarts.size > 0) return;
+    this.#startingThreads.delete(threadId);
+    if (pendingStart.generation === this.#generation) {
       this.#clearBufferedThread(threadId);
-      return;
     }
-    this.#startingThreads.set(threadId, count - 1);
   }
 
   #isPendingTurn(threadId: string): boolean {
-    return (this.#startingThreads.get(threadId) ?? 0) > 0;
+    const pendingStarts = this.#startingThreads.get(threadId);
+    if (!pendingStarts) return false;
+    for (const pendingStart of pendingStarts) {
+      if (pendingStart.generation === this.#generation) return true;
+    }
+    return false;
   }
 
   #clearBufferedTurn(key: string): void {

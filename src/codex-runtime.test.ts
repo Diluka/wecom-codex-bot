@@ -671,6 +671,82 @@ describe("CodexRuntime", () => {
     await runtime.stop();
   });
 
+  it("preserves replacement early events when an old generation turn RPC resolves late", async () => {
+    const factory = new FakeFactory();
+    const crashed = new FakeClient();
+    const replacement = new FakeClient();
+    const originalResponse = deferred<string>();
+    const replacementResponse = deferred<string>();
+    crashed.turnIds.push(originalResponse.promise);
+    replacement.turnIds.push(replacementResponse.promise);
+    factory.queue.push(crashed, replacement);
+    const runtime = runtimeWith(factory, { delay: async () => {} });
+    await runtime.start();
+
+    const originalStarting = runtime.startTurn(
+      "thread-generation-race",
+      "original",
+      () => {},
+    );
+    await waitFor(() => crashed.startedTurns.length === 1, "original turn RPC");
+    crashed.exit();
+    await waitFor(() => runtime.ready && runtime.generation === 2, "restart");
+
+    const activities: ActivityEvent[] = [];
+    const replacementStarting = runtime.startTurn(
+      "thread-generation-race",
+      "replacement",
+      (activity) => {
+        activities.push(activity);
+      },
+    );
+    await waitFor(
+      () => replacement.startedTurns.length === 1,
+      "replacement turn RPC",
+    );
+    replacement.callbacks.onNotification?.({
+      method: "item/reasoning/summaryTextDelta",
+      params: {
+        threadId: "thread-generation-race",
+        turnId: "turn-reused-across-generations",
+        delta: "replacement early summary",
+      },
+    });
+    replacement.callbacks.onTurnCompleted?.({
+      threadId: "thread-generation-race",
+      turnId: "turn-reused-across-generations",
+      status: "completed",
+      error: null,
+      finalMessage: "replacement answer",
+    });
+
+    originalResponse.resolve("turn-reused-across-generations");
+    const original = await originalStarting;
+    const originalOutcome = await original.completion;
+
+    replacementResponse.resolve("turn-reused-across-generations");
+    const recovered = await replacementStarting;
+    const replacementOutcome = await Promise.race([
+      recovered.completion,
+      Promise.resolve({ status: "still_pending" } as const),
+    ]);
+    await runtime.stop();
+
+    assertEquals(originalOutcome, { status: "runtime_lost" });
+    assertEquals(activities, [{
+      tag: "CONTENT",
+      body: "replacement early summary",
+      threadId: "thread-generation-race",
+      turnId: "turn-reused-across-generations",
+      delivery: "progress",
+    }]);
+    assertEquals(replacementOutcome, {
+      status: "completed",
+      finalAnswer: "replacement answer",
+      error: null,
+    });
+  });
+
   it("replays early activity for a reused key after restart clears terminal state", async () => {
     const factory = new FakeFactory();
     const crashed = new FakeClient();
