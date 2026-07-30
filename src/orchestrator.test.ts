@@ -11,6 +11,8 @@ import {
   type RoutedText,
   type TurnOutcome,
 } from "./orchestrator.ts";
+import type { ActivityEvent } from "./activity-event.ts";
+import { OUTPUT_TAGS, type OutputSettings } from "./output-settings.ts";
 
 function message(
   conversationKey: `single:${string}` | `group:${string}`,
@@ -27,6 +29,22 @@ function message(
     msgId,
     text: content,
     frame: { id: msgId },
+  };
+}
+
+function outputSettings(
+  level: OutputSettings["level"] = "full",
+): OutputSettings {
+  return {
+    level,
+    levels: Object.fromEntries(
+      OUTPUT_TAGS.map((tag) => [tag, level]),
+    ) as OutputSettings["levels"],
+    label: "show",
+    labels: Object.fromEntries(
+      OUTPUT_TAGS.map((tag) => [tag, "show"]),
+    ) as OutputSettings["labels"],
+    toolFormat: "individual",
   };
 }
 
@@ -102,7 +120,7 @@ class FakeState implements OrchestratorState {
 interface StartedTurn {
   threadId: string;
   prompt: string;
-  onProgress: (text: string) => void;
+  onActivity: (event: ActivityEvent) => void | Promise<void>;
   turnId: string;
   resolve: (outcome: TurnOutcome) => void;
 }
@@ -133,7 +151,7 @@ class FakeCodex implements CodexPort {
   async startTurn(
     threadId: string,
     prompt: string,
-    onProgress: (text: string) => void,
+    onActivity: (event: ActivityEvent) => void | Promise<void>,
   ): Promise<CodexTurnHandle> {
     this.startTurnAttempts++;
     const gate = this.startTurnGates.shift();
@@ -142,7 +160,7 @@ class FakeCodex implements CodexPort {
     if (error) throw error;
     const { promise, resolve } = Promise.withResolvers<TurnOutcome>();
     const turnId = `turn-${++this.turnSequence}`;
-    this.starts.push({ threadId, prompt, onProgress, turnId, resolve });
+    this.starts.push({ threadId, prompt, onActivity, turnId, resolve });
     return { turnId, completion: promise };
   }
 
@@ -161,6 +179,7 @@ class FakeOutput implements ChatOutput {
     { msgId: string; chunks: string[]; finished: boolean }
   > = [];
   readonly sendErrors: Error[] = [];
+  readonly lateProgressAppends: Array<{ msgId: string; text: string }> = [];
   failNextProgressFinish = false;
 
   send(message: RoutedMessage, text: string, final = false): Promise<void> {
@@ -178,7 +197,13 @@ class FakeOutput implements ChatOutput {
     };
     this.progress.push(entry);
     return Promise.resolve({
-      append: (text: string) => entry.chunks.push(text),
+      append: (text: string) => {
+        if (entry.finished) {
+          this.lateProgressAppends.push({ msgId: message.msgId, text });
+          return;
+        }
+        entry.chunks.push(text);
+      },
       finish: () => {
         entry.finished = true;
         if (this.failNextProgressFinish) {
@@ -224,7 +249,11 @@ describe("ConversationOrchestrator", () => {
     assertEquals(codex.starts[0].threadId, "thread-1");
     assertMatch(codex.starts[0].prompt, /sender_userid: bob/);
     assertMatch(codex.starts[0].prompt, /conversation_key: group:engineering/);
-    codex.starts[0].onProgress("正在检查");
+    await codex.starts[0].onActivity({
+      tag: "CONTENT",
+      body: "正在检查",
+      delivery: "progress",
+    });
     codex.starts[0].resolve({ status: "completed", finalAnswer: "测试正常" });
     await running;
 
@@ -232,11 +261,12 @@ describe("ConversationOrchestrator", () => {
       state.getConversation("group:engineering")?.threadId,
       "thread-1",
     );
-    assertEquals(output.progress[0].chunks.includes("正在检查"), true);
-    assertEquals(
-      output.progress[0].chunks.includes("[turn completed]\n"),
-      true,
-    );
+    assertEquals(output.progress[0].chunks, [
+      "[queue] 已提交给 Codex",
+      "[turn] started",
+      "[content] 正在检查",
+      "[turn] completed",
+    ]);
     assertEquals(output.sent.at(-1), {
       msgId: "m1",
       text: "测试正常",
@@ -244,64 +274,66 @@ describe("ConversationOrchestrator", () => {
     });
   });
 
-  it("keeps queue and turn statuses at turn detail but hides passive statuses at none", async () => {
-    const visible = setup({
-      progressSettings: {
-        intermediateOutput: "full",
-        statusDetail: "turn",
-      },
+  it("routes direct user input and final answers when every output level is off", async () => {
+    const { codex, orchestrator, output } = setup({
+      outputSettings: outputSettings("off"),
     });
-    const visibleRunning = visible.orchestrator.handleText(
-      message("single:alice", "visible", "work"),
+    const running = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
     );
-    await waitFor(() => visible.codex.starts.length === 1);
-    visible.codex.starts[0].resolve({
-      status: "completed",
-      finalAnswer: "visible final",
+    await waitFor(() => codex.starts.length === 1);
+
+    await codex.starts[0].onActivity({
+      tag: "CONTENT",
+      body: "Codex 需要用户输入\n\n请补充范围。",
+      delivery: "direct",
     });
-    await visibleRunning;
-    assertEquals(visible.output.progress[0].chunks, [
-      "[queued] 已提交给 Codex\n",
-      "[turn completed]\n",
+    await waitFor(() => output.sent.length === 1);
+    codex.starts[0].resolve({ status: "completed", finalAnswer: "final" });
+    await running;
+
+    assertEquals(output.progress[0].chunks, []);
+    assertEquals(output.sent, [
+      {
+        msgId: "m1",
+        text: "Codex 需要用户输入\n\n请补充范围。",
+        final: false,
+      },
+      { msgId: "m1", text: "final", final: true },
     ]);
-
-    const hidden = setup({
-      progressSettings: {
-        intermediateOutput: "full",
-        statusDetail: "none",
-      },
-    });
-    const hiddenRunning = hidden.orchestrator.handleText(
-      message("single:alice", "hidden", "work"),
-    );
-    await waitFor(() => hidden.codex.starts.length === 1);
-    hidden.codex.starts[0].resolve({
-      status: "completed",
-      finalAnswer: "hidden final",
-    });
-    await hiddenRunning;
-
-    assertEquals(hidden.output.progress[0].chunks, []);
-    assertEquals(hidden.output.sent, [{
-      msgId: "hidden",
-      text: "hidden final",
-      final: true,
-    }]);
   });
 
-  it("keeps direct failures visible when passive status is disabled", async () => {
+  it("keeps help, status, unsupported notices, and start failures direct when levels are off", async () => {
     const { codex, orchestrator, output } = setup({
-      progressSettings: {
-        intermediateOutput: "none",
-        statusDetail: "none",
-      },
+      outputSettings: outputSettings("off"),
     });
     codex.startTurnErrors.push(new Error("start failed"));
 
-    await orchestrator.handleText(message("single:alice", "m1", "work"));
+    await orchestrator.handleText(message("single:alice", "help", "/help"));
+    await orchestrator.handleText(message("single:alice", "status", "/status"));
+    await orchestrator.handleUnsupported(
+      message("single:alice", "image", ""),
+      "image",
+    );
+    await orchestrator.handleText(message("single:alice", "work", "work"));
 
-    assertEquals(output.progress[0].chunks, ["[failed] start failed\n"]);
-    assertMatch(output.sent.at(-1)!.text, /任务启动失败：start failed/);
+    assertEquals(output.progress[0].chunks, []);
+    assertMatch(
+      output.sent.find((entry) => entry.msgId === "help")!.text,
+      /\/new/,
+    );
+    assertMatch(
+      output.sent.find((entry) => entry.msgId === "status")!.text,
+      /idle/,
+    );
+    assertMatch(
+      output.sent.find((entry) => entry.msgId === "image")!.text,
+      /暂不支持/,
+    );
+    assertMatch(
+      output.sent.find((entry) => entry.msgId === "work")!.text,
+      /任务启动失败：start failed/,
+    );
   });
 
   it("interrupts an active turn and only runs the latest pending message", async () => {
@@ -513,6 +545,73 @@ describe("ConversationOrchestrator", () => {
     assertEquals(stopped, true);
   });
 
+  it("renders shutdown through the active pipeline and rejects late activity after finish", async () => {
+    const { codex, orchestrator, output } = setup();
+    const running = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await waitFor(() => codex.starts.length === 1);
+
+    const stopping = orchestrator.interruptAll();
+    await waitFor(() => codex.interrupts.length === 1);
+    codex.starts[0].resolve({ status: "interrupted" });
+    await Promise.all([running, stopping]);
+
+    await codex.starts[0].onActivity({
+      tag: "CONTENT",
+      body: "late activity",
+      delivery: "progress",
+    });
+    assertEquals(output.progress[0].chunks, [
+      "[queue] 已提交给 Codex",
+      "[turn] started",
+      "[shutdown] shutting down",
+      "[turn] interrupted",
+    ]);
+    assertEquals(output.lateProgressAppends, []);
+  });
+
+  it("filters shutdown only through its output level", async () => {
+    const settings = outputSettings();
+    settings.levels.SHUTDOWN = "off";
+    const { codex, orchestrator, output } = setup({ outputSettings: settings });
+    const running = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await waitFor(() => codex.starts.length === 1);
+
+    const stopping = orchestrator.interruptAll();
+    await waitFor(() => codex.interrupts.length === 1);
+    codex.starts[0].resolve({ status: "interrupted" });
+    await Promise.all([running, stopping]);
+
+    assertEquals(
+      output.progress[0].chunks.includes("[shutdown] shutting down"),
+      false,
+    );
+  });
+
+  it("respects the shutdown label setting without changing its visibility", async () => {
+    const settings = outputSettings();
+    settings.labels.SHUTDOWN = "hide";
+    const { codex, orchestrator, output } = setup({ outputSettings: settings });
+    const running = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await waitFor(() => codex.starts.length === 1);
+
+    const stopping = orchestrator.interruptAll();
+    await waitFor(() => codex.interrupts.length === 1);
+    codex.starts[0].resolve({ status: "interrupted" });
+    await Promise.all([running, stopping]);
+
+    assertEquals(output.progress[0].chunks.includes("shutting down"), true);
+    assertEquals(
+      output.progress[0].chunks.includes("[shutdown] shutting down"),
+      false,
+    );
+  });
+
   it("bounds shutdown when an interrupted turn never reaches terminal state", async () => {
     const { codex, orchestrator, output, state } = setup({
       shutdownGraceMs: 1,
@@ -566,6 +665,10 @@ describe("ConversationOrchestrator", () => {
       turnId: "turn-1",
     }]);
     assertEquals(output.progress[0].finished, true);
+    assertEquals(
+      output.progress[0].chunks.includes("[turn] interrupted"),
+      true,
+    );
     assertMatch(output.sent.at(-1)!.text, /beginTurn failed/);
   });
 

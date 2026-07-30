@@ -1,8 +1,9 @@
+import type { ActivityEvent } from "./activity-event.ts";
+import { TurnOutputPipeline } from "./output-pipeline.ts";
 import { buildCodexPrompt } from "./prompt.ts";
 import {
-  DEFAULT_PROGRESS_SETTINGS,
-  type ProgressSettings,
-  shouldShowStatus,
+  DEFAULT_OUTPUT_SETTINGS,
+  type OutputSettings,
 } from "./output-settings.ts";
 import type {
   ChatType,
@@ -67,7 +68,7 @@ export interface CodexPort {
   startTurn(
     threadId: string,
     prompt: string,
-    onProgress: (text: string) => void,
+    onActivity: (event: ActivityEvent) => void | Promise<void>,
   ): Promise<CodexTurnHandle>;
   interruptTurn(threadId: string, turnId: string): Promise<void>;
 }
@@ -87,7 +88,7 @@ export interface ConversationOrchestratorOptions {
   codex: CodexPort;
   output: ChatOutput;
   workspace: string;
-  progressSettings?: ProgressSettings;
+  outputSettings?: OutputSettings;
   onError?: (error: Error) => void;
   shutdownGraceMs?: number;
   interruptRetryDelaysMs?: readonly number[];
@@ -96,8 +97,17 @@ export interface ConversationOrchestratorOptions {
 interface ActiveTurn {
   threadId: string;
   turnId: string;
-  progress: ProgressHandle;
+  turnOutput: TurnOutput;
   forceComplete: (outcome: TurnOutcome) => void;
+}
+
+interface TurnOutput {
+  message: RoutedText;
+  progress: ProgressHandle;
+  pipeline: TurnOutputPipeline;
+  activityTail: Promise<void>;
+  acceptingActivities: boolean;
+  finished: boolean;
 }
 
 interface ConversationSlot {
@@ -122,7 +132,7 @@ export class ConversationOrchestrator {
   readonly #codex: CodexPort;
   readonly #output: ChatOutput;
   readonly #workspace: string;
-  readonly #progressSettings: ProgressSettings;
+  readonly #outputSettings: OutputSettings;
   readonly #onError?: (error: Error) => void;
   readonly #shutdownGraceMs: number;
   readonly #interruptRetryDelaysMs: readonly number[];
@@ -135,8 +145,7 @@ export class ConversationOrchestrator {
     this.#codex = options.codex;
     this.#output = options.output;
     this.#workspace = options.workspace;
-    this.#progressSettings = options.progressSettings ??
-      DEFAULT_PROGRESS_SETTINGS;
+    this.#outputSettings = options.outputSettings ?? DEFAULT_OUTPUT_SETTINGS;
     this.#onError = options.onError;
     this.#shutdownGraceMs = options.shutdownGraceMs ?? 30_000;
     this.#interruptRetryDelaysMs = options.interruptRetryDelaysMs ?? [
@@ -224,7 +233,13 @@ export class ConversationOrchestrator {
       slot.pending = undefined;
       slot.resetPending = undefined;
       if (slot.drain) drains.push(slot.drain);
-      if (!slot.active || slot.interruptRequested) continue;
+      if (!slot.active) continue;
+      void this.#enqueueActivity(slot.active.turnOutput, {
+        tag: "SHUTDOWN",
+        body: "shutting down",
+        delivery: "progress",
+      }).catch((error) => this.#report(error));
+      if (slot.interruptRequested) continue;
       slot.interruptRequested = true;
       void this.#codex.interruptTurn(slot.active.threadId, slot.active.turnId)
         .catch(() => {});
@@ -334,8 +349,16 @@ export class ConversationOrchestrator {
     if (this.#shuttingDown || slot.resetPending || slot.pending) return;
 
     const progress = await this.#output.startProgress(message);
-    if (shouldShowStatus(this.#progressSettings, "turn")) {
-      progress.append("[queued] 已提交给 Codex\n");
+    const turnOutput = this.#createTurnOutput(message, progress);
+    try {
+      await this.#enqueueActivity(turnOutput, {
+        tag: "QUEUE",
+        body: "已提交给 Codex",
+        delivery: "progress",
+      });
+    } catch (error) {
+      await this.#finishTurnOutput(turnOutput);
+      throw error;
     }
     const prompt = buildCodexPrompt({
       chatType: message.chatType,
@@ -350,11 +373,10 @@ export class ConversationOrchestrator {
       handle = await this.#codex.startTurn(
         threadId,
         prompt,
-        (text) => progress.append(text),
+        (activity) => this.#enqueueActivity(turnOutput, activity),
       );
     } catch (error) {
-      progress.append(`[failed] ${errorMessage(error)}\n`);
-      await progress.finish();
+      await this.#finishTurnOutput(turnOutput);
       throw error;
     }
 
@@ -362,23 +384,38 @@ export class ConversationOrchestrator {
     slot.active = {
       threadId,
       turnId: handle.turnId,
-      progress,
+      turnOutput,
       forceComplete: forced.resolve,
     };
     slot.interruptRequested = false;
     slot.interruptFailures = 0;
     try {
+      await this.#enqueueActivity(turnOutput, {
+        tag: "TURN",
+        body: "started",
+        delivery: "progress",
+      });
       this.#state.beginTurn(message.conversationKey, handle.turnId);
     } catch (error) {
       this.#requestInterrupt(slot);
+      let interruptedOutcome: TurnOutcome;
       try {
-        await Promise.race([handle.completion, forced.promise]);
-      } catch {
-        // Rejection also means the old turn can no longer run concurrently.
+        interruptedOutcome = await Promise.race([
+          handle.completion,
+          forced.promise,
+        ]);
+      } catch (completionError) {
+        interruptedOutcome = {
+          status: "failed",
+          error: errorMessage(completionError),
+        };
       }
       try {
-        progress.append(`[failed] ${errorMessage(error)}\n`);
-        await progress.finish();
+        await this.#finishTurnOutput(turnOutput, {
+          tag: "TURN",
+          body: interruptedOutcome.status,
+          delivery: "progress",
+        });
       } finally {
         this.#clearInterruptRetry(slot);
         slot.active = undefined;
@@ -397,24 +434,12 @@ export class ConversationOrchestrator {
       outcome = { status: "failed", error: errorMessage(error) };
     }
 
-    let progressAppendFailure: unknown;
-    let progressAppendFailed = false;
     try {
-      try {
-        if (shouldShowStatus(this.#progressSettings, "turn")) {
-          progress.append(`[turn ${outcome.status}]\n`);
-        }
-      } catch (error) {
-        progressAppendFailed = true;
-        progressAppendFailure = error;
-      }
-      if (!progressAppendFailed) {
-        try {
-          await progress.finish();
-        } catch {
-          // Progress finish failures are already reported by ChatOutput.
-        }
-      }
+      await this.#finishTurnOutput(turnOutput, {
+        tag: "TURN",
+        body: outcome.status,
+        delivery: "progress",
+      });
       try {
         this.#state.finishTurn(
           message.conversationKey,
@@ -431,7 +456,6 @@ export class ConversationOrchestrator {
       slot.interruptRequested = false;
       slot.interruptFailures = 0;
     }
-    if (progressAppendFailed) throw progressAppendFailure;
 
     const superseded = Boolean(slot.resetPending || slot.pending);
     if (
@@ -447,6 +471,75 @@ export class ConversationOrchestrator {
         `Codex 执行失败：${outcome.error ?? "unknown error"}`,
         true,
       );
+    }
+  }
+
+  #createTurnOutput(
+    message: RoutedText,
+    progress: ProgressHandle,
+  ): TurnOutput {
+    return {
+      message,
+      progress,
+      pipeline: new TurnOutputPipeline(this.#outputSettings),
+      activityTail: Promise.resolve(),
+      acceptingActivities: true,
+      finished: false,
+    };
+  }
+
+  #enqueueActivity(
+    turnOutput: TurnOutput,
+    activity: ActivityEvent,
+  ): Promise<void> {
+    if (!turnOutput.acceptingActivities || turnOutput.finished) {
+      return Promise.resolve();
+    }
+    const result = turnOutput.activityTail.then(async () => {
+      if (turnOutput.finished) return;
+      await this.#dispatchActivity(turnOutput, activity);
+    });
+    turnOutput.activityTail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  async #dispatchActivity(
+    turnOutput: TurnOutput,
+    activity: ActivityEvent,
+  ): Promise<void> {
+    const rendered = turnOutput.pipeline.apply(activity);
+    if (rendered === null) return;
+    if (activity.delivery === "direct") {
+      await this.#output.send(turnOutput.message, rendered);
+      return;
+    }
+    turnOutput.progress.append(rendered);
+  }
+
+  async #finishTurnOutput(
+    turnOutput: TurnOutput,
+    terminal?: ActivityEvent,
+  ): Promise<void> {
+    if (turnOutput.finished) return;
+    turnOutput.acceptingActivities = false;
+    await turnOutput.activityTail;
+    if (terminal) {
+      try {
+        await this.#dispatchActivity(turnOutput, terminal);
+      } catch (error) {
+        this.#report(error);
+      }
+    }
+    try {
+      await turnOutput.progress.finish();
+    } catch {
+      // Progress finish failures are already reported by ChatOutput.
+    } finally {
+      turnOutput.pipeline.clear();
+      turnOutput.finished = true;
     }
   }
 
@@ -479,13 +572,11 @@ export class ConversationOrchestrator {
     const active = slot.active;
     void this.#codex.interruptTurn(active.threadId, active.turnId).catch(
       (error) => {
-        try {
-          active.progress.append(
-            `[interrupt failed] ${errorMessage(error)}\n`,
-          );
-        } catch {
-          // The progress stream may have completed while the RPC was pending.
-        }
+        void this.#enqueueActivity(active.turnOutput, {
+          tag: "ERROR",
+          body: `interrupt failed: ${errorMessage(error)}`,
+          delivery: "progress",
+        }).catch((activityError) => this.#report(activityError));
         if (slot.active !== active) return;
         slot.interruptRequested = false;
         if (this.#shuttingDown || (!slot.pending && !slot.resetPending)) return;

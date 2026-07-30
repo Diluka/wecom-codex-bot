@@ -11,6 +11,7 @@ import {
   type CodexRuntimeClient,
   type CodexRuntimeClientFactory,
 } from "./codex-runtime.ts";
+import type { ActivityEvent } from "./activity-event.ts";
 
 const EXITED: AppServerProcessStatus = {
   success: false,
@@ -164,17 +165,21 @@ describe("CodexRuntime", () => {
     const runtime = runtimeWith(factory);
     await runtime.start();
 
-    const firstProgress: string[] = [];
-    const secondProgress: string[] = [];
+    const firstProgress: ActivityEvent[] = [];
+    const secondProgress: ActivityEvent[] = [];
     const first = await runtime.startTurn(
       "thread-a",
       "first",
-      (text) => firstProgress.push(text),
+      (activity) => {
+        firstProgress.push(activity);
+      },
     );
     const second = await runtime.startTurn(
       "thread-b",
       "second",
-      (text) => secondProgress.push(text),
+      (activity) => {
+        secondProgress.push(activity);
+      },
     );
 
     client.callbacks.onNotification?.({
@@ -194,8 +199,20 @@ describe("CodexRuntime", () => {
       },
     });
 
-    assertEquals(firstProgress, ["A summary\n"]);
-    assertEquals(secondProgress, ["B summary\n"]);
+    assertEquals(firstProgress, [{
+      tag: "CONTENT",
+      body: "A summary\n",
+      threadId: "thread-a",
+      turnId: "same-turn",
+      delivery: "progress",
+    }]);
+    assertEquals(secondProgress, [{
+      tag: "CONTENT",
+      body: "B summary\n",
+      threadId: "thread-b",
+      turnId: "same-turn",
+      delivery: "progress",
+    }]);
 
     client.callbacks.onTurnCompleted?.({
       threadId: "thread-b",
@@ -231,11 +248,13 @@ describe("CodexRuntime", () => {
     const runtime = runtimeWith(factory);
     await runtime.start();
 
-    const progress: string[] = [];
+    const progress: ActivityEvent[] = [];
     const starting = runtime.startTurn(
       "thread-early",
       "work",
-      (text) => progress.push(text),
+      (activity) => {
+        progress.push(activity);
+      },
     );
     await waitFor(() => client.startedTurns.length === 1, "pending turn RPC");
     client.callbacks.onNotification?.({
@@ -256,7 +275,13 @@ describe("CodexRuntime", () => {
     turnResponse.resolve("turn-early");
 
     const handle = await starting;
-    assertEquals(progress, ["early stdout\n"]);
+    assertEquals(progress, [{
+      tag: "TOOL_RESULT",
+      body: "early stdout\n",
+      threadId: "thread-early",
+      turnId: "turn-early",
+      delivery: "progress",
+    }]);
     assertEquals(await handle.completion, {
       status: "completed",
       finalAnswer: "early answer",
@@ -265,18 +290,97 @@ describe("CodexRuntime", () => {
     await runtime.stop();
   });
 
-  it("only forwards notifications accepted by the renderer", async () => {
+  it("replays raw early activity events, including direct user input, in arrival order", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    const turnResponse = deferred<string>();
+    client.turnIds.push(turnResponse.promise);
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const activities: unknown[] = [];
+    const starting = runtime.startTurn(
+      "thread-early",
+      "work",
+      (activity) => {
+        activities.push(activity);
+      },
+    );
+    await waitFor(() => client.startedTurns.length === 1, "pending turn RPC");
+
+    client.callbacks.onNotification?.({
+      method: "item/reasoning/summaryTextDelta",
+      params: {
+        threadId: "thread-early",
+        turnId: "turn-early",
+        delta: "early summary",
+      },
+    });
+    client.callbacks.onRequestUserInput?.({
+      threadId: "thread-early",
+      turnId: "turn-early",
+      itemId: "input-1",
+      questions: [{
+        header: "实现方式",
+        question: "请选择下一步",
+        options: [{ label: "直接实现", description: "继续修改代码" }],
+      }],
+    });
+    turnResponse.resolve("turn-early");
+
+    const handle = await starting;
+    assertEquals(activities, [
+      {
+        tag: "CONTENT",
+        body: "early summary",
+        threadId: "thread-early",
+        turnId: "turn-early",
+        delivery: "progress",
+      },
+      {
+        tag: "CONTENT",
+        body: [
+          "Codex 需要用户输入",
+          "",
+          "### 实现方式",
+          "",
+          "请选择下一步",
+          "",
+          "- **直接实现**：继续修改代码",
+          "",
+          "请直接发送下一条文本继续。",
+        ].join("\n"),
+        threadId: "thread-early",
+        turnId: "turn-early",
+        itemId: "input-1",
+        delivery: "direct",
+      },
+    ]);
+    client.callbacks.onTurnCompleted?.({
+      threadId: "thread-early",
+      turnId: "turn-early",
+      status: "interrupted",
+      error: null,
+    });
+    await handle.completion;
+    await runtime.stop();
+  });
+
+  it("forwards only safe raw activity notifications", async () => {
     const factory = new FakeFactory();
     const client = new FakeClient();
     client.turnIds.push("turn-filter");
     factory.queue.push(client);
     const runtime = runtimeWith(factory);
     await runtime.start();
-    const progress: string[] = [];
+    const activities: ActivityEvent[] = [];
     const handle = await runtime.startTurn(
       "thread-filter",
       "work",
-      (text) => progress.push(text),
+      (activity) => {
+        activities.push(activity);
+      },
     );
 
     for (
@@ -307,9 +411,22 @@ describe("CodexRuntime", () => {
       });
     }
 
-    assertEquals(progress, [
-      "safe summary",
-      "\n[Codex] safe commentary\n",
+    assertEquals(activities, [
+      {
+        tag: "CONTENT",
+        body: "safe summary",
+        threadId: "thread-filter",
+        turnId: "turn-filter",
+        delivery: "progress",
+      },
+      {
+        tag: "CONTENT",
+        summary: "Codex",
+        body: "safe commentary",
+        threadId: "thread-filter",
+        turnId: "turn-filter",
+        delivery: "progress",
+      },
     ]);
     client.callbacks.onTurnCompleted?.({
       threadId: "thread-filter",
@@ -321,122 +438,91 @@ describe("CodexRuntime", () => {
     await runtime.stop();
   });
 
-  it("uses a turn-local reference count when merging matching tool calls", async () => {
+  it("ignores adapter TURN notifications so completion owns terminal state", async () => {
     const factory = new FakeFactory();
     const client = new FakeClient();
-    client.turnIds.push("turn-merged");
+    client.turnIds.push("turn-terminal");
     factory.queue.push(client);
-    const runtime = runtimeWith(factory, {
-      progressSettings: {
-        intermediateOutput: "merge_same_tool",
-        statusDetail: "verbose",
-      },
-    });
+    const runtime = runtimeWith(factory);
     await runtime.start();
 
-    const progress: string[] = [];
+    const activities: ActivityEvent[] = [];
     const handle = await runtime.startTurn(
-      "thread-merged",
+      "thread-terminal",
       "work",
-      (text) => progress.push(text),
+      (activity) => {
+        activities.push(activity);
+      },
     );
-    const notification = (method: string, item: Record<string, unknown>) => {
-      client.callbacks.onNotification?.({
-        method,
-        params: { threadId: "thread-merged", turnId: "turn-merged", item },
-      });
-    };
-
-    notification("item/started", {
-      id: "command-1",
-      type: "commandExecution",
-      command: "deno test",
-    });
-    notification("item/started", {
-      id: "command-2",
-      type: "commandExecution",
-      command: "deno test",
-    });
     client.callbacks.onNotification?.({
-      method: "item/commandExecution/outputDelta",
+      method: "turn/started",
       params: {
-        threadId: "thread-merged",
-        turnId: "turn-merged",
-        delta: "ignored",
+        threadId: "thread-terminal",
+        turn: { id: "turn-terminal", status: "in_progress" },
       },
     });
-    notification("item/completed", {
-      id: "command-1",
-      type: "commandExecution",
-      command: "deno test",
-      status: "completed",
-      exitCode: 0,
-    });
-    notification("item/completed", {
-      id: "command-2",
-      type: "commandExecution",
-      command: "deno test",
-      status: "completed",
-      exitCode: 0,
+    client.callbacks.onNotification?.({
+      method: "turn/completed",
+      params: {
+        threadId: "thread-terminal",
+        turn: { id: "turn-terminal", status: "completed" },
+      },
     });
 
-    assertEquals(progress, [
-      "\n$ deno test\n",
-      "[command completed, exit 0]\n",
-    ]);
+    assertEquals(activities, []);
     client.callbacks.onTurnCompleted?.({
-      threadId: "thread-merged",
-      turnId: "turn-merged",
+      threadId: "thread-terminal",
+      turnId: "turn-terminal",
       status: "completed",
       error: null,
+      finalMessage: "final answer",
     });
-    await handle.completion;
+    assertEquals(await handle.completion, {
+      status: "completed",
+      finalAnswer: "final answer",
+      error: null,
+    });
     await runtime.stop();
   });
 
-  it("filters early notifications before replay and still forwards input prompts", async () => {
+  it("reports rejected activity callbacks without an unhandled rejection", async () => {
     const factory = new FakeFactory();
     const client = new FakeClient();
-    const turnResponse = deferred<string>();
-    client.turnIds.push(turnResponse.promise);
+    client.turnIds.push("turn-diagnostic");
     factory.queue.push(client);
+    const diagnostics: string[] = [];
     const runtime = runtimeWith(factory, {
-      progressSettings: {
-        intermediateOutput: "none",
-        statusDetail: "none",
+      onDiagnostic: (message) => {
+        diagnostics.push(message);
       },
     });
     await runtime.start();
-
-    const progress: string[] = [];
-    const starting = runtime.startTurn(
-      "thread-hidden",
+    const handle = await runtime.startTurn(
+      "thread-diagnostic",
       "work",
-      (text) => progress.push(text),
+      () => Promise.reject(new Error("activity callback rejected")),
     );
-    await waitFor(() => client.startedTurns.length === 1, "pending turn RPC");
+
     client.callbacks.onNotification?.({
       method: "item/reasoning/summaryTextDelta",
       params: {
-        threadId: "thread-hidden",
-        turnId: "turn-hidden",
-        delta: "hidden summary",
+        threadId: "thread-diagnostic",
+        turnId: "turn-diagnostic",
+        delta: "safe summary",
       },
     });
-    client.callbacks.onRequestUserInput?.({
-      threadId: "thread-hidden",
-      turnId: "turn-hidden",
-      questions: [{ header: "需要信息", question: "请补充范围" }],
-    });
-    turnResponse.resolve("turn-hidden");
+    await waitFor(
+      () => diagnostics.length === 1,
+      "activity callback diagnostic",
+    );
 
-    const handle = await starting;
-    assertEquals(progress.length, 1);
-    assertMatch(progress[0], /Codex 需要用户输入/);
-    assertMatch(progress[0], /请补充范围/);
+    assertMatch(
+      diagnostics[0],
+      /Codex activity callback failed: activity callback rejected/,
+    );
     client.callbacks.onTurnCompleted?.({
-      threadId: "thread-hidden",
-      turnId: "turn-hidden",
+      threadId: "thread-diagnostic",
+      turnId: "turn-diagnostic",
       status: "interrupted",
       error: null,
     });
@@ -444,66 +530,41 @@ describe("CodexRuntime", () => {
     await runtime.stop();
   });
 
-  it("releases cached tool identities after an App Server restart", async () => {
+  it("drops late activity after a completed turn instead of replaying it", async () => {
     const factory = new FakeFactory();
-    const crashed = new FakeClient();
-    const replacement = new FakeClient();
-    crashed.turnIds.push("turn-reused");
-    replacement.turnIds.push("turn-reused");
-    factory.queue.push(crashed, replacement);
-    const runtime = runtimeWith(factory, {
-      delay: async () => {},
-      progressSettings: {
-        intermediateOutput: "merge_same_tool",
-        statusDetail: "verbose",
-      },
-    });
+    const client = new FakeClient();
+    client.turnIds.push("turn-reused", "turn-reused");
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
     await runtime.start();
 
-    const firstProgress: string[] = [];
-    const first = await runtime.startTurn(
-      "thread-reused",
-      "first",
-      (text) => firstProgress.push(text),
-    );
-    crashed.callbacks.onNotification?.({
-      method: "item/started",
+    const first = await runtime.startTurn("thread-reused", "first", () => {});
+    client.callbacks.onTurnCompleted?.({
+      threadId: "thread-reused",
+      turnId: "turn-reused",
+      status: "completed",
+      error: null,
+    });
+    await first.completion;
+    client.callbacks.onNotification?.({
+      method: "item/reasoning/summaryTextDelta",
       params: {
         threadId: "thread-reused",
         turnId: "turn-reused",
-        item: {
-          id: "command-1",
-          type: "commandExecution",
-          command: "deno test",
-        },
+        delta: "late summary",
       },
     });
-    assertEquals(firstProgress, ["\n$ deno test\n"]);
 
-    crashed.exit();
-    assertEquals(await first.completion, { status: "runtime_lost" });
-    await waitFor(() => runtime.ready && runtime.generation === 2, "restart");
-
-    const secondProgress: string[] = [];
+    const replayed: ActivityEvent[] = [];
     const second = await runtime.startTurn(
       "thread-reused",
       "second",
-      (text) => secondProgress.push(text),
-    );
-    replacement.callbacks.onNotification?.({
-      method: "item/started",
-      params: {
-        threadId: "thread-reused",
-        turnId: "turn-reused",
-        item: {
-          id: "command-1",
-          type: "commandExecution",
-          command: "deno test",
-        },
+      (activity) => {
+        replayed.push(activity);
       },
-    });
-    assertEquals(secondProgress, ["\n$ deno test\n"]);
-    replacement.callbacks.onTurnCompleted?.({
+    );
+    assertEquals(replayed, []);
+    client.callbacks.onTurnCompleted?.({
       threadId: "thread-reused",
       turnId: "turn-reused",
       status: "completed",
@@ -513,47 +574,156 @@ describe("CodexRuntime", () => {
     await runtime.stop();
   });
 
-  it("renders requestUserInput questions and options as readable Markdown", async () => {
+  it("does not buffer late activity for a completed key while a reused turn RPC is pending", async () => {
     const factory = new FakeFactory();
     const client = new FakeClient();
-    client.turnIds.push("turn-input");
+    const secondResponse = deferred<string>();
+    client.turnIds.push("turn-reused", secondResponse.promise);
     factory.queue.push(client);
     const runtime = runtimeWith(factory);
     await runtime.start();
-    const progress: string[] = [];
-    const handle = await runtime.startTurn(
-      "thread-input",
-      "work",
-      (text) => progress.push(text),
-    );
 
-    client.callbacks.onRequestUserInput?.({
-      threadId: "thread-input",
-      turnId: "turn-input",
-      questions: [{
-        id: "strategy",
-        header: "实现方式",
-        question: "请选择下一步",
-        options: [
-          { label: "直接实现", description: "继续修改代码" },
-          { label: "先调查", description: "只读取现状" },
-        ],
-      }],
-    });
-
-    const markdown = progress.join("");
-    assertMatch(markdown, /Codex 需要用户输入/);
-    assertMatch(markdown, /实现方式/);
-    assertMatch(markdown, /请选择下一步/);
-    assertMatch(markdown, /直接实现.*继续修改代码/);
-    assertMatch(markdown, /先调查.*只读取现状/);
+    const first = await runtime.startTurn("thread-reused", "first", () => {});
     client.callbacks.onTurnCompleted?.({
-      threadId: "thread-input",
-      turnId: "turn-input",
-      status: "interrupted",
+      threadId: "thread-reused",
+      turnId: "turn-reused",
+      status: "completed",
       error: null,
     });
-    await handle.completion;
+    await first.completion;
+
+    const activities: ActivityEvent[] = [];
+    const starting = runtime.startTurn(
+      "thread-reused",
+      "second",
+      (activity) => {
+        activities.push(activity);
+      },
+    );
+    await waitFor(() => client.startedTurns.length === 2, "reused turn RPC");
+    client.callbacks.onNotification?.({
+      method: "item/reasoning/summaryTextDelta",
+      params: {
+        threadId: "thread-reused",
+        turnId: "turn-reused",
+        delta: "late summary",
+      },
+    });
+    secondResponse.resolve("turn-reused");
+
+    const second = await starting;
+    assertEquals(activities, []);
+    client.callbacks.onTurnCompleted?.({
+      threadId: "thread-reused",
+      turnId: "turn-reused",
+      status: "completed",
+      error: null,
+    });
+    await second.completion;
+    await runtime.stop();
+  });
+
+  it("clears pending-start state after restart before a replacement turn begins", async () => {
+    const factory = new FakeFactory();
+    const crashed = new FakeClient();
+    const replacement = new FakeClient();
+    const firstResponse = deferred<string>();
+    crashed.turnIds.push(firstResponse.promise);
+    replacement.turnIds.push("turn-late");
+    factory.queue.push(crashed, replacement);
+    const runtime = runtimeWith(factory, { delay: async () => {} });
+    await runtime.start();
+
+    const starting = runtime.startTurn("thread-pending", "first", () => {});
+    await waitFor(() => crashed.startedTurns.length === 1, "pending turn RPC");
+    crashed.exit();
+    await waitFor(() => runtime.ready && runtime.generation === 2, "restart");
+    replacement.callbacks.onNotification?.({
+      method: "item/reasoning/summaryTextDelta",
+      params: {
+        threadId: "thread-pending",
+        turnId: "turn-late",
+        delta: "must not buffer",
+      },
+    });
+
+    const activities: ActivityEvent[] = [];
+    const recovered = await runtime.startTurn(
+      "thread-pending",
+      "second",
+      (activity) => {
+        activities.push(activity);
+      },
+    );
+    assertEquals(activities, []);
+    replacement.callbacks.onTurnCompleted?.({
+      threadId: "thread-pending",
+      turnId: "turn-late",
+      status: "completed",
+      error: null,
+    });
+    await recovered.completion;
+
+    firstResponse.resolve("turn-old");
+    const original = await starting;
+    assertEquals(original.turnId, "turn-old");
+    assertEquals(await original.completion, { status: "runtime_lost" });
+    await runtime.stop();
+  });
+
+  it("replays early activity for a reused key after restart clears terminal state", async () => {
+    const factory = new FakeFactory();
+    const crashed = new FakeClient();
+    const replacement = new FakeClient();
+    const replacementResponse = deferred<string>();
+    crashed.turnIds.push("turn-reused");
+    replacement.turnIds.push(replacementResponse.promise);
+    factory.queue.push(crashed, replacement);
+    const runtime = runtimeWith(factory, { delay: async () => {} });
+    await runtime.start();
+
+    const first = await runtime.startTurn("thread-reused", "first", () => {});
+    crashed.exit();
+    assertEquals(await first.completion, { status: "runtime_lost" });
+    await waitFor(() => runtime.ready && runtime.generation === 2, "restart");
+
+    const activities: ActivityEvent[] = [];
+    const starting = runtime.startTurn(
+      "thread-reused",
+      "second",
+      (activity) => {
+        activities.push(activity);
+      },
+    );
+    await waitFor(
+      () => replacement.startedTurns.length === 1,
+      "replacement turn RPC",
+    );
+    replacement.callbacks.onNotification?.({
+      method: "item/reasoning/summaryTextDelta",
+      params: {
+        threadId: "thread-reused",
+        turnId: "turn-reused",
+        delta: "new generation early summary",
+      },
+    });
+    replacementResponse.resolve("turn-reused");
+
+    const second = await starting;
+    assertEquals(activities, [{
+      tag: "CONTENT",
+      body: "new generation early summary",
+      threadId: "thread-reused",
+      turnId: "turn-reused",
+      delivery: "progress",
+    }]);
+    replacement.callbacks.onTurnCompleted?.({
+      threadId: "thread-reused",
+      turnId: "turn-reused",
+      status: "completed",
+      error: null,
+    });
+    await second.completion;
     await runtime.stop();
   });
 

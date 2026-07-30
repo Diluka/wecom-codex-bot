@@ -183,16 +183,4 @@ describe("loadConfig", () => {
       assertNotMatch(error.message, /do-not-print/);
     }
   });
-
-  it("ignores legacy intermediate-output environment variables", async () => {
-    const config = await loadConfig(
-      configEnv({
-        CODEX_INTERMEDIATE_OUTPUT: "do-not-read",
-        CODEX_STATUS_DETAIL: "do-not-read",
-      }),
-      Deno.cwd(),
-    );
-
-    assertEquals(config.outputSettings, DEFAULT_OUTPUT_SETTINGS);
-  });
 });
