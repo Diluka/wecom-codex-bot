@@ -421,7 +421,6 @@ describe("CodexRuntime", () => {
       },
       {
         tag: "CONTENT",
-        summary: "Codex",
         body: "safe commentary",
         threadId: "thread-filter",
         turnId: "turn-filter",

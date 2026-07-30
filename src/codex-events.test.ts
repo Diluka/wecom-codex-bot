@@ -51,7 +51,6 @@ describe("describeCodexNotification", () => {
       }),
       {
         tag: "CONTENT",
-        summary: "Codex",
         body: "我在运行测试。",
         delivery: "progress",
       },

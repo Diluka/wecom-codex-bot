@@ -190,7 +190,6 @@ export function describeCodexNotification(
         const body = text(item.text);
         return scopedEvent(params, {
           tag: "CONTENT",
-          summary: "Codex",
           ...(body !== undefined ? { body } : {}),
         });
       }
