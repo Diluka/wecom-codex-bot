@@ -18,6 +18,7 @@ interface LineState {
   truncated: boolean;
 }
 
+/** Applies per-turn aggregation, detail filtering, and label rendering to activity events. */
 export class TurnOutputPipeline {
   readonly #settings: OutputSettings;
   readonly #sameToolByItemId = new Map<string, string>();

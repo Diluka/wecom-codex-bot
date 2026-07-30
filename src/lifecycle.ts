@@ -31,6 +31,7 @@ export interface BotLifecycleOptions {
   onError?: (error: Error) => void;
 }
 
+/** Coordinates startup and orderly shutdown across the bot's dependencies. */
 export class BotLifecycle {
   readonly #options: BotLifecycleOptions;
   #started = false;

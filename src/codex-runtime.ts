@@ -66,6 +66,7 @@ const defaultDelay = (
   });
 };
 
+/** Adapts Codex App Server sessions into the orchestrator's resilient Codex port. */
 export class CodexRuntime implements CodexPort {
   readonly #workspace: string;
   readonly #clientFactory: CodexRuntimeClientFactory;

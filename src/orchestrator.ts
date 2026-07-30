@@ -147,6 +147,7 @@ const HELP = [
   "- `/help`：显示本帮助",
 ].join("\n");
 
+/** Serializes each conversation's Codex turns, state changes, and output. */
 export class ConversationOrchestrator {
   readonly #state: OrchestratorState;
   readonly #codex: CodexPort;

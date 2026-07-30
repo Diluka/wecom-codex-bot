@@ -37,6 +37,7 @@ const CONVERSATION_COLUMNS = `
   updated_at
 `;
 
+/** Persists conversation bindings, deduplication keys, and turn state in SQLite. */
 export class StateStore {
   readonly #database: DatabaseSync;
 

@@ -127,6 +127,7 @@ export interface ProgressBufferOptions {
   secrets?: Iterable<string>;
 }
 
+/** Retains a redacted, UTF-8-safe tail of streamed progress. */
 export class ProgressBuffer {
   readonly #maxBytes: number;
   readonly #secrets: string[];
@@ -166,6 +167,7 @@ export type WeComStreamSender = (
   finish: boolean,
 ) => Promise<unknown>;
 
+/** Serializes and rate-limits outbound sends per conversation. */
 export class ConversationSendQueue {
   readonly #regularQueues = new Map<string, Promise<void>>();
   readonly #operationQueues = new Map<string, Promise<void>>();
@@ -469,6 +471,7 @@ function toError(value: unknown): Error {
   return value instanceof Error ? value : new Error(String(value));
 }
 
+/** Sends stream frames through the conversation queue with failure reporting. */
 export class WeComSink {
   readonly #options: WeComSinkOptions;
   readonly #queue: ConversationSendQueue;
@@ -545,6 +548,7 @@ export interface StreamControllerOptions {
   maxRotationAttempts?: number;
 }
 
+/** Coalesces, rotates, and finalizes a single WeCom progress stream. */
 export class StreamController {
   readonly #conversationKey: string;
   readonly #frame: unknown;

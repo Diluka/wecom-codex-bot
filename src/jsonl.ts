@@ -1,3 +1,4 @@
+/** Decodes arbitrarily chunked UTF-8 JSONL input into complete text lines. */
 export class JsonlLineDecoder {
   readonly #decoder = new TextDecoder();
   #buffer = "";

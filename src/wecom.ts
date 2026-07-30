@@ -175,6 +175,7 @@ function redactReplyValue(value: unknown, secret: string): unknown {
   return redacted;
 }
 
+/** Adapts the WeCom WebSocket SDK to normalized bot messages and replies. */
 export class WeComGateway {
   readonly client: WeComClientLike;
   #ready = false;

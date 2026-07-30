@@ -34,6 +34,7 @@ export interface WeComChatOutputOptions {
   >;
 }
 
+/** Delivers redacted direct and streaming responses through WeCom. */
 export class WeComChatOutput implements ChatOutput {
   readonly #gateway: WeComReplyGateway;
   readonly #secrets: string[];

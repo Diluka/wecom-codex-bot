@@ -118,6 +118,7 @@ export function selectFinalAgentMessage(
   return (lastFinalMessage ?? lastMessage)?.text;
 }
 
+/** Represents an error response returned by the Codex JSON-RPC server. */
 export class CodexRpcError extends Error {
   constructor(
     readonly code: number | undefined,
@@ -128,6 +129,7 @@ export class CodexRpcError extends Error {
   }
 }
 
+/** Signals that a Codex JSON-RPC request exceeded its configured deadline. */
 export class CodexRpcTimeoutError extends Error {
   constructor(
     readonly method: string,
@@ -138,6 +140,7 @@ export class CodexRpcTimeoutError extends Error {
   }
 }
 
+/** Signals that the Codex App Server process exited. */
 export class CodexAppServerExitedError extends Error {
   constructor(readonly status: AppServerProcessStatus) {
     super(
@@ -162,6 +165,7 @@ const DEFAULT_TERMINATION_GRACE_MS = 2_000;
 const defaultSpawn: SpawnAppServer = (command, options) =>
   new Deno.Command(command, options).spawn();
 
+/** Manages the stdio JSON-RPC session with a Codex App Server process. */
 export class CodexAppServerClient {
   readonly #cwd: string;
   readonly #callbacks: CodexAppServerCallbacks;
