@@ -2,14 +2,18 @@
 
 ## 目标
 
-在企业微信的父任务进度流中显示每个 Codex 子代理的可读名称和状态变化，让用户可以识别哪个子代理正在工作、已取消、已完成或失败。
+在企业微信的父任务进度流中显示每个 Codex
+子代理的可读名称和状态变化，让用户可以识别哪个子代理正在工作、已取消、已完成或失败。
 
 ## 范围
 
-- 显示子代理的 `agentNickname`；名称不可用时依次回退到线程 `name`、`agentRole`、短线程 ID。
+- 显示子代理的 `agentNickname`；名称不可用时依次回退到线程
+  `name`、`agentRole`、短线程 ID。
 - 将子代理状态显示在父任务既有的企业微信流中，而不是创建独立聊天消息或独立会话。
-- 显示 `正在工作`、`已取消`、`已完成`、`失败`，并允许 `pendingInit` 显示为 `已启动`。
-- 通过新的 `SUBAGENT` 输出标签遵循既有 `OUTPUT_LEVEL_*` 和 `OUTPUT_LABEL_*` 配置；默认显示，且不受 `TOOL` 聚合影响。
+- 显示 `正在工作`、`已取消`、`已完成`、`失败`，并允许 `pendingInit` 显示为
+  `已启动`。
+- 通过新的 `SUBAGENT` 输出标签遵循既有 `OUTPUT_LEVEL_*` 和 `OUTPUT_LABEL_*`
+  配置；默认显示，且不受 `TOOL` 聚合影响。
 
 ## 非目标
 
@@ -19,23 +23,29 @@
 
 ## 事件与数据流
 
-Codex App Server 的 `thread/started` 通知提供子线程的 `parentThreadId`、`agentNickname`、`agentRole` 和 `name`。运行时保存这些只存在于当前父 turn 的名称元数据。
+Codex App Server 的 `thread/started` 通知提供子线程的
+`parentThreadId`、`agentNickname`、`agentRole` 和
+`name`。运行时保存这些只存在于当前父 turn 的名称元数据。
 
-`collabAgentToolCall` 提供接收方子线程 ID 和 `agentsStates`，`subAgentActivity` 提供子线程活动。适配层将这两类事件转换为带有子线程 ID、显示名称和标准状态的 `SUBAGENT` 活动。运行时只将关联到活动父 turn 的状态发送给该父任务的输出管线。
+`collabAgentToolCall` 提供接收方子线程 ID 和 `agentsStates`，`subAgentActivity`
+提供子线程活动。适配层将这两类事件转换为带有子线程 ID、显示名称和标准状态的
+`SUBAGENT` 活动。运行时只将关联到活动父 turn 的状态发送给该父任务的输出管线。
 
-同一子代理重复上报同一状态时，输出管线只渲染第一次状态变化。若状态先于名称事件抵达，运行时暂存该状态；名称元数据到达后立刻按名称发送。若在终止状态前仍未收到名称，才使用短线程 ID，确保不会丢失最终状态。
+同一子代理重复上报同一状态时，输出管线只渲染第一次状态变化。若状态先于名称事件抵达，运行时暂存该状态；名称元数据到达后立刻按名称发送。若在终止状态前仍未收到名称，才使用短线程
+ID，确保不会丢失最终状态。
 
 ## 状态映射
 
-| App Server 状态或活动 | 企业微信状态 |
-| --- | --- |
-| `pendingInit` | 已启动 |
-| `running`、`started`、`interacted` | 正在工作 |
-| `interrupted`、`shutdown` | 已取消 |
-| `completed` | 已完成 |
-| `errored`、`notFound` | 失败 |
+| App Server 状态或活动              | 企业微信状态 |
+| ---------------------------------- | ------------ |
+| `pendingInit`                      | 已启动       |
+| `running`、`started`、`interacted` | 正在工作     |
+| `interrupted`、`shutdown`          | 已取消       |
+| `completed`                        | 已完成       |
+| `errored`、`notFound`              | 失败         |
 
-渲染格式为：`[subagent] <显示名称>：<状态>`。若同时提供角色，显示名称为 `<昵称> (<角色>)`。
+渲染格式为：`[subagent] <显示名称>：<状态>`。若同时提供角色，显示名称为
+`<昵称> (<角色>)`。
 
 ## 错误处理
 
