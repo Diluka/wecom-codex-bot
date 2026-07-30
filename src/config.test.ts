@@ -8,11 +8,42 @@ import {
 import { describe, it } from "@std/testing/bdd";
 import { loadConfig } from "./config.ts";
 import {
-  INTERMEDIATE_OUTPUT_MODES,
-  type ProgressSettings,
-  shouldShowStatus,
-  STATUS_DETAILS,
+  DEFAULT_OUTPUT_SETTINGS,
+  OUTPUT_LABELS,
+  OUTPUT_LEVELS,
+  OUTPUT_TAGS,
+  type OutputSettings,
+  TOOL_OUTPUT_FORMATS,
 } from "./output-settings.ts";
+
+function configEnv(
+  overrides: Record<string, string | undefined> = {},
+): Record<string, string | undefined> {
+  return {
+    BOT_ID: "bot-id",
+    BOT_SECRET: "bot-secret",
+    CODEX_WORKSPACE: ".",
+    ...overrides,
+  };
+}
+
+function expectedSettings(
+  level: OutputSettings["level"] = "full",
+  label: OutputSettings["label"] = "show",
+  toolFormat: OutputSettings["toolFormat"] = "individual",
+): OutputSettings {
+  return {
+    level,
+    levels: Object.fromEntries(
+      OUTPUT_TAGS.map((tag) => [tag, level]),
+    ) as OutputSettings["levels"],
+    label,
+    labels: Object.fromEntries(
+      OUTPUT_TAGS.map((tag) => [tag, label]),
+    ) as OutputSettings["labels"],
+    toolFormat,
+  };
+}
 
 describe("loadConfig", () => {
   it("resolves a relative Codex workspace from the bot directory", async () => {
@@ -20,11 +51,7 @@ describe("loadConfig", () => {
 
     try {
       const config = await loadConfig(
-        {
-          BOT_ID: "bot-id",
-          BOT_SECRET: "bot-secret",
-          CODEX_WORKSPACE: ".",
-        },
+        configEnv(),
         root,
       );
 
@@ -54,11 +81,7 @@ describe("loadConfig", () => {
       await assertRejects(
         () =>
           loadConfig(
-            {
-              BOT_ID: "bot-id",
-              BOT_SECRET: "bot-secret",
-              CODEX_WORKSPACE: file,
-            },
+            configEnv({ CODEX_WORKSPACE: file }),
             Deno.cwd(),
           ),
         Error,
@@ -69,145 +92,107 @@ describe("loadConfig", () => {
     }
   });
 
-  it("uses full intermediate output and verbose statuses by default", async () => {
-    const config = await loadConfig(
-      {
-        BOT_ID: "bot-id",
-        BOT_SECRET: "bot-secret",
-        CODEX_WORKSPACE: ".",
-      },
-      Deno.cwd(),
-    );
-
-    assertEquals(config.intermediateOutput, "full");
-    assertEquals(config.statusDetail, "verbose");
-  });
-
-  it("accepts every listed intermediate-output mode", async () => {
-    assertEquals(INTERMEDIATE_OUTPUT_MODES, [
-      "full",
-      "no_tool_results",
-      "merge_same_tool",
-      "merge_all_tools",
-      "none",
+  it("uses output-only defaults for every tag", async () => {
+    assertEquals(OUTPUT_TAGS, [
+      "QUEUE",
+      "TURN",
+      "TOOL",
+      "TOOL_RESULT",
+      "CONTENT",
+      "PLAN",
+      "WARNING",
+      "ERROR",
+      "SHUTDOWN",
+    ]);
+    assertEquals(OUTPUT_LEVELS, ["off", "line", "excerpt", "full"]);
+    assertEquals(OUTPUT_LABELS, ["show", "hide"]);
+    assertEquals(TOOL_OUTPUT_FORMATS, [
+      "individual",
+      "merge_same",
+      "merge_all",
     ]);
 
-    for (const intermediateOutput of INTERMEDIATE_OUTPUT_MODES) {
-      const config = await loadConfig(
-        {
-          BOT_ID: "bot-id",
-          BOT_SECRET: "bot-secret",
-          CODEX_WORKSPACE: ".",
-          CODEX_INTERMEDIATE_OUTPUT: intermediateOutput,
-        },
-        Deno.cwd(),
-      );
+    const config = await loadConfig(configEnv(), Deno.cwd());
 
-      assertEquals(config.intermediateOutput, intermediateOutput);
-    }
+    assertEquals(config.outputSettings, expectedSettings());
+    assertEquals(DEFAULT_OUTPUT_SETTINGS, expectedSettings());
   });
 
-  it("accepts every listed status-detail level", async () => {
-    assertEquals(STATUS_DETAILS, ["verbose", "turn", "none"]);
-
-    for (const statusDetail of STATUS_DETAILS) {
-      const config = await loadConfig(
-        {
-          BOT_ID: "bot-id",
-          BOT_SECRET: "bot-secret",
-          CODEX_WORKSPACE: ".",
-          CODEX_STATUS_DETAIL: statusDetail,
-        },
-        Deno.cwd(),
-      );
-
-      assertEquals(config.statusDetail, statusDetail);
-    }
-  });
-
-  it("trims output settings and treats blank values as defaults", async () => {
+  it("trims global and per-tag output settings", async () => {
     const config = await loadConfig(
-      {
-        BOT_ID: "bot-id",
-        BOT_SECRET: "bot-secret",
-        CODEX_WORKSPACE: ".",
-        CODEX_INTERMEDIATE_OUTPUT: " merge_same_tool ",
-        CODEX_STATUS_DETAIL: "   ",
-      },
+      configEnv({
+        OUTPUT_LEVEL: " excerpt ",
+        OUTPUT_LEVEL_TOOL: " full ",
+        OUTPUT_LABEL: " hide ",
+        OUTPUT_LABEL_CONTENT: " show ",
+        OUTPUT_FORMAT_TOOL: " merge_all ",
+      }),
       Deno.cwd(),
     );
 
-    assertEquals(config.intermediateOutput, "merge_same_tool");
-    assertEquals(config.statusDetail, "verbose");
+    assertEquals(config.outputSettings.level, "excerpt");
+    assertEquals(config.outputSettings.levels.TOOL, "full");
+    assertEquals(config.outputSettings.levels.CONTENT, "excerpt");
+    assertEquals(config.outputSettings.label, "hide");
+    assertEquals(config.outputSettings.labels.CONTENT, "show");
+    assertEquals(config.outputSettings.labels.TOOL, "hide");
+    assertEquals(config.outputSettings.toolFormat, "merge_all");
   });
 
-  it("rejects invalid intermediate-output settings without echoing secrets", async () => {
-    const error = await assertRejects(() =>
-      loadConfig(
-        {
-          BOT_ID: "bot-id",
-          BOT_SECRET: "do-not-print",
-          CODEX_WORKSPACE: ".",
-          CODEX_INTERMEDIATE_OUTPUT: "unexpected",
-        },
-        Deno.cwd(),
-      )
+  it("inherits global values for absent or blank per-tag settings", async () => {
+    const config = await loadConfig(
+      configEnv({
+        OUTPUT_LEVEL: "line",
+        OUTPUT_LABEL: "hide",
+        OUTPUT_LEVEL_QUEUE: "   ",
+        OUTPUT_LABEL_QUEUE: "\t",
+      }),
+      Deno.cwd(),
     );
 
-    assertInstanceOf(error, Error);
-    assertMatch(error.message, /CODEX_INTERMEDIATE_OUTPUT/);
-    assertNotMatch(error.message, /do-not-print/);
-  });
-
-  it("rejects invalid status-detail settings without echoing secrets", async () => {
-    const error = await assertRejects(() =>
-      loadConfig(
-        {
-          BOT_ID: "bot-id",
-          BOT_SECRET: "do-not-print",
-          CODEX_WORKSPACE: ".",
-          CODEX_STATUS_DETAIL: "unexpected",
-        },
-        Deno.cwd(),
-      )
-    );
-
-    assertInstanceOf(error, Error);
-    assertMatch(error.message, /CODEX_STATUS_DETAIL/);
-    assertNotMatch(error.message, /do-not-print/);
-  });
-
-  it("shows statuses at the configured detail level", () => {
-    const cases: Array<{
-      settings: ProgressSettings;
-      turn: boolean;
-      verbose: boolean;
-    }> = [
-      {
-        settings: { intermediateOutput: "full", statusDetail: "verbose" },
-        turn: true,
-        verbose: true,
-      },
-      {
-        settings: { intermediateOutput: "full", statusDetail: "turn" },
-        turn: true,
-        verbose: false,
-      },
-      {
-        settings: { intermediateOutput: "full", statusDetail: "none" },
-        turn: false,
-        verbose: false,
-      },
-      {
-        settings: { intermediateOutput: "none", statusDetail: "verbose" },
-        turn: false,
-        verbose: false,
-      },
-    ];
-
-    for (const { settings, turn, verbose } of cases) {
-      assertEquals(shouldShowStatus(settings, "turn"), turn);
-      assertEquals(shouldShowStatus(settings, "verbose"), verbose);
+    for (const tag of OUTPUT_TAGS) {
+      assertEquals(config.outputSettings.levels[tag], "line");
+      assertEquals(config.outputSettings.labels[tag], "hide");
     }
+  });
+
+  it("rejects invalid output settings by naming only the invalid variable", async () => {
+    for (
+      const name of [
+        "OUTPUT_LEVEL",
+        "OUTPUT_LEVEL_TOOL_RESULT",
+        "OUTPUT_LABEL",
+        "OUTPUT_LABEL_WARNING",
+        "OUTPUT_FORMAT_TOOL",
+      ]
+    ) {
+      const error = await assertRejects(() =>
+        loadConfig(
+          configEnv({
+            BOT_SECRET: "do-not-print",
+            ANOTHER_SECRET: "also-do-not-print",
+            [name]: "invalid-setting-value",
+          }),
+          Deno.cwd(),
+        )
+      );
+
+      assertInstanceOf(error, Error);
+      assertEquals(error.message, `Invalid environment variable: ${name}`);
+      assertNotMatch(error.message, /invalid-setting-value/);
+      assertNotMatch(error.message, /do-not-print/);
+    }
+  });
+
+  it("ignores legacy intermediate-output environment variables", async () => {
+    const config = await loadConfig(
+      configEnv({
+        CODEX_INTERMEDIATE_OUTPUT: "do-not-read",
+        CODEX_STATUS_DETAIL: "do-not-read",
+      }),
+      Deno.cwd(),
+    );
+
+    assertEquals(config.outputSettings, DEFAULT_OUTPUT_SETTINGS);
   });
 });

@@ -10,10 +10,6 @@ import { WeComGateway } from "./src/wecom.ts";
 
 const config = await loadConfig();
 await Deno.mkdir(dirname(config.stateDbPath), { recursive: true });
-const progressSettings = {
-  intermediateOutput: config.intermediateOutput,
-  statusDetail: config.statusDetail,
-} as const;
 
 const safeLog = (level: "info" | "error", value: unknown): void => {
   const message = redactSecrets(errorMessage(value), [config.botSecret]);
@@ -49,7 +45,6 @@ const shutdown = (code: number, reason?: unknown): Promise<void> => {
 
 const runtime = new CodexRuntime({
   workspace: config.workspace,
-  progressSettings,
   onDiagnostic: (message) => safeLog("info", message.trimEnd()),
   onFatal: (error) => shutdown(1, error),
 });
@@ -72,7 +67,6 @@ const gateway = new WeComGateway({
 const output = new WeComChatOutput({
   gateway,
   secrets: [config.botSecret],
-  progressSettings,
   onError: (error) => safeLog("error", error),
 });
 
@@ -81,7 +75,6 @@ const orchestrator = new ConversationOrchestrator({
   codex: runtime,
   output,
   workspace: config.workspace,
-  progressSettings,
   onError: (error) => safeLog("error", error),
 });
 context.orchestrator = orchestrator;
