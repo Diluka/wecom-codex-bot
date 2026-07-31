@@ -326,6 +326,13 @@ function modelHelp(snapshot: ModelSettingsSnapshot): string {
 }
 
 function effortHelp(snapshot: ModelSettingsSnapshot): string {
+  if (!snapshot.selectedModel) {
+    return [
+      `当前推理强度：\`${snapshot.settings.effort ?? "default"}\``,
+      `当前模型 \`${snapshot.settings.model}\` 不在模型目录中，无法显示或校验支持的推理强度。`,
+      "用法：`/effort <level>`",
+    ].join("\n");
+  }
   const efforts = snapshot.selectedModel.supportedReasoningEfforts
     .map(({ reasoningEffort }) => `\`${reasoningEffort}\``)
     .join("、");
@@ -348,6 +355,9 @@ function settingsUpdateReply(
     return `未知模型。可选模型：${codeList(result.availableModels)}`;
   }
   if (result.status === "invalid_effort") {
+    if (result.availableEfforts.length === 0) {
+      return `模型 \`${result.model}\` 不在模型目录中，无法校验或修改推理强度。请先用 \`/model <model-id>\` 切换到目录中的模型。`;
+    }
     return `模型 \`${result.model}\` 不支持该强度。可选强度：${
       codeList(result.availableEfforts)
     }`;
@@ -392,8 +402,8 @@ const HELP = [
   "- `/new`：中断当前任务并新建 Codex 会话",
   "- `/stop`：立即停止当前聊天中正在执行或等待的任务",
   "- `/status`：查看当前聊天的绑定与运行状态",
-  "- `/model [model-id]`：查看或切换模型，并保存为新会话默认值",
-  "- `/effort [level]`：查看或切换推理强度，并保存为新会话默认值",
+  "- `/model [model-id]`：查询当前模型；带 model-id 时切换并保存为新会话默认值（仅 owner）",
+  "- `/effort [level]`：查询当前推理强度；带 level 时切换并保存为新会话默认值（仅 owner）",
   "- `/help`：显示本帮助",
 ].join("\n");
 

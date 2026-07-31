@@ -284,12 +284,9 @@ export class CodexRuntime implements CodexPort {
   ): Promise<ModelSettingsSnapshot> {
     const models = await this.#models(context);
     const settings = await this.#currentSettings(context, threadId, models);
-    const selectedModel = models.find(({ model }) => model === settings.model);
-    if (!selectedModel) {
-      throw new Error(
-        `Codex model catalog does not include ${settings.model}`,
-      );
-    }
+    const selectedModel =
+      models.find(({ model }) => model === settings.model) ??
+        null;
     return {
       settings,
       selectedModel,
@@ -371,6 +368,13 @@ export class CodexRuntime implements CodexPort {
       threadId ? "updating thread settings" : "updating default settings",
     );
     const snapshot = await this.#getModelSettings(context, threadId);
+    if (!snapshot.selectedModel) {
+      return {
+        status: "invalid_effort",
+        model: snapshot.settings.model,
+        availableEfforts: [],
+      };
+    }
     const efforts = supportedEfforts(snapshot.selectedModel);
     if (!efforts.includes(effort)) {
       return {
@@ -1282,12 +1286,18 @@ function resolveDefaults(
   defaults: ConfigDefaults,
   models: readonly CodexModel[],
 ): CodexSettings {
-  const selected = models.find(({ model }) => model === defaults.model) ??
-    models.find(({ isDefault }) => isDefault) ?? models[0];
-  if (!selected) throw new Error("Codex model catalog is empty");
+  const configuredModel = defaults.model && defaults.model.length > 0
+    ? defaults.model
+    : null;
+  const selected = configuredModel
+    ? models.find(({ model }) => model === configuredModel)
+    : models.find(({ isDefault }) => isDefault) ?? models[0];
+  if (!configuredModel && !selected) {
+    throw new Error("Codex model catalog is empty");
+  }
   return {
-    model: selected.model,
-    effort: defaults.effort ?? selected.defaultReasoningEffort,
+    model: configuredModel ?? selected!.model,
+    effort: defaults.effort ?? selected?.defaultReasoningEffort ?? null,
   };
 }
 

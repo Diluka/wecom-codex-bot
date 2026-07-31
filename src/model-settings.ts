@@ -36,7 +36,7 @@ export interface CodexThreadSession {
 
 export interface ModelSettingsSnapshot {
   settings: CodexSettings;
-  selectedModel: CodexModel;
+  selectedModel: CodexModel | null;
   models: readonly CodexModel[];
   source: "thread" | "default";
 }

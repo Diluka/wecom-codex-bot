@@ -244,6 +244,88 @@ describe("CodexRuntime validates model settings", () => {
     await runtime.stop();
   });
 
+  it("preserves bound thread settings when the model is absent from the catalog", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    client.threadSettings.set("thread-custom", {
+      model: "custom-thread-model",
+      effort: "ultra",
+    });
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    assertEquals(await runtime.getModelSettings("thread-custom"), {
+      settings: { model: "custom-thread-model", effort: "ultra" },
+      selectedModel: null,
+      models: client.models,
+      source: "thread",
+    });
+    assertEquals(client.resumedThreads, ["thread-custom"]);
+    await runtime.stop();
+  });
+
+  it("preserves custom config defaults with and without an explicit effort", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    client.configDefaults = {
+      model: "project-custom-model",
+      effort: "high",
+    };
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    assertEquals(await runtime.getModelSettings(), {
+      settings: { model: "project-custom-model", effort: "high" },
+      selectedModel: null,
+      models: client.models,
+      source: "default",
+    });
+
+    client.configDefaults = {
+      model: "project-custom-with-model-default",
+      effort: null,
+    };
+    assertEquals(await runtime.getModelSettings(), {
+      settings: {
+        model: "project-custom-with-model-default",
+        effort: null,
+      },
+      selectedModel: null,
+      models: client.models,
+      source: "default",
+    });
+    await runtime.stop();
+  });
+
+  it("uses catalog defaults only when config omits a model or its effort", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    const catalogDefault = modelFixture("gpt-default", "high", [
+      "medium",
+      "high",
+    ]);
+    catalogDefault.isDefault = true;
+    client.models.push(catalogDefault);
+    client.configDefaults = { model: null, effort: null };
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    assertEquals((await runtime.getModelSettings()).settings, {
+      model: "gpt-default",
+      effort: "high",
+    });
+
+    client.configDefaults = { model: "gpt-a", effort: null };
+    assertEquals((await runtime.getModelSettings()).settings, {
+      model: "gpt-a",
+      effort: "medium",
+    });
+    await runtime.stop();
+  });
+
   it("rejects unknown models without writing settings", async () => {
     const factory = new FakeFactory();
     const client = new FakeClient();
@@ -274,6 +356,43 @@ describe("CodexRuntime validates model settings", () => {
     });
     assertEquals(client.threadUpdates, []);
     assertEquals(client.configWrites, []);
+    await runtime.stop();
+  });
+
+  it("rejects effort changes for uncatalogued models but still allows a catalog model switch", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    client.threadSettings.set("thread-custom", {
+      model: "custom-thread-model",
+      effort: "ultra",
+    });
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    assertEquals(await runtime.setEffort("thread-custom", "high"), {
+      status: "invalid_effort",
+      model: "custom-thread-model",
+      availableEfforts: [],
+    });
+    assertEquals(client.threadUpdates, []);
+    assertEquals(client.configWrites, []);
+
+    assertEquals(await runtime.setModel("thread-custom", "gpt-a"), {
+      status: "updated",
+      settings: { model: "gpt-a", effort: "medium" },
+      threadUpdated: true,
+      defaultPersisted: true,
+      effortAdjusted: true,
+    });
+    assertEquals(client.threadUpdates, [{
+      threadId: "thread-custom",
+      patch: { model: "gpt-a", effort: "medium" },
+    }]);
+    assertEquals(client.configWrites, [{
+      model: "gpt-a",
+      effort: "medium",
+    }]);
     await runtime.stop();
   });
 });

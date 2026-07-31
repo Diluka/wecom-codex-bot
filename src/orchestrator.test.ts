@@ -731,6 +731,44 @@ describe("ConversationOrchestrator", () => {
     assertEquals(codex.startTurnAttempts, 0);
     assertEquals(requestEvents, []);
   });
+
+  it("shows exact uncatalogued settings and explains missing effort metadata", async () => {
+    const { codex, orchestrator, output, state } = setup();
+    state.bindConversation("single:alice", "single", "thread-custom");
+    codex.settingsSnapshot = {
+      settings: { model: "custom-thread-model", effort: "ultra" },
+      selectedModel: null,
+      models: codex.settingsSnapshot.models,
+      source: "thread",
+    };
+
+    await orchestrator.handleText(
+      message("single:alice", "status", "/status"),
+    );
+    await orchestrator.handleText(
+      message("single:alice", "model", "/model"),
+    );
+    await orchestrator.handleText(
+      message("single:alice", "effort", "/effort"),
+    );
+
+    const status = output.sent.find(({ msgId }) => msgId === "status")!.text;
+    assertMatch(status, /model: `custom-thread-model`/);
+    assertMatch(status, /effort: `ultra`/);
+    assertEquals(status.includes("(default)"), false);
+    assertMatch(
+      output.sent.find(({ msgId }) => msgId === "model")!.text,
+      /当前模型：`custom-thread-model`/,
+    );
+    const effort = output.sent.find(({ msgId }) => msgId === "effort")!.text;
+    assertMatch(effort, /当前推理强度：`ultra`/);
+    assertMatch(effort, /不在模型目录.*无法.*支持.*推理强度/);
+    assertEquals(codex.settingsLookups, [
+      "thread-custom",
+      "thread-custom",
+      "thread-custom",
+    ]);
+  });
 });
 
 describe("ConversationOrchestrator settings authorization", () => {
@@ -996,6 +1034,23 @@ describe("ConversationOrchestrator", () => {
       /模型 `gpt-a` 不支持该强度。可选强度：`low`、`medium`/,
     );
     assertEquals(codex.starts.length, 0);
+  });
+  it("explains why effort cannot be changed for an uncatalogued model", async () => {
+    const { codex, orchestrator, output } = setup({ ownerUserId: "alice" });
+    codex.nextSettingsResult = {
+      status: "invalid_effort",
+      model: "custom-thread-model",
+      availableEfforts: [],
+    };
+
+    await orchestrator.handleText(
+      message("single:alice", "effort", "/effort high"),
+    );
+
+    const reply = output.sent[0].text;
+    assertMatch(reply, /模型 `custom-thread-model` 不在模型目录/);
+    assertMatch(reply, /无法校验或修改推理强度/);
+    assertEquals(reply.includes("可选强度："), false);
   });
   it("distinguishes partial thread success from complete persistence failure", async () => {
     const bound = setup({ ownerUserId: "alice" });
@@ -2296,11 +2351,11 @@ describe("ConversationOrchestrator", () => {
     );
     assertMatch(
       output.sent.find((entry) => entry.msgId === "help")!.text,
-      /\/model \[model-id\]/,
+      /\/model \[model-id\].*查询.*仅 owner/,
     );
     assertMatch(
       output.sent.find((entry) => entry.msgId === "help")!.text,
-      /\/effort \[level\]/,
+      /\/effort \[level\].*查询.*仅 owner/,
     );
     assertMatch(
       output.sent.find((entry) => entry.msgId === "status")!.text,
