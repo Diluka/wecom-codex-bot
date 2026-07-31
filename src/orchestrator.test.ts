@@ -3312,10 +3312,10 @@ describe("ConversationOrchestrator", () => {
       ],
     );
   });
-  it("keeps single and group tool aggregation profiles isolated", async () => {
+  it("keeps individual and summary chat profiles isolated", async () => {
     const singleSettings = outputSettings();
     const groupSettings = outputSettings();
-    groupSettings.toolFormat = "merge_all";
+    groupSettings.toolFormat = "summary";
     const { codex, orchestrator, output } = setup({
       outputSettings: singleSettings,
       groupOutputSettings: groupSettings,
@@ -3333,13 +3333,12 @@ describe("ConversationOrchestrator", () => {
     const groupTurn = codex.starts.find((turn) =>
       turn.prompt.includes("msgid: group-tools")
     )!;
-    const tools: ActivityEvent[] = [
+    const activities: ActivityEvent[] = [
       {
         tag: "TOOL",
         summary: "deno test",
         body: "started",
         itemId: "tool-1",
-        toolId: "command:deno test",
         toolState: "started",
         delivery: "progress",
       },
@@ -3348,13 +3347,18 @@ describe("ConversationOrchestrator", () => {
         summary: "git status",
         body: "started",
         itemId: "tool-2",
-        toolId: "command:git status",
         toolState: "started",
+        delivery: "progress",
+      },
+      {
+        tag: "TOOL_RESULT",
+        body: "command output",
+        itemId: "tool-1",
         delivery: "progress",
       },
     ];
 
-    for (const event of tools) {
+    for (const event of activities) {
       await singleTurn.onActivity(event);
       await groupTurn.onActivity(event);
     }
@@ -3368,9 +3372,16 @@ describe("ConversationOrchestrator", () => {
       output.progress.find(({ msgId }) => msgId === "group-tools")!.chunks;
     assertEquals(singleChunks.includes("[tool] deno test\nstarted"), true);
     assertEquals(singleChunks.includes("[tool] git status\nstarted"), true);
-    assertEquals(groupChunks.includes("[tool] tools started"), true);
+    assertEquals(
+      singleChunks.includes("[tool_result] command output"),
+      true,
+    );
     assertEquals(groupChunks.includes("[tool] deno test\nstarted"), false);
     assertEquals(groupChunks.includes("[tool] git status\nstarted"), false);
+    assertEquals(
+      groupChunks.includes("[tool_result] command output"),
+      false,
+    );
   });
   it("requests reasoning summaries only for chats using summary tool format", async () => {
     const singleSettings = outputSettings();

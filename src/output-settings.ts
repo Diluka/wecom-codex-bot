@@ -23,8 +23,6 @@ export type OutputLabel = (typeof OUTPUT_LABELS)[number];
 
 export const TOOL_OUTPUT_FORMATS = [
   "individual",
-  "merge_same",
-  "merge_all",
   "summary",
 ] as const;
 

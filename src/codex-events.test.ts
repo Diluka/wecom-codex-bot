@@ -69,7 +69,7 @@ describe("describeCodexNotification", () => {
     );
   });
 
-  it("adapts tool lifecycle events with raw identities and state", () => {
+  it("adapts tool lifecycle events with display metadata and state", () => {
     assertEquals(
       describeCodexNotification({
         method: "item/started",
@@ -90,7 +90,6 @@ describe("describeCodexNotification", () => {
         threadId: "thread-2",
         turnId: "turn-2",
         itemId: "command-param-id",
-        toolId: "command:deno test --all",
         toolState: "started",
         delivery: "progress",
       },
@@ -99,7 +98,7 @@ describe("describeCodexNotification", () => {
     const cases = [
       {
         item: { id: "file-1", type: "fileChange" },
-        toolId: "file:fileChange",
+        summary: "file change",
       },
       {
         item: {
@@ -108,7 +107,7 @@ describe("describeCodexNotification", () => {
           server: "dbhub",
           tool: "execute_sql",
         },
-        toolId: "mcp:dbhub/execute_sql",
+        summary: "dbhub/execute_sql",
       },
       {
         item: {
@@ -117,7 +116,7 @@ describe("describeCodexNotification", () => {
           namespace: "functions",
           tool: "exec",
         },
-        toolId: "dynamic:functions/exec",
+        summary: "functions/exec",
       },
       {
         item: {
@@ -125,7 +124,7 @@ describe("describeCodexNotification", () => {
           type: "collabToolCall",
           tool: "spawn_agent",
         },
-        toolId: "collaboration:spawn_agent",
+        summary: "spawn_agent",
       },
       {
         item: {
@@ -133,18 +132,18 @@ describe("describeCodexNotification", () => {
           type: "webSearch",
           query: "Codex app server",
         },
-        toolId: "web-search:Codex app server",
+        summary: "Codex app server",
       },
     ];
 
-    for (const { item, toolId } of cases) {
+    for (const { item, summary } of cases) {
       const event = describeCodexNotification({
         method: "item/started",
         params: { item },
       });
       assertEquals(event?.tag, "TOOL");
       assertEquals(event?.itemId, item.id);
-      assertEquals(event?.toolId, toolId);
+      assertEquals(event?.summary, summary);
       assertEquals(event?.toolState, "started");
       assertEquals(event?.delivery, "progress");
     }
@@ -179,7 +178,6 @@ describe("describeCodexNotification", () => {
         tag: "TOOL_RESULT",
         body: "正在查询",
         itemId: "mcp-3",
-        toolId: "mcpToolCall",
         delivery: "progress",
       },
     );
@@ -217,7 +215,7 @@ describe("describeCodexNotification", () => {
     );
   });
 
-  it("preserves a textless web-search completion so aggregation can release it", () => {
+  it("preserves a textless web-search completion for result stream cleanup", () => {
     const event = describeCodexNotification({
       method: "item/completed",
       params: {
@@ -234,7 +232,6 @@ describe("describeCodexNotification", () => {
       tag: "TOOL",
       summary: "Codex app server",
       itemId: "search-1",
-      toolId: "web-search:Codex app server",
       toolState: "completed",
       delivery: "progress",
     });

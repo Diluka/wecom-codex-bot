@@ -105,29 +105,24 @@ OUTPUT_FORMAT_TOOL=individual
 
 `OUTPUT_FORMAT_TOOL` 选择工具输出格式，默认 `individual`：
 
-| 值           | 行为                                                                                                               |
-| ------------ | ------------------------------------------------------------------------------------------------------------------ |
-| `individual` | 每个工具调用分别显示启动与完成事件。                                                                               |
-| `merge_same` | 同一 turn 内相同工具的并发调用按工具身份聚合，只显示第一次启动和最后一次完成。                                     |
-| `merge_all`  | 将当前同时活动的所有工具聚合为一组；每组只显示首次启动和最后一次完成，引用计数归零后释放，之后启动的工具进入新组。 |
-| `summary`    | 保留 App Server 返回的 reasoning summary `CONTENT`，抑制普通 `TOOL` 生命周期和全部普通 `TOOL_RESULT` 工具详情。    |
+| 值           | 行为                                                                                                            |
+| ------------ | --------------------------------------------------------------------------------------------------------------- |
+| `individual` | 每个工具调用分别显示启动与完成事件。                                                                            |
+| `summary`    | 保留 App Server 返回的 reasoning summary `CONTENT`，抑制普通 `TOOL` 生命周期和全部普通 `TOOL_RESULT` 工具详情。 |
 
-前三种格式只处理工具生命周期的呈现方式：`individual`、`merge_same` 和
-`merge_all`。工具生命周期和工具结果是否可见，仍由对应的输出级别决定。
-`merge_same` 和 `merge_all` 使用活动调用的引用计数，而不是简单布尔缓存：每次启动
-增加计数、每次完成减少计数，最后一个活动调用完成时释放该组状态；
-缓存和计数状态也会在 turn 结束、App Server 重启和机器人关闭时释放。
+`individual` 逐一呈现工具生命周期。工具生命周期和工具结果是否可见，仍由对应的
+输出级别决定。
 
 工具生命周期与工具结果分别由独立的 `OUTPUT_LEVEL_TOOL` 和
 `OUTPUT_LEVEL_TOOL_RESULT` 控制。例如，只显示无标签的工具生命周期首行、隐藏工具
-结果，并聚合相同工具：
+结果：
 
 ```dotenv
 OUTPUT_LEVEL=off
 OUTPUT_LEVEL_TOOL=line
 OUTPUT_LEVEL_TOOL_RESULT=off
 OUTPUT_LABEL_TOOL=hide
-OUTPUT_FORMAT_TOOL=merge_same
+OUTPUT_FORMAT_TOOL=individual
 ```
 
 `summary` 是明确的工具详情隐藏模式。它不会读取 `ActivityEvent.summary` 中记录的
@@ -136,12 +131,12 @@ OUTPUT_FORMAT_TOOL=merge_same
 它只沿用 App Server 通知
 `item/reasoning/summaryTextDelta`。当最终生效的工具格式为 `summary`
 时，机器人会在对应的 `turn/start` 请求中显式传入 `summary: "auto"`，
-再把该通知作为 `CONTENT` 流式输出。其他三种工具格式不传这个字段，继续使用现有
-Codex 配置和模型默认值。普通 commentary 目前也属于 `CONTENT`，行为保持不变。
+再把该通知作为 `CONTENT` 流式输出。`individual` 不传这个字段，继续使用现有 Codex
+配置和模型默认值。普通 commentary 目前也属于 `CONTENT`，行为保持不变。
 
 摘要仍服从 `OUTPUT_LEVEL_CONTENT` 和 `OUTPUT_LABEL_CONTENT`。如果 App Server
 没有返回 reasoning summary，工具活动就保持静默。工具名称、命令、参数、状态和结果
-不会作为后备内容，`tools started` 等通用占位信息也不会显示。
+不会作为后备内容，也不会伪造通用占位信息。
 
 下面的配置会显示不带标签的完整内容摘要。所有工具详情都会被隐藏：
 

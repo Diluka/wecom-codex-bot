@@ -45,30 +45,22 @@ function progress(
   return { delivery: "progress", ...event };
 }
 
-function toolStarted(
-  itemId: string | undefined,
-  toolId = "command:deno test",
-): ActivityEvent {
+function toolStarted(itemId: string | undefined): ActivityEvent {
   return progress({
     tag: "TOOL",
     summary: "deno test",
     body: "started",
     ...(itemId ? { itemId } : {}),
-    toolId,
     toolState: "started",
   });
 }
 
-function toolCompleted(
-  itemId: string | undefined,
-  toolId = "command:deno test",
-): ActivityEvent {
+function toolCompleted(itemId: string | undefined): ActivityEvent {
   return progress({
     tag: "TOOL",
     summary: "deno test",
     body: "completed",
     ...(itemId ? { itemId } : {}),
-    toolId,
     toolState: "completed",
   });
 }
@@ -200,7 +192,7 @@ describe("TurnOutputPipeline", () => {
     );
   });
 
-  it("renders subagent status independently from tool aggregation settings", () => {
+  it("applies subagent labels and levels in summary format", () => {
     const event = progress({
       tag: "SUBAGENT",
       body: "amber-otter：正在工作",
@@ -208,7 +200,7 @@ describe("TurnOutputPipeline", () => {
     });
 
     assertEquals(
-      new TurnOutputPipeline(outputSettings({ toolFormat: "merge_all" })).apply(
+      new TurnOutputPipeline(outputSettings({ toolFormat: "summary" })).apply(
         event,
       ),
       "[subagent] amber-otter：正在工作",
@@ -224,123 +216,6 @@ describe("TurnOutputPipeline", () => {
         outputSettings({ levels: { SUBAGENT: "off" } }),
       ).apply(event),
       null,
-    );
-  });
-
-  it("merges matching concurrent tool lifecycles by their tool identity", () => {
-    const pipeline = new TurnOutputPipeline(
-      outputSettings({ toolFormat: "merge_same" }),
-    );
-
-    assertEquals(
-      pipeline.apply(toolStarted("tool-1")),
-      "[tool] deno test\nstarted",
-    );
-    assertEquals(pipeline.apply(toolStarted("tool-2")), null);
-    assertEquals(pipeline.apply(toolCompleted("tool-1")), null);
-    assertEquals(
-      pipeline.apply(toolCompleted("tool-2")),
-      "[tool] deno test\ncompleted",
-    );
-  });
-
-  it("merges all active tools while ignoring duplicate and unknown completions", () => {
-    const pipeline = new TurnOutputPipeline(
-      outputSettings({ toolFormat: "merge_all" }),
-    );
-
-    assertEquals(pipeline.apply(toolStarted("tool-1")), "[tool] tools started");
-    assertEquals(
-      pipeline.apply(toolStarted("tool-2", "command:git status")),
-      null,
-    );
-    assertEquals(pipeline.apply(toolCompleted("unknown")), null);
-    assertEquals(pipeline.apply(toolCompleted("tool-1")), null);
-    assertEquals(pipeline.apply(toolCompleted("tool-1")), null);
-    assertEquals(
-      pipeline.apply(toolCompleted("tool-2", "command:git status")),
-      "[tool] tools completed",
-    );
-    assertEquals(
-      pipeline.apply(toolStarted("tool-3", "command:git diff")),
-      "[tool] tools started",
-    );
-  });
-
-  it("tracks hidden tool starts before deciding whether to render their final completion", () => {
-    const settings = outputSettings({
-      toolFormat: "merge_all",
-      levels: { TOOL: "off" },
-    });
-    const pipeline = new TurnOutputPipeline(settings);
-
-    assertEquals(pipeline.apply(toolStarted("tool-1")), null);
-    settings.levels.TOOL = "full";
-    assertEquals(
-      pipeline.apply(toolCompleted("tool-1")),
-      "[tool] tools completed",
-    );
-  });
-
-  it("uses a per-turn fallback stream for tool lifecycles without item ids", () => {
-    const pipeline = new TurnOutputPipeline(
-      outputSettings({ toolFormat: "merge_same" }),
-    );
-
-    assertEquals(
-      pipeline.apply(toolStarted(undefined)),
-      "[tool] deno test\nstarted",
-    );
-    assertEquals(pipeline.apply(toolStarted(undefined)), null);
-    assertEquals(pipeline.apply(toolCompleted(undefined)), null);
-    assertEquals(
-      pipeline.apply(toolCompleted(undefined)),
-      "[tool] deno test\ncompleted",
-    );
-  });
-
-  it("releases textless tool completions and all state on clear", () => {
-    const pipeline = new TurnOutputPipeline(
-      outputSettings({ toolFormat: "merge_same" }),
-    );
-    const webSearch = "web-search:Codex app server";
-
-    assertEquals(
-      pipeline.apply(progress({
-        tag: "TOOL",
-        summary: "Codex app server",
-        itemId: "search-1",
-        toolId: webSearch,
-        toolState: "started",
-      })),
-      "[tool] Codex app server",
-    );
-    assertEquals(
-      pipeline.apply(progress({
-        tag: "TOOL",
-        summary: "Codex app server",
-        itemId: "search-1",
-        toolId: webSearch,
-        toolState: "completed",
-      })),
-      "[tool] Codex app server",
-    );
-    assertEquals(
-      pipeline.apply(progress({
-        tag: "TOOL",
-        summary: "Codex app server",
-        itemId: "search-2",
-        toolId: webSearch,
-        toolState: "started",
-      })),
-      "[tool] Codex app server",
-    );
-
-    pipeline.clear();
-    assertEquals(pipeline.apply(toolCompleted("search-2", webSearch)), null);
-    assertEquals(
-      pipeline.apply(toolStarted("tool-after-clear")),
-      "[tool] deno test\nstarted",
     );
   });
 
@@ -528,7 +403,6 @@ describe("TurnOutputPipeline", () => {
         tag: "TOOL",
         summary: "web search",
         itemId,
-        toolId: "web-search:query",
         toolState: "completed",
       })),
       "[tool] web search",
@@ -558,7 +432,6 @@ describe("TurnOutputPipeline", () => {
         tag: "TOOL",
         summary: "web search",
         itemId: "reused-line",
-        toolId: "web-search:query",
         toolState: "completed",
       })),
       "[tool] web search",
