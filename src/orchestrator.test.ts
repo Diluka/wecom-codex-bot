@@ -1032,6 +1032,68 @@ describe("ConversationOrchestrator", () => {
     );
   });
 
+  it("does not run a scheduled interrupt retry after entering reply phase", async () => {
+    const interruptGate = Promise.withResolvers<void>();
+    const output = new PendingProgressFinishOutput();
+    const { codex, orchestrator, requestEvents } = setup({
+      output,
+      interruptRetryDelaysMs: [0],
+    });
+    codex.interruptGates.push(interruptGate.promise);
+    const first = orchestrator.handleText(
+      message("single:alice", "m1", "first"),
+    );
+    await waitFor(() => codex.starts.length === 1);
+    const second = orchestrator.handleText(
+      message("single:alice", "m2", "second"),
+    );
+    await waitFor(() => codex.interrupts.length === 1);
+
+    const retryScheduled = Promise.withResolvers<() => void>();
+    const originalSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = ((callback: () => void) => {
+      retryScheduled.resolve(callback);
+      return 0;
+    }) as unknown as typeof setTimeout;
+    let runRetry: () => void;
+    try {
+      interruptGate.reject(new Error("interrupt failed during turn"));
+      runRetry = await retryScheduled.promise;
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+    }
+    assertEquals(typeof runRetry, "function");
+    assertEquals(codex.interrupts.length, 1);
+
+    codex.starts[0].resolve({ status: "completed", finalAnswer: "first done" });
+    await output.finishStarted.promise;
+    const eventsBeforeRetry = requestEvents.filter(({ msgId }) =>
+      msgId === "m1"
+    );
+    const progressBeforeRetry = [...output.progress[0].chunks];
+
+    runRetry();
+    const interruptCallsAfterRetry = codex.interrupts.length;
+    const eventsAfterRetry = requestEvents.filter(({ msgId }) =>
+      msgId === "m1"
+    );
+    const progressAfterRetry = [...output.progress[0].chunks];
+
+    output.finishGate.resolve();
+    await waitFor(() => codex.starts.length === 2);
+    codex.starts[1].resolve({ status: "completed" });
+    await Promise.all([first, second]);
+
+    assertEquals(interruptCallsAfterRetry, 1);
+    assertEquals(eventsAfterRetry, eventsBeforeRetry);
+    assertEquals(progressAfterRetry, progressBeforeRetry);
+    assertEquals(
+      eventsAfterRetry.filter(({ state }) => state === "interrupt_requested")
+        .length,
+      1,
+    );
+  });
+
   it("terminalizes a runtime-unavailable reply send failure", async () => {
     const { codex, orchestrator, output, requestEvents } = setup();
     codex.ready = false;
