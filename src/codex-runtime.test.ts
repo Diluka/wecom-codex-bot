@@ -136,7 +136,12 @@ describe("CodexRuntime", () => {
       },
     });
     await runtime.start();
-    const handle = await runtime.startTurn("thread-trace", "prompt", () => {});
+    const handle = await runtime.startTurn(
+      "thread-trace",
+      "prompt",
+      "owner",
+      () => {},
+    );
 
     client.callbacks.onNotification?.({
       method: "item/reasoning/summaryTextDelta",
