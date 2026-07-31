@@ -73,7 +73,7 @@ describe("WeComChatOutput", () => {
 
   it("forwards keyed progress tails to the active stream", async () => {
     const gateway = new FakeGateway();
-    const output = new WeComChatOutput({ gateway, secrets: [] });
+    const output = new WeComChatOutput({ gateway });
     const progress = await output.startProgress(message());
 
     progress.append("[content] *first section*", summaryTail(0));

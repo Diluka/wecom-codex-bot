@@ -145,18 +145,14 @@ export class ProgressBuffer {
   }
 
   #prefixBeforeTail(expected: string): string | null {
-    const redactedExpected = redactSecrets(expected, this.#secrets);
-    if (!redactedExpected || !this.#content.endsWith(redactedExpected)) {
+    if (!expected || !this.#content.endsWith(expected)) {
       return null;
     }
-    return this.#content.slice(0, -redactedExpected.length);
+    return this.#content.slice(0, -expected.length);
   }
 
   #replaceFromPrefix(prefix: string, replacement: string): void {
-    this.#content = utf8Tail(
-      redactSecrets(prefix + replacement, this.#secrets),
-      this.#maxBytes,
-    );
+    this.#content = utf8Tail(prefix + replacement, this.#maxBytes);
   }
 
   snapshot(): string {

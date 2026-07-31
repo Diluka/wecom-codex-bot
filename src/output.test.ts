@@ -143,20 +143,17 @@ describe("UTF-8 output helpers", () => {
     assert(encoder.encode(progress.snapshot()).byteLength <= 32);
   });
 
-  it("ProgressBuffer replaces only an exact redacted UTF-8-safe tail", () => {
-    const progress = new ProgressBuffer({
-      maxBytes: 32,
-      secrets: ["top-secret"],
-    });
+  it("ProgressBuffer replaces only an exact UTF-8-safe tail", () => {
+    const progress = new ProgressBuffer({ maxBytes: 32 });
     progress.append("before\ntop-secret old🙂");
 
     assertEquals(
       progress.replaceTail("top-secret old🙂", "top-secret new你🙂"),
       true,
     );
-    assertEquals(progress.snapshot(), "before\n[REDACTED] new你🙂");
+    assertEquals(progress.snapshot(), "before\ntop-secret new你🙂");
     assertEquals(progress.replaceTail("missing", "discarded"), false);
-    assertEquals(progress.snapshot(), "before\n[REDACTED] new你🙂");
+    assertEquals(progress.snapshot(), "before\ntop-secret new你🙂");
     assert(encoder.encode(progress.snapshot()).byteLength <= 32);
   });
 });
