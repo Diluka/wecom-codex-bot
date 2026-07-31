@@ -4,10 +4,12 @@ import {
   parseGroupOutputSettings,
   parseOutputSettings,
 } from "./output-settings.ts";
+import { normalizeOwnerUserId } from "./owner-policy.ts";
 
 export interface BotConfig {
   botId: string;
   botSecret: string;
+  ownerUserId?: string;
   workspace: string;
   stateDbPath: string;
   botRoot: string;
@@ -32,6 +34,7 @@ export async function loadConfig(
 ): Promise<BotConfig> {
   const botId = required(env, "BOT_ID");
   const botSecret = required(env, "BOT_SECRET");
+  const ownerUserId = normalizeOwnerUserId(env.OWNER_USER_ID);
   const workspaceValue = required(env, "CODEX_WORKSPACE");
   const outputSettings = parseOutputSettings(env);
   const groupOutputSettings = parseGroupOutputSettings(env, outputSettings);
@@ -46,6 +49,7 @@ export async function loadConfig(
   return {
     botId,
     botSecret,
+    ownerUserId,
     workspace,
     stateDbPath: join(botRoot, ".data", "bot.sqlite"),
     botRoot,
