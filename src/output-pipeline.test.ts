@@ -262,6 +262,78 @@ describe("TurnOutputPipeline", () => {
     );
   });
 
+  it("preserves full-line bold inside backtick fenced code", () => {
+    const pipeline = new TurnOutputPipeline(
+      outputSettings({ toolFormat: "summary" }),
+    );
+    const summary = [
+      "**before**",
+      "```ts",
+      "**literal**",
+      "```",
+      "**after**",
+    ].join("\n");
+
+    assertEquals(
+      pipeline.apply(reasoningSummary(summary)),
+      [
+        "[content] *before*",
+        "```ts",
+        "**literal**",
+        "```",
+        "*after*",
+      ].join("\n"),
+    );
+  });
+
+  it("preserves full-line bold inside tilde fenced code", () => {
+    const pipeline = new TurnOutputPipeline(
+      outputSettings({ toolFormat: "summary" }),
+    );
+    const summary = [
+      "**before**",
+      "~~~ markdown",
+      "**literal**",
+      "~~~",
+      "**after**",
+    ].join("\n");
+
+    assertEquals(
+      pipeline.apply(reasoningSummary(summary)),
+      [
+        "[content] *before*",
+        "~~~ markdown",
+        "**literal**",
+        "~~~",
+        "*after*",
+      ].join("\n"),
+    );
+  });
+
+  it("preserves full-line bold inside four-space indented code", () => {
+    const pipeline = new TurnOutputPipeline(
+      outputSettings({ toolFormat: "summary" }),
+    );
+    const summary = "**before**\n    **literal**\n**after**";
+
+    assertEquals(
+      pipeline.apply(reasoningSummary(summary)),
+      "[content] *before*\n    **literal**\n*after*",
+    );
+  });
+
+  it("preserves full-line bold inside tab-indented code", () => {
+    const pipeline = new TurnOutputPipeline(
+      outputSettings({ toolFormat: "summary" }),
+    );
+    const summary = "**before**\n\t**literal**\n**after**";
+
+    assertEquals(
+      pipeline.apply(reasoningSummary(summary)),
+      "[content] *before*\n\t**literal**\n*after*",
+    );
+  });
+
   it("italicizes summary lines before line and excerpt projection", () => {
     const line = new TurnOutputPipeline(
       outputSettings({

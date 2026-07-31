@@ -239,9 +239,43 @@ function renderLabel(
 }
 
 function italicizeFullLineBold(source: string): string {
-  return source.split(/(\r?\n)/).map((part, index) =>
-    index % 2 === 0 ? italicizeBoldLine(part) : part
-  ).join("");
+  let fence: MarkdownFence | null = null;
+  return source.split(/(\r?\n)/).map((part, index) => {
+    if (index % 2 !== 0) return part;
+    if (fence) {
+      if (isClosingFence(part, fence)) fence = null;
+      return part;
+    }
+    if (isIndentedCodeLine(part)) return part;
+
+    fence = openingFence(part);
+    return fence ? part : italicizeBoldLine(part);
+  }).join("");
+}
+
+interface MarkdownFence {
+  marker: "`" | "~";
+  length: number;
+}
+
+function openingFence(line: string): MarkdownFence | null {
+  const match = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+  if (!match) return null;
+
+  const markers = match[1];
+  const marker = markers[0] as MarkdownFence["marker"];
+  if (marker === "`" && match[2].includes("`")) return null;
+  return { marker, length: markers.length };
+}
+
+function isClosingFence(line: string, fence: MarkdownFence): boolean {
+  const match = /^ {0,3}(`+|~+)[ \t]*$/.exec(line);
+  if (!match) return false;
+  return match[1][0] === fence.marker && match[1].length >= fence.length;
+}
+
+function isIndentedCodeLine(line: string): boolean {
+  return line.startsWith("    ") || line.startsWith("\t");
 }
 
 function italicizeBoldLine(line: string): string {
