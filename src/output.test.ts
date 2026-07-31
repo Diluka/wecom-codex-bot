@@ -429,7 +429,7 @@ describe("StreamController", () => {
     assertEquals(calls[1].content, "first second third");
   });
 
-  it("finishes a stream after nine minutes and opens a continuation", async () => {
+  it("finishes a stream after six minutes and opens a continuation", async () => {
     const calls: SendCall[] = [];
     const timers = new FakeTimers();
     const ids = ["stream-1", "stream-2"];
@@ -443,7 +443,7 @@ describe("StreamController", () => {
 
     controller.append("working");
     await timers.advance(2_500);
-    await timers.advance(9 * 60_000 - 2_500);
+    await timers.advance(6 * 60_000 - 2_500);
 
     assertEquals(calls[1], {
       key: "group:room",
@@ -488,7 +488,7 @@ describe("StreamController", () => {
     });
 
     controller.append("working");
-    await timers.advance(9 * 60_000);
+    await timers.advance(6 * 60_000);
 
     assertEquals(
       calls.map(({ streamId, finish }) => ({ streamId, finish })),
@@ -530,7 +530,7 @@ describe("StreamController", () => {
     });
 
     controller.append("before rotation");
-    const rotating = timers.advance(9 * 60_000);
+    const rotating = timers.advance(6 * 60_000);
     await finishStarted.promise;
     controller.append(" during rotation");
     finishGate.resolve();
@@ -572,7 +572,7 @@ describe("StreamController", () => {
     });
 
     controller.append("working");
-    const rotating = timers.advance(9 * 60_000);
+    const rotating = timers.advance(6 * 60_000);
     await rotationStarted.promise;
     const finishing = controller.finish(" final result");
     rotationGate.resolve();
@@ -621,7 +621,7 @@ describe("StreamController", () => {
     });
 
     controller.append("working");
-    await timers.advance(9 * 60_000);
+    await timers.advance(6 * 60_000);
 
     assertEquals(calls.length, 2);
     assertEquals(calls[1].streamId, "stream-1");
@@ -666,7 +666,7 @@ describe("StreamController", () => {
     });
 
     controller.append("working");
-    await timers.advance(9 * 60_000);
+    await timers.advance(6 * 60_000);
     await timers.advance(2_500);
     await timers.advance(2_500);
     assertEquals(calls.filter(({ finish }) => finish).length, 3);
