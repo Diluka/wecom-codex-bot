@@ -35,11 +35,13 @@ export interface OutputPipelineDecision {
   output: string | null;
   disposition: "rendered" | "suppressed";
   reason: OutputDecisionReason;
+  replaceProgressTail?: true;
 }
 
 /** Applies per-turn detail filtering and label rendering to activity events. */
 export class TurnOutputPipeline {
   readonly #settings: OutputSettings;
+  readonly #reasoningSummaries = new Map<string, Map<number, string>>();
   readonly #excerpts: StreamStates<ExcerptState> = new Map();
   readonly #lines: StreamStates<LineState> = new Map();
 
@@ -65,19 +67,25 @@ export class TurnOutputPipeline {
       return suppressed("tool_format_summary");
     }
 
-    const level = this.#settings.levels[event.tag];
+    const summarySnapshot = this.#reasoningSummarySnapshot(event);
+    const renderable = summarySnapshot ?? event;
+    const level = this.#settings.levels[renderable.tag];
     if (level === "off") return suppressed("level_off");
 
-    const source = sourceText(event);
+    const source = sourceText(renderable);
     if (source === null) return suppressed("no_source");
 
     let visible: string | null;
     let reason: OutputDecisionReason;
     if (level === "line") {
-      visible = this.#line(event, source);
+      visible = summarySnapshot
+        ? summaryLine(source)
+        : this.#line(renderable, source);
       reason = visible === null ? "line_complete" : "line";
     } else if (level === "excerpt") {
-      visible = this.#excerpt(event, source);
+      visible = summarySnapshot
+        ? summaryExcerpt(source)
+        : this.#excerpt(renderable, source);
       reason = visible === null ? "excerpt_complete" : "excerpt";
     } else {
       visible = source;
@@ -87,17 +95,36 @@ export class TurnOutputPipeline {
       return suppressed(visible === null ? reason : "no_visible_text");
     }
 
-    const output = this.#settings.labels[event.tag] === "show"
-      ? `[${event.tag.toLowerCase()}] ${visible}`
+    const output = this.#settings.labels[renderable.tag] === "show"
+      ? `[${renderable.tag.toLowerCase()}] ${visible}`
       : visible;
-    return rendered(output, reason);
+    return rendered(output, reason, summarySnapshot !== null);
   }
 
   clear(): void {
+    this.#reasoningSummaries.clear();
     this.#excerpts.clear();
     this.#lines.clear();
   }
 
+  #reasoningSummarySnapshot(event: ActivityEvent): ActivityEvent | null {
+    if (
+      this.#settings.toolFormat !== "summary" || event.tag !== "CONTENT" ||
+      event.body === undefined || !event.reasoningSummary
+    ) {
+      return null;
+    }
+
+    const { itemId, summaryIndex } = event.reasoningSummary;
+    let sections = this.#reasoningSummaries.get(itemId);
+    if (!sections) {
+      sections = new Map();
+      this.#reasoningSummaries.set(itemId, sections);
+    }
+    const body = (sections.get(summaryIndex) ?? "") + event.body;
+    sections.set(summaryIndex, body);
+    return { ...event, body };
+  }
   #excerpt(event: ActivityEvent, source: string): string | null {
     const state = streamState(
       this.#excerpts,
@@ -164,8 +191,14 @@ export class TurnOutputPipeline {
 function rendered(
   output: string,
   reason: OutputDecisionReason,
+  replaceProgressTail = false,
 ): OutputPipelineDecision {
-  return { output, disposition: "rendered", reason };
+  return {
+    output,
+    disposition: "rendered",
+    reason,
+    ...(replaceProgressTail ? { replaceProgressTail: true as const } : {}),
+  };
 }
 
 function suppressed(reason: OutputDecisionReason): OutputPipelineDecision {
@@ -177,6 +210,28 @@ function sourceText(event: ActivityEvent): string | null {
     value !== undefined
   );
   return parts.length === 0 ? null : parts.join("\n");
+}
+
+function summaryExcerpt(source: string): string {
+  const codePoints = Array.from(source);
+  return codePoints.length <= EXCERPT_LIMIT
+    ? source
+    : `${codePoints.slice(0, EXCERPT_LIMIT).join("")}...`;
+}
+
+function summaryLine(source: string): string | null {
+  const lines = source.split(/\r?\n/);
+  const firstIndex = lines.findIndex((value) => value.trim());
+  if (firstIndex === -1) return null;
+
+  const first = lines[firstIndex].trim();
+  const codePoints = Array.from(first);
+  const hasLaterContent = lines.slice(firstIndex + 1).some((value) =>
+    value.trim()
+  );
+  return codePoints.length > LINE_LIMIT || hasLaterContent
+    ? `${codePoints.slice(0, LINE_LIMIT).join("")}...`
+    : first;
 }
 
 function streamState<T>(

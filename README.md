@@ -138,6 +138,15 @@ OUTPUT_FORMAT_TOOL=individual
 再把该通知作为 `CONTENT` 流式输出。`individual` 不传这个字段，继续使用现有 Codex
 配置和模型默认值。普通 commentary 目前也属于 `CONTENT`，行为保持不变。
 
+同一 reasoning summary section 的增量会先按 App Server 提供的 `itemId` 和
+`summaryIndex` 累积，再刷新当前企业微信 stream 的最后一个摘要块。连续的新摘要段
+也会轮换这个尾块；一旦出现其他可见进度，旧摘要就会固化，之后的摘要从新尾块开始。
+被输出级别抑制的事件和 direct 消息不会中断这条替换链。
+
+尾块替换只作用于仍打开的 stream。六分钟轮换已经完成的旧 stream 不会被修改；缺失
+或非法的摘要元数据、被 UTF-8 尾部截断后无法精确匹配的旧块都会安全退化为追加。
+摘要 Markdown 完全沿用 App Server 原文，不会改写粗体、斜体或其他格式。
+
 摘要仍服从 `OUTPUT_LEVEL_CONTENT` 和 `OUTPUT_LABEL_CONTENT`。如果 App Server
 没有返回 reasoning summary，工具活动就保持静默。工具名称、命令、参数、状态和结果
 不会作为后备内容，也不会伪造通用占位信息。

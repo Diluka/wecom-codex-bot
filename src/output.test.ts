@@ -1,6 +1,7 @@
 import { assert, assertEquals, assertMatch } from "@std/assert";
 import { describe, it } from "@std/testing/bdd";
 import {
+  CONTINUATION_MARKER,
   ConversationSendQueue,
   ProgressBuffer,
   redactSecrets,
@@ -142,6 +143,23 @@ describe("UTF-8 output helpers", () => {
     assertEquals(progress.snapshot().includes("top-secret"), false);
     assert(progress.snapshot().includes("[REDACTED]"));
     assert(progress.snapshot().endsWith(" latest🙂"));
+    assert(encoder.encode(progress.snapshot()).byteLength <= 32);
+  });
+
+  it("ProgressBuffer replaces only an exact redacted UTF-8-safe tail", () => {
+    const progress = new ProgressBuffer({
+      maxBytes: 32,
+      secrets: ["top-secret"],
+    });
+    progress.append("before\ntop-secret old🙂");
+
+    assertEquals(
+      progress.replaceTail("top-secret old🙂", "top-secret new你🙂"),
+      true,
+    );
+    assertEquals(progress.snapshot(), "before\n[REDACTED] new你🙂");
+    assertEquals(progress.replaceTail("missing", "discarded"), false);
+    assertEquals(progress.snapshot(), "before\n[REDACTED] new你🙂");
     assert(encoder.encode(progress.snapshot()).byteLength <= 32);
   });
 });
@@ -347,6 +365,85 @@ describe("WeComSink", () => {
 });
 
 describe("StreamController", () => {
+  it("replaces consecutive logical tail blocks and preserves their separator", async () => {
+    const calls: SendCall[] = [];
+    const controller = new StreamController({
+      conversationKey: "single:alice",
+      frame: { key: "single:alice" },
+      sink: recordingSink(calls),
+      streamIdFactory: () => "stream-1",
+    });
+
+    controller.appendBlock("turn started");
+    controller.appendBlock("summary first\n", true);
+    controller.appendBlock("summary second", true);
+    assertEquals(await controller.finish(), true);
+
+    assertEquals(calls.at(-1)?.content, "turn started\nsummary second");
+  });
+
+  it("recomputes the separator when a replacement drops its leading break", async () => {
+    const calls: SendCall[] = [];
+    const controller = new StreamController({
+      conversationKey: "single:alice",
+      frame: { key: "single:alice" },
+      sink: recordingSink(calls),
+      streamIdFactory: () => "stream-1",
+    });
+
+    controller.appendBlock("before");
+    controller.appendBlock("\nfirst summary", true);
+    controller.appendBlock("second summary", true);
+    assertEquals(await controller.finish(), true);
+
+    assertEquals(calls.at(-1)?.content, "before\nsecond summary");
+  });
+
+  it("freezes a replaceable block when ordinary progress interrupts it", async () => {
+    const calls: SendCall[] = [];
+    const controller = new StreamController({
+      conversationKey: "single:alice",
+      frame: { key: "single:alice" },
+      sink: recordingSink(calls),
+      streamIdFactory: () => "stream-1",
+    });
+
+    controller.appendBlock("summary first", true);
+    controller.appendBlock("ordinary commentary");
+    controller.appendBlock("summary second", true);
+    controller.appendBlock("summary third", true);
+    assertEquals(await controller.finish(), true);
+
+    assertEquals(
+      calls.at(-1)?.content,
+      "summary first\nordinary commentary\nsummary third",
+    );
+  });
+
+  it("starts a new replaceable tail after stream rotation", async () => {
+    const calls: SendCall[] = [];
+    const timers = new FakeTimers();
+    const ids = ["stream-1", "stream-2"];
+    const controller = new StreamController({
+      conversationKey: "single:alice",
+      frame: { key: "single:alice" },
+      sink: recordingSink(calls),
+      timers,
+      streamIdFactory: () => ids.shift() ?? "unexpected",
+    });
+
+    controller.appendBlock("summary before rotation", true);
+    await timers.advance(6 * 60_000);
+    controller.appendBlock("summary after rotation", true);
+    assertEquals(await controller.finish(), true);
+
+    const finished = calls.filter(({ finish }) => finish);
+    assertEquals(finished[0].streamId, "stream-1");
+    assertEquals(finished[0].content, "summary before rotation");
+    assertEquals(finished[1].streamId, "stream-2");
+    assertMatch(finished[1].content, /summary after rotation/);
+  });
+
   it("finishes during shutdown when a pending non-critical flush holds the send queue", async () => {
     const queue = new ConversationSendQueue();
     const flushStarted = Promise.withResolvers<void>();
@@ -529,17 +626,66 @@ describe("StreamController", () => {
       streamIdFactory: () => ids.shift() ?? "unexpected",
     });
 
-    controller.append("before rotation");
+    controller.appendBlock("before rotation");
     const rotating = timers.advance(6 * 60_000);
     await finishStarted.promise;
-    controller.append(" during rotation");
+    controller.appendBlock("during rotation", true);
     finishGate.resolve();
     await rotating;
 
     assertEquals(calls[1].streamId, "stream-1");
     assertEquals(calls[1].finish, true);
     assertEquals(calls[2].streamId, "stream-2");
-    assertMatch(calls[2].content, /during rotation/);
+    assertEquals(
+      calls[2].content,
+      `${CONTINUATION_MARKER}\nduring rotation`,
+    );
+  });
+
+  it("separates blocks restored after a failed rotation", async () => {
+    const calls: SendCall[] = [];
+    const timers = new FakeTimers();
+    const finishGate = Promise.withResolvers<void>();
+    const finishStarted = Promise.withResolvers<void>();
+    let rejectFinish = true;
+    const sink = new WeComSink({
+      send: async (frame, streamId, content, finish) => {
+        calls.push({
+          key: String((frame as { key?: string }).key ?? ""),
+          frame,
+          streamId,
+          content,
+          finish,
+        });
+        if (finish && rejectFinish) {
+          rejectFinish = false;
+          finishStarted.resolve();
+          await finishGate.promise;
+          throw new Error("temporary rotation failure");
+        }
+      },
+    });
+    const controller = new StreamController({
+      conversationKey: "group:room",
+      frame: { key: "group:room" },
+      sink,
+      timers,
+      streamIdFactory: () => "stream-1",
+    });
+
+    controller.appendBlock("before rotation");
+    const rotating = timers.advance(6 * 60_000);
+    await finishStarted.promise;
+    controller.appendBlock("during rotation", true);
+    finishGate.resolve();
+    await rotating;
+    assertEquals(await controller.flush(), true);
+
+    assertEquals(calls.at(-1)?.finish, false);
+    assertEquals(
+      calls.at(-1)?.content,
+      "before rotation\nduring rotation",
+    );
   });
 
   it("finishes each stream once when finish races with rotation", async () => {

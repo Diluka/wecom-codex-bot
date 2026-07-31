@@ -45,6 +45,18 @@ function progress(
   return { delivery: "progress", ...event };
 }
 
+function reasoningSummary(
+  body: string,
+  summaryIndex = 0,
+  itemId = "reasoning-1",
+): ActivityEvent {
+  return progress({
+    tag: "CONTENT",
+    body,
+    reasoningSummary: { itemId, summaryIndex },
+  });
+}
+
 function toolStarted(itemId: string | undefined): ActivityEvent {
   return progress({
     tag: "TOOL",
@@ -134,6 +146,92 @@ describe("TurnOutputPipeline", () => {
       disposition: "suppressed",
       reason: "tool_format_summary",
     });
+  });
+
+  it("renders complete replaceable snapshots for reasoning summary deltas", () => {
+    const pipeline = new TurnOutputPipeline(
+      outputSettings({ toolFormat: "summary" }),
+    );
+
+    assertEquals(
+      pipeline.applyWithDecision(reasoningSummary("Checking ")),
+      {
+        output: "[content] Checking ",
+        disposition: "rendered",
+        reason: "full",
+        replaceProgressTail: true,
+      },
+    );
+    assertEquals(
+      pipeline.applyWithDecision(reasoningSummary("tests")),
+      {
+        output: "[content] Checking tests",
+        disposition: "rendered",
+        reason: "full",
+        replaceProgressTail: true,
+      },
+    );
+    assertEquals(
+      pipeline.applyWithDecision(reasoningSummary("**Running**", 1)),
+      {
+        output: "[content] **Running**",
+        disposition: "rendered",
+        reason: "full",
+        replaceProgressTail: true,
+      },
+    );
+    assertEquals(
+      pipeline.applyWithDecision(
+        progress({ tag: "CONTENT", body: "ordinary commentary" }),
+      ),
+      {
+        output: "[content] ordinary commentary",
+        disposition: "rendered",
+        reason: "full",
+      },
+    );
+  });
+
+  it("keeps reasoning summary deltas independent outside summary format", () => {
+    const pipeline = new TurnOutputPipeline(outputSettings());
+
+    assertEquals(
+      pipeline.apply(reasoningSummary("Checking ")),
+      "[content] Checking ",
+    );
+    assertEquals(
+      pipeline.apply(reasoningSummary("tests")),
+      "[content] tests",
+    );
+  });
+
+  it("recomputes limited summary snapshots and clears their accumulated text", () => {
+    const line = new TurnOutputPipeline(
+      outputSettings({
+        levels: { CONTENT: "line" },
+        label: "hide",
+        toolFormat: "summary",
+      }),
+    );
+    assertEquals(line.apply(reasoningSummary("Checking ")), "Checking");
+    assertEquals(line.apply(reasoningSummary("tests")), "Checking tests");
+
+    const excerpt = new TurnOutputPipeline(
+      outputSettings({
+        levels: { CONTENT: "excerpt" },
+        label: "hide",
+        toolFormat: "summary",
+      }),
+    );
+    const first = "🙂".repeat(799);
+    assertEquals(excerpt.apply(reasoningSummary(first)), first);
+    assertEquals(
+      excerpt.apply(reasoningSummary("ab")),
+      `${first}a...`,
+    );
+
+    excerpt.clear();
+    assertEquals(excerpt.apply(reasoningSummary("fresh")), "fresh");
   });
 
   it("preserves non-tool progress in summary format", () => {

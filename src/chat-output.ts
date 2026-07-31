@@ -116,8 +116,8 @@ export class WeComChatOutput implements ChatOutput {
     this.#active.add(controller);
 
     return Promise.resolve({
-      append: (content) => {
-        controller.append(content);
+      append: (content, replaceTail) => {
+        controller.appendBlock(content, replaceTail);
       },
       finish: async () => {
         try {

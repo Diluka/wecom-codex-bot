@@ -61,6 +61,18 @@ describe("WeComChatOutput", () => {
     assertEquals(gateway.streams[0].content, "running [REDACTED]");
   });
 
+  it("forwards replaceable progress blocks to the active stream", async () => {
+    const gateway = new FakeGateway();
+    const output = new WeComChatOutput({ gateway, secrets: [] });
+    const progress = await output.startProgress(message());
+
+    progress.append("first summary", true);
+    progress.append("second summary", true);
+    await progress.finish();
+
+    assertEquals(gateway.streams.at(-1)?.content, "second summary");
+  });
+
   it("sends final Markdown in at most four UTF-8-safe chunks", async () => {
     const gateway = new FakeGateway();
     const output = new WeComChatOutput({ gateway, secrets: [] });
