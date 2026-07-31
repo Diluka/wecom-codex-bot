@@ -10,7 +10,6 @@ export interface BotConfig {
   botSecret: string;
   workspace: string;
   stateDbPath: string;
-  botRoot: string;
   outputSettings: OutputSettings;
   groupOutputSettings: OutputSettings;
 }
@@ -48,7 +47,6 @@ export async function loadConfig(
     botSecret,
     workspace,
     stateDbPath: join(botRoot, ".data", "bot.sqlite"),
-    botRoot,
     outputSettings,
     groupOutputSettings,
   };
