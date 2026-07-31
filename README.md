@@ -102,7 +102,7 @@ OUTPUT_FORMAT_TOOL=merge_same
 前台终端统一使用 Pino 和 Pino Pretty 输出单行结构化日志，格式如下：
 
 ```text
-[2026-07-31T14:22:33.456 +0800] INFO: [request] received {"chat_type":"group","chat_id":"room-1","user_id":"alice","msg_id":"m1","summary":"检查订单状态…","active_count":1,"pending_count":0}
+[2026-07-31T14:22:33.456 +0800] INFO: [request] received {"chat_type":"group","chat_id":"room-1","user_id":"alice","msg_id":"m1","summary":"检查订单状态是否完成…","active_count":1,"pending_count":0}
 ```
 
 方括号中的时间是带本地时区偏移的 ISO 时间，不是固定 UTC 时间。`INFO` 是 Pino

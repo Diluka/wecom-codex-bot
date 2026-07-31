@@ -4,6 +4,7 @@ import {
   type TurnCompletedEvent,
 } from "../src/codex-app-server.ts";
 import { createLogger } from "../src/log.ts";
+import { finishSmoke } from "../src/smoke-cleanup.ts";
 
 if (Deno.env.get("RUN_CODEX_TURN") !== "1") {
   throw new Error(
@@ -19,6 +20,7 @@ const logger = createLogger({ secrets: [secret] });
 const codexLogger = logger.child({ scope: "codex" });
 const completed = Promise.withResolvers<TurnCompletedEvent>();
 let client: CodexAppServerClient | undefined;
+let hasPrimaryError = false;
 
 try {
   client = await CodexAppServerClient.start({
@@ -46,12 +48,16 @@ try {
     thread_id: threadId,
     turn_id: turnId,
   }, "model_turn_succeeded");
+} catch (error) {
+  hasPrimaryError = true;
+  throw error;
 } finally {
-  try {
-    await client?.close();
-  } finally {
-    logger.flush();
-  }
+  await finishSmoke(
+    codexLogger,
+    () => client?.close(),
+    () => logger.flush(),
+    hasPrimaryError,
+  );
 }
 
 async function withTimeout<T>(

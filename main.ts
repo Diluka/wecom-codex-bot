@@ -30,6 +30,7 @@ type ShutdownSignal = "SIGINT" | "SIGTERM";
 
 const shutdown = (code: number, signal?: ShutdownSignal): Promise<void> => {
   exitCode = Math.max(exitCode, code);
+  Deno.exitCode = exitCode;
   if (!shutdownPromise) {
     lifecycleLogger.info({ signal, exit_code: exitCode }, "stopping");
     shutdownPromise = (async () => {
