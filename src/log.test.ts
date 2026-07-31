@@ -1,6 +1,7 @@
 import { assertEquals, assertMatch } from "@std/assert";
 import { describe, it } from "@std/testing/bdd";
 import { Writable } from "node:stream";
+import type { Logger } from "pino";
 import { createLogger, logRequestStatus, summarizeRequest } from "./log.ts";
 
 function captureLogs(): {
@@ -20,19 +21,23 @@ function captureLogs(): {
 describe("createLogger", () => {
   it("formats scoped structured logs and recursively redacts secrets", () => {
     const capture = captureLogs();
-    const logger = createLogger({
+    const logger: Logger = createLogger({
       secrets: ["actual-secret"],
       destination: capture.destination,
     });
+    const requestLogger = logger.child({ scope: "request" });
+    const codexLogger = logger.child({ scope: "codex" });
 
-    logger.request.info("received", {
+    requestLogger.info({
       chat_id: "room-1",
       user_id: "alice",
       msg_id: "m1",
       summary: "hello actual-secret",
       nested: { values: ["safe", "actual-secret"] },
-    });
-    logger.codex.error(new Error("failed actual-secret"));
+    }, "received");
+    codexLogger.error({
+      error: new Error("failed actual-secret"),
+    }, "failed");
     logger.flush();
 
     const output = capture.output();
@@ -43,16 +48,19 @@ describe("createLogger", () => {
       /^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3} [+-]\d{4}\] INFO: \[request\] received /,
     );
     assertMatch(lines[0], /"chat_id":"room-1"/);
-    assertMatch(lines[1], / ERROR: \[codex\] Error: failed \[REDACTED\]/);
+    assertMatch(
+      lines[1],
+      / ERROR: \[codex\] failed .*"error":"Error: failed \[REDACTED\]"/,
+    );
     assertEquals(output.includes("actual-secret"), false);
     assertEquals(output.includes("[REDACTED]"), true);
     assertEquals(output.includes("time="), false);
     assertEquals(output.includes("level="), false);
   });
 
-  it("exposes every fixed logging scope", () => {
+  it("creates native child loggers for every project scope", () => {
     const capture = captureLogs();
-    const logger = createLogger({ destination: capture.destination });
+    const logger: Logger = createLogger({ destination: capture.destination });
 
     for (
       const scope of [
@@ -63,7 +71,7 @@ describe("createLogger", () => {
         "lifecycle",
       ] as const
     ) {
-      logger[scope].info("ready");
+      logger.child({ scope }).info("ready");
     }
     logger.flush();
 
@@ -83,9 +91,10 @@ describe("createLogger", () => {
 
   it("prevents top-level fields from overriding logger metadata", () => {
     const capture = captureLogs();
-    const logger = createLogger({ destination: capture.destination });
+    const logger: Logger = createLogger({ destination: capture.destination });
+    const requestLogger = logger.child({ scope: "request" });
 
-    logger.request.info("received", {
+    requestLogger.info({
       scope: "spoofed-scope",
       time: 0,
       level: 60,
@@ -105,7 +114,7 @@ describe("createLogger", () => {
         name: "nested-name",
         v: 992_002,
       },
-    });
+    }, "received");
     logger.flush();
 
     const line = capture.output().trimEnd();
@@ -134,12 +143,13 @@ describe("createLogger", () => {
 
   it("drops nested JSON hooks and other unsafe values", () => {
     const capture = captureLogs();
-    const logger = createLogger({
+    const logger: Logger = createLogger({
       secrets: ["actual-secret"],
       destination: capture.destination,
     });
+    const requestLogger = logger.child({ scope: "request" });
 
-    logger.request.info("received", {
+    requestLogger.info({
       nested: {
         ordinary: "hello actual-secret",
         callback: () => "actual-secret",
@@ -151,7 +161,7 @@ describe("createLogger", () => {
           };
         },
       },
-    });
+    }, "received");
     logger.flush();
 
     const output = capture.output();
@@ -204,10 +214,11 @@ describe("summarizeRequest", () => {
 describe("logRequestStatus", () => {
   it("maps event fields and request states to Pino levels", () => {
     const capture = captureLogs();
-    const logger = createLogger({
+    const logger: Logger = createLogger({
       secrets: ["actual-secret"],
       destination: capture.destination,
     });
+    const requestLogger = logger.child({ scope: "request" });
     const base = {
       chatType: "group",
       chatId: "room-1",
@@ -217,17 +228,17 @@ describe("logRequestStatus", () => {
       pendingCount: 0,
     };
 
-    logRequestStatus(logger, {
+    logRequestStatus(requestLogger, {
       ...base,
       state: "received",
       summary: "hello",
     });
-    logRequestStatus(logger, {
+    logRequestStatus(requestLogger, {
       ...base,
       state: "runtime_unavailable",
       reason: "offline",
     });
-    logRequestStatus(logger, {
+    logRequestStatus(requestLogger, {
       ...base,
       state: "failed",
       threadId: "thread-1",

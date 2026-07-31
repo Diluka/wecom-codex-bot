@@ -1,14 +1,7 @@
-import pino from "pino";
+import pino, { type LogFn, type Logger } from "pino";
 import pretty, { type PrettyOptions } from "pino-pretty";
 import { redactSecrets } from "./output.ts";
 
-const SCOPES = [
-  "request",
-  "codex",
-  "wecom",
-  "output",
-  "lifecycle",
-] as const;
 const REQUEST_WARN = new Set(["runtime_unavailable", "shutdown_discarded"]);
 const REQUEST_ERROR = new Set(["failed", "runtime_lost"]);
 const RESERVED_LOG_FIELDS = new Set([
@@ -26,24 +19,12 @@ const REQUEST_SEGMENTER = new Intl.Segmenter(undefined, {
   granularity: "grapheme",
 });
 
-type LogScope = (typeof SCOPES)[number];
 type LogFields = Record<string, unknown>;
-type LogMethod = (message: unknown, fields?: LogFields) => void;
 
 export interface LoggerOptions {
   secrets?: Iterable<string>;
   destination?: PrettyOptions["destination"];
 }
-
-export interface ScopedLogger {
-  info: LogMethod;
-  warn: LogMethod;
-  error: LogMethod;
-}
-
-export type ProjectLogger = Record<LogScope, ScopedLogger> & {
-  flush(): void;
-};
 
 // Structural by design: the orchestrator's later event type needs no import here.
 export interface RequestStatusEventLike {
@@ -64,11 +45,12 @@ export interface RequestStatusEventLike {
   pendingCount?: number;
 }
 
-export function createLogger(options: LoggerOptions = {}): ProjectLogger {
+export function createLogger(options: LoggerOptions = {}): Logger {
   const secrets = [...(options.secrets ?? [])];
   const stream = pretty({
     colorize: false,
     destination: options.destination,
+    errorLikeObjectKeys: [],
     ignore: "pid,hostname,scope",
     messageFormat: (log, messageKey) =>
       `[${String(log.scope)}] ${String(log[messageKey])}`,
@@ -76,18 +58,19 @@ export function createLogger(options: LoggerOptions = {}): ProjectLogger {
     translateTime: "SYS:yyyy-mm-dd'T'HH:MM:ss.l o",
     sync: true,
   });
-  const root = pino({ base: null }, stream);
-  const scopes = Object.fromEntries(
-    SCOPES.map((scope) => [
-      scope,
-      wrapLogger(root.child({ scope }), secrets),
-    ]),
-  ) as Record<LogScope, ScopedLogger>;
+  const root = pino({
+    base: null,
+    hooks: {
+      logMethod(args, method) {
+        const sanitizedArgs = args.map((argument, index) =>
+          sanitizeLogArgument(argument, index === 0, secrets)
+        ) as Parameters<LogFn>;
+        method.apply(this, sanitizedArgs);
+      },
+    },
+  }, stream);
 
-  return {
-    ...scopes,
-    flush: () => root.flush(),
-  };
+  return root;
 }
 
 export function summarizeRequest(
@@ -101,7 +84,7 @@ export function summarizeRequest(
 }
 
 export function logRequestStatus(
-  logger: Pick<ProjectLogger, "request">,
+  logger: Logger,
   event: RequestStatusEventLike,
 ): void {
   const fields: LogFields = {
@@ -125,27 +108,22 @@ export function logRequestStatus(
     : REQUEST_WARN.has(event.state)
     ? "warn"
     : "info";
-  logger.request[level](event.state, fields);
+  logger[level](fields, event.state);
 }
 
-function wrapLogger(
-  logger: ReturnType<typeof pino>,
+function sanitizeLogArgument(
+  value: unknown,
+  isFirst: boolean,
   secrets: readonly string[],
-): ScopedLogger {
-  const write = (
-    level: "info" | "warn" | "error",
-    message: unknown,
-    fields?: LogFields,
-  ): void => {
-    const safeMessage = redactSecrets(loggerMessage(message), secrets);
-    if (fields === undefined) logger[level](safeMessage);
-    else logger[level](redactFields(fields, secrets), safeMessage);
-  };
-  return {
-    info: (message, fields) => write("info", message, fields),
-    warn: (message, fields) => write("warn", message, fields),
-    error: (message, fields) => write("error", message, fields),
-  };
+): unknown {
+  if (isFirst && isLogFields(value)) return redactFields(value, secrets);
+  const redacted = redactValue(value, secrets);
+  return redacted === OMIT_LOG_VALUE ? null : redacted;
+}
+
+function isLogFields(value: unknown): value is LogFields {
+  return value !== null && typeof value === "object" &&
+    !Array.isArray(value) && !(value instanceof Error);
 }
 
 function redactFields(
