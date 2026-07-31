@@ -4273,6 +4273,40 @@ describe("ConversationOrchestrator settings barriers", () => {
     modelGate.resolve();
     await switching;
   });
+
+  it("waits for an earlier mutation before /new without waiting for a later mutation", async () => {
+    const modelGate = Promise.withResolvers<void>();
+    const effortGate = Promise.withResolvers<void>();
+    const { codex, orchestrator } = setup({ ownerUserId: "alice" });
+    codex.modelChangeGates.push(modelGate.promise);
+    codex.effortChangeGates.push(effortGate.promise);
+    const switching = orchestrator.handleText(
+      message("single:alice", "model", "/model gpt-b"),
+    );
+    await waitFor(() => codex.modelChanges.length === 1);
+
+    const resetting = orchestrator.handleText(
+      message("single:alice", "new", "/new"),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const startsWhileEarlierMutationBlocked = codex.startThreadAttempts;
+    const changingEffort = orchestrator.handleText(
+      message("single:alice", "effort", "/effort low"),
+    );
+
+    modelGate.resolve();
+    await waitFor(() => codex.effortChanges.length === 1);
+    await waitFor(() => codex.startThreadAttempts === 1);
+    const resetSettledBeforeLaterMutation = await Promise.race([
+      resetting.then(() => true as const),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
+    ]);
+    effortGate.resolve();
+    await Promise.all([switching, resetting, changingEffort]);
+
+    assertEquals(startsWhileEarlierMutationBlocked, 0);
+    assertEquals(resetSettledBeforeLaterMutation, true);
+  });
 });
 
 describe("ConversationOrchestrator settings shutdown", () => {

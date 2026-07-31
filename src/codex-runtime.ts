@@ -179,7 +179,7 @@ export class CodexRuntime implements CodexPort {
     generation: number;
     promise: Promise<readonly CodexModel[]>;
   };
-  #configWriteTail: Promise<void> = Promise.resolve();
+  #configMutationTail: Promise<void> = Promise.resolve();
   #started = false;
   #stopping = false;
 
@@ -319,7 +319,10 @@ export class CodexRuntime implements CodexPort {
         () => this.#setModel(context, threadId, model),
       );
     }
-    return await this.#setModel(context, undefined, model);
+    return await this.#enqueueConfigMutation(
+      context,
+      () => this.#setModel(context, undefined, model),
+    );
   }
 
   async #setModel(
@@ -368,7 +371,10 @@ export class CodexRuntime implements CodexPort {
         () => this.#setEffort(context, threadId, effort),
       );
     }
-    return await this.#setEffort(context, undefined, effort);
+    return await this.#enqueueConfigMutation(
+      context,
+      () => this.#setEffort(context, undefined, effort),
+    );
   }
 
   async #setEffort(
@@ -904,7 +910,7 @@ export class CodexRuntime implements CodexPort {
     this.#threadSettingTails.clear();
     this.#catalog = undefined;
     this.#catalogPromise = undefined;
-    this.#configWriteTail = Promise.resolve();
+    this.#configMutationTail = Promise.resolve();
   }
 
   async #currentSettings(
@@ -983,11 +989,18 @@ export class CodexRuntime implements CodexPort {
       threadUpdated = true;
     }
 
+    const defaultPatch: SettingsPatch = threadId
+      ? { model: next.model, effort: next.effort }
+      : patch;
     try {
-      await this.#enqueueConfigWrite(
-        context,
-        () => context.client.writeConfigDefaults(patch),
-      );
+      if (threadId) {
+        await this.#enqueueConfigMutation(
+          context,
+          () => this.#writeConfigDefaults(context, defaultPatch),
+        );
+      } else {
+        await this.#writeConfigDefaults(context, defaultPatch);
+      }
       return {
         status: "updated",
         settings: next,
@@ -1025,29 +1038,35 @@ export class CodexRuntime implements CodexPort {
     }
   }
 
-  async #enqueueConfigWrite(
+  async #enqueueConfigMutation<T>(
     context: SettingsRuntimeContext,
-    operation: () => Promise<void>,
-  ): Promise<void> {
-    const write = this.#configWriteTail.catch(() => {}).then(async () => {
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const mutation = this.#configMutationTail.catch(() => {}).then(async () => {
       this.#assertSettingsContext(
         context,
-        "persisting default settings",
+        "updating default settings",
       );
-      await operation();
-      this.#assertSettingsContext(
-        context,
-        "persisting default settings",
-      );
+      return await operation();
     });
-    this.#configWriteTail = write;
+    const tail = mutation.then(() => {}, () => {});
+    this.#configMutationTail = tail;
     try {
-      await write;
+      return await mutation;
     } finally {
-      if (this.#configWriteTail === write) {
-        this.#configWriteTail = Promise.resolve();
+      if (this.#configMutationTail === tail) {
+        this.#configMutationTail = Promise.resolve();
       }
     }
+  }
+
+  async #writeConfigDefaults(
+    context: SettingsRuntimeContext,
+    patch: SettingsPatch,
+  ): Promise<void> {
+    this.#assertSettingsContext(context, "persisting default settings");
+    await context.client.writeConfigDefaults(patch);
+    this.#assertSettingsContext(context, "persisting default settings");
   }
 
   #subagentRecord(

@@ -255,13 +255,18 @@ interface ConversationSlot {
   debounce?: DebounceBatch;
   pending?: PendingRequest;
   current?: PendingRequest;
-  resetPending?: RoutedText;
+  resetPending?: ResetRequest;
   active?: ActiveTurn;
   control?: TurnControl;
   interruptRequested: boolean;
   interruptFailures: number;
   interruptRetryTimer?: ReturnType<typeof setTimeout>;
   drain?: Promise<void>;
+}
+
+interface ResetRequest {
+  message: RoutedText;
+  settingsBarrier: Promise<void>;
 }
 
 interface RequestStatusDetails {
@@ -549,7 +554,12 @@ export class ConversationOrchestrator {
         );
         return;
       }
-      slot.resetPending = message;
+      slot.resetPending = {
+        message,
+        settingsBarrier: this.#settingsMutationTails.get(
+          message.conversationKey,
+        ) ?? Promise.resolve(),
+      };
       if (isInterruptible(slot.active)) this.#requestInterrupt(slot);
       if (!slot.drain) {
         slot.drain = this.#drain(message.conversationKey, slot).finally(() => {
@@ -998,9 +1008,24 @@ export class ConversationOrchestrator {
   }
 
   async #resetConversation(
-    message: RoutedText,
+    request: ResetRequest,
     control: TurnControl,
   ): Promise<void> {
+    const settingsReady = await this.#raceWithForce(
+      () =>
+        Promise.race([
+          request.settingsBarrier.then(() => true as const),
+          this.#shutdownSignal.promise.then(() => false as const),
+        ]),
+      control,
+    );
+    if (
+      settingsReady.type === "forced" ||
+      (settingsReady.type === "value" && !settingsReady.value)
+    ) return;
+    if (settingsReady.type === "error") throw settingsReady.error;
+
+    const message = request.message;
     try {
       const started = await this.#startAndBindThread(message, control);
       if (started === undefined) return;

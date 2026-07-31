@@ -450,7 +450,10 @@ describe("CodexRuntime updates model settings", () => {
       threadId: "thread-1",
       patch: { effort: "low" },
     });
-    assertEquals(client.configWrites[0], { effort: "low" });
+    assertEquals(client.configWrites[0], {
+      model: "gpt-a",
+      effort: "low",
+    });
     await runtime.stop();
   });
 
@@ -574,6 +577,118 @@ describe("CodexRuntime serializes mixed model and effort updates", () => {
   });
 });
 
+describe("CodexRuntime serializes default settings mutations", () => {
+  it("validates a queued effort against defaults written by the preceding model change", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    const modelWrite = deferred<void>();
+    client.models.push(modelFixture("gpt-b", "high", ["high"]));
+    client.configWriteBehaviors.push(async () => {
+      await modelWrite.promise;
+      client.configDefaults = {
+        ...client.configDefaults,
+        ...client.configWrites[0],
+      };
+    });
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const settingModel = runtime.setModel(undefined, "gpt-b");
+    await waitFor(
+      () => client.configWrites.length === 1,
+      "blocked default model write",
+    );
+    const settingEffort = runtime.setEffort(undefined, "low");
+    await Promise.resolve();
+    const readsWhileModelWriteBlocked = client.configReadCalls;
+
+    modelWrite.resolve();
+    assertEquals(await settingModel, {
+      status: "updated",
+      settings: { model: "gpt-b", effort: "high" },
+      threadUpdated: false,
+      defaultPersisted: true,
+      effortAdjusted: true,
+    });
+    const effortResult = await settingEffort;
+    await runtime.stop();
+
+    assertEquals(readsWhileModelWriteBlocked, 1);
+    assertEquals(effortResult, {
+      status: "invalid_effort",
+      model: "gpt-b",
+      availableEfforts: ["high"],
+    });
+    assertEquals(client.configReadCalls, 2);
+    assertEquals(client.configWrites, [{ model: "gpt-b", effort: "high" }]);
+  });
+
+  it("persists complete defaults after concurrent updates to different threads", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    const modelWrite = deferred<void>();
+    client.models.push(modelFixture("gpt-b", "high", ["high"]));
+    client.threadSettings.set("thread-a", {
+      model: "gpt-a",
+      effort: "medium",
+    });
+    client.threadSettings.set("thread-b", {
+      model: "gpt-a",
+      effort: "medium",
+    });
+    client.configWriteBehaviors.push(
+      async () => {
+        await modelWrite.promise;
+        client.configDefaults = {
+          ...client.configDefaults,
+          ...client.configWrites[0],
+        };
+      },
+      () => {
+        client.configDefaults = {
+          ...client.configDefaults,
+          ...client.configWrites[1],
+        };
+        return Promise.resolve();
+      },
+    );
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+    await Promise.all([
+      runtime.resumeThread("thread-a"),
+      runtime.resumeThread("thread-b"),
+    ]);
+
+    const settingModel = runtime.setModel("thread-a", "gpt-b");
+    await waitFor(
+      () => client.configWrites.length === 1,
+      "blocked thread model default write",
+    );
+    const settingEffort = runtime.setEffort("thread-b", "low");
+    await waitFor(
+      () => client.threadUpdates.length === 2,
+      "concurrent thread effort update",
+    );
+    const threadUpdatesWhileModelWriteBlocked = client.threadUpdates.length;
+
+    modelWrite.resolve();
+    await Promise.all([settingModel, settingEffort]);
+    await runtime.stop();
+
+    assertEquals(threadUpdatesWhileModelWriteBlocked, 2);
+    assertEquals(client.configWrites, [
+      { model: "gpt-b", effort: "high" },
+      { model: "gpt-a", effort: "low" },
+    ]);
+    assertEquals(client.configDefaults, {
+      model: "gpt-a",
+      effort: "low",
+    });
+  });
+});
+
 describe("CodexRuntime isolates queued settings across restart", () => {
   it("drops queued old-generation thread updates without blocking new work", async () => {
     const factory = new FakeFactory();
@@ -649,11 +764,8 @@ describe("CodexRuntime isolates queued settings across restart", () => {
       "old in-flight config write",
     );
     const oldQueued = runtime.setEffort(undefined, "medium");
-    await waitFor(
-      () => firstClient.configReadCalls === 2,
-      "old queued config read",
-    );
     await Promise.resolve();
+    assertEquals(firstClient.configReadCalls, 1);
 
     firstClient.exit();
     await waitFor(
@@ -677,15 +789,11 @@ describe("CodexRuntime isolates queued settings across restart", () => {
       persistenceError:
         "Codex runtime changed while persisting default settings",
     });
-    assertEquals(await oldQueued, {
-      status: "updated",
-      settings: { model: "gpt-a", effort: "medium" },
-      threadUpdated: false,
-      defaultPersisted: false,
-      effortAdjusted: false,
-      persistenceError:
-        "Codex runtime changed while persisting default settings",
-    });
+    await assertRejects(
+      () => oldQueued,
+      Error,
+      "Codex runtime changed while updating default settings",
+    );
     assertEquals(await current, {
       status: "updated",
       settings: { model: "gpt-a", effort: "low" },
