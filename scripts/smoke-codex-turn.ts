@@ -58,6 +58,7 @@ try {
     () => client?.close(),
     () => logger.flush(),
     hasPrimaryError,
+    () => undefined,
   );
 }
 
