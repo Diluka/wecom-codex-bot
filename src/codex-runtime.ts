@@ -65,6 +65,12 @@ interface PendingTurnStart {
   readonly generation: number;
 }
 
+interface SettingsRuntimeContext {
+  readonly client: CodexRuntimeClient;
+  readonly token: object;
+  readonly generation: number;
+}
+
 interface SubagentRecord {
   parentTurnId?: string;
   agentNickname?: string;
@@ -240,13 +246,15 @@ export class CodexRuntime implements CodexPort {
   async getModelSettings(
     threadId?: string,
   ): Promise<ModelSettingsSnapshot> {
-    const models = await this.#models();
-    const settings = threadId
-      ? await this.#loadedThreadSettings(threadId)
-      : resolveDefaults(
-        await this.#requireClient().readConfigDefaults(),
-        models,
-      );
+    return await this.#getModelSettings(this.#settingsContext(), threadId);
+  }
+
+  async #getModelSettings(
+    context: SettingsRuntimeContext,
+    threadId?: string,
+  ): Promise<ModelSettingsSnapshot> {
+    const models = await this.#models(context);
+    const settings = await this.#currentSettings(context, threadId, models);
     const selectedModel = models.find(({ model }) => model === settings.model);
     if (!selectedModel) {
       throw new Error(
@@ -265,7 +273,26 @@ export class CodexRuntime implements CodexPort {
     threadId: string | undefined,
     model: string,
   ): Promise<ModelSettingsUpdateResult> {
-    const models = await this.#models();
+    const context = this.#settingsContext();
+    if (threadId) {
+      return await this.#enqueueThreadSettings(
+        threadId,
+        () => this.#setModel(context, threadId, model),
+      );
+    }
+    return await this.#setModel(context, undefined, model);
+  }
+
+  async #setModel(
+    context: SettingsRuntimeContext,
+    threadId: string | undefined,
+    model: string,
+  ): Promise<ModelSettingsUpdateResult> {
+    this.#assertSettingsContext(
+      context,
+      threadId ? "updating thread settings" : "updating default settings",
+    );
+    const models = await this.#models(context);
     const selectedModel = models.find((entry) => entry.model === model);
     if (!selectedModel) {
       return {
@@ -273,12 +300,7 @@ export class CodexRuntime implements CodexPort {
         availableModels: models.map((entry) => entry.model),
       };
     }
-    const current = threadId
-      ? await this.#loadedThreadSettings(threadId)
-      : resolveDefaults(
-        await this.#requireClient().readConfigDefaults(),
-        models,
-      );
+    const current = await this.#currentSettings(context, threadId, models);
     const patch: SettingsPatch = { model };
     let effort = current.effort;
     let effortAdjusted = false;
@@ -288,6 +310,7 @@ export class CodexRuntime implements CodexPort {
       effortAdjusted = true;
     }
     return await this.#applySettings(
+      context,
       threadId,
       patch,
       { model, effort },
@@ -299,7 +322,26 @@ export class CodexRuntime implements CodexPort {
     threadId: string | undefined,
     effort: string,
   ): Promise<ModelSettingsUpdateResult> {
-    const snapshot = await this.getModelSettings(threadId);
+    const context = this.#settingsContext();
+    if (threadId) {
+      return await this.#enqueueThreadSettings(
+        threadId,
+        () => this.#setEffort(context, threadId, effort),
+      );
+    }
+    return await this.#setEffort(context, undefined, effort);
+  }
+
+  async #setEffort(
+    context: SettingsRuntimeContext,
+    threadId: string | undefined,
+    effort: string,
+  ): Promise<ModelSettingsUpdateResult> {
+    this.#assertSettingsContext(
+      context,
+      threadId ? "updating thread settings" : "updating default settings",
+    );
+    const snapshot = await this.#getModelSettings(context, threadId);
     const efforts = supportedEfforts(snapshot.selectedModel);
     if (!efforts.includes(effort)) {
       return {
@@ -309,6 +351,7 @@ export class CodexRuntime implements CodexPort {
       };
     }
     return await this.#applySettings(
+      context,
       threadId,
       { effort },
       { model: snapshot.settings.model, effort },
@@ -720,14 +763,34 @@ export class CodexRuntime implements CodexPort {
   #clearModelSettingsState(): void {
     this.#threadSettings.clear();
     this.#resumePromises.clear();
+    this.#threadSettingTails.clear();
     this.#catalog = undefined;
     this.#catalogPromise = undefined;
+    this.#configWriteTail = Promise.resolve();
   }
 
-  async #loadedThreadSettings(threadId: string): Promise<CodexSettings> {
+  async #currentSettings(
+    context: SettingsRuntimeContext,
+    threadId: string | undefined,
+    models: readonly CodexModel[],
+  ): Promise<CodexSettings> {
+    if (threadId) {
+      return await this.#loadedThreadSettings(context, threadId);
+    }
+    const defaults = await context.client.readConfigDefaults();
+    this.#assertSettingsContext(context, "reading default settings");
+    return resolveDefaults(defaults, models);
+  }
+
+  async #loadedThreadSettings(
+    context: SettingsRuntimeContext,
+    threadId: string,
+  ): Promise<CodexSettings> {
+    this.#assertSettingsContext(context, "loading thread settings");
     if (!this.#threadSettings.has(threadId)) {
       await this.resumeThread(threadId);
     }
+    this.#assertSettingsContext(context, "loading thread settings");
     const settings = this.#threadSettings.get(threadId);
     if (!settings) {
       throw new Error(
@@ -737,31 +800,25 @@ export class CodexRuntime implements CodexPort {
     return settings;
   }
 
-  async #models(): Promise<readonly CodexModel[]> {
-    if (this.#catalog?.generation === this.#generation) {
+  async #models(
+    context: SettingsRuntimeContext,
+  ): Promise<readonly CodexModel[]> {
+    this.#assertSettingsContext(context, "loading the model catalog");
+    if (this.#catalog?.generation === context.generation) {
       return this.#catalog.models;
     }
-    if (this.#catalogPromise?.generation === this.#generation) {
-      return await this.#catalogPromise.promise;
+    if (this.#catalogPromise?.generation === context.generation) {
+      const models = await this.#catalogPromise.promise;
+      this.#assertSettingsContext(context, "loading the model catalog");
+      return models;
     }
-    const client = this.#requireClient();
-    const token = this.#clientToken;
-    const generation = this.#generation;
     const load = (async (): Promise<readonly CodexModel[]> => {
-      const models = await client.listModels();
-      if (
-        !this.#ready || client !== this.#client ||
-        token !== this.#clientToken ||
-        generation !== this.#generation
-      ) {
-        throw new Error(
-          "Codex runtime changed while loading the model catalog",
-        );
-      }
-      this.#catalog = { generation, models };
+      const models = await context.client.listModels();
+      this.#assertSettingsContext(context, "loading the model catalog");
+      this.#catalog = { generation: context.generation, models };
       return models;
     })();
-    const pending = { generation, promise: load };
+    const pending = { generation: context.generation, promise: load };
     this.#catalogPromise = pending;
     try {
       return await load;
@@ -773,6 +830,7 @@ export class CodexRuntime implements CodexPort {
   }
 
   async #applySettings(
+    context: SettingsRuntimeContext,
     threadId: string | undefined,
     patch: SettingsPatch,
     next: CodexSettings,
@@ -780,23 +838,17 @@ export class CodexRuntime implements CodexPort {
   ): Promise<ModelSettingsUpdateResult> {
     let threadUpdated = false;
     if (threadId) {
-      await this.#enqueueThreadSettings(threadId, async () => {
-        const client = this.#requireClient();
-        const token = this.#clientToken;
-        await client.updateThreadSettings(threadId, patch);
-        if (!this.#ready || token !== this.#clientToken) {
-          throw new Error(
-            "Codex runtime changed while updating thread settings",
-          );
-        }
-        this.#threadSettings.set(threadId, next);
-        threadUpdated = true;
-      });
+      this.#assertSettingsContext(context, "updating thread settings");
+      await context.client.updateThreadSettings(threadId, patch);
+      this.#assertSettingsContext(context, "updating thread settings");
+      this.#threadSettings.set(threadId, next);
+      threadUpdated = true;
     }
 
     try {
-      await this.#enqueueConfigWrite(() =>
-        this.#requireClient().writeConfigDefaults(patch)
+      await this.#enqueueConfigWrite(
+        context,
+        () => context.client.writeConfigDefaults(patch),
       );
       return {
         status: "updated",
@@ -817,25 +869,39 @@ export class CodexRuntime implements CodexPort {
     }
   }
 
-  async #enqueueThreadSettings(
+  async #enqueueThreadSettings<T>(
     threadId: string,
-    operation: () => Promise<void>,
-  ): Promise<void> {
+    operation: () => Promise<T>,
+  ): Promise<T> {
     const previous = this.#threadSettingTails.get(threadId) ??
       Promise.resolve();
-    const update = previous.catch(() => {}).then(operation);
-    this.#threadSettingTails.set(threadId, update);
+    const update = previous.then(operation);
+    const tail = update.then(() => {}, () => {});
+    this.#threadSettingTails.set(threadId, tail);
     try {
-      await update;
+      return await update;
     } finally {
-      if (this.#threadSettingTails.get(threadId) === update) {
+      if (this.#threadSettingTails.get(threadId) === tail) {
         this.#threadSettingTails.delete(threadId);
       }
     }
   }
 
-  async #enqueueConfigWrite(operation: () => Promise<void>): Promise<void> {
-    const write = this.#configWriteTail.catch(() => {}).then(operation);
+  async #enqueueConfigWrite(
+    context: SettingsRuntimeContext,
+    operation: () => Promise<void>,
+  ): Promise<void> {
+    const write = this.#configWriteTail.catch(() => {}).then(async () => {
+      this.#assertSettingsContext(
+        context,
+        "persisting default settings",
+      );
+      await operation();
+      this.#assertSettingsContext(
+        context,
+        "persisting default settings",
+      );
+    });
     this.#configWriteTail = write;
     try {
       await write;
@@ -972,6 +1038,26 @@ export class CodexRuntime implements CodexPort {
     }
     for (const key of this.#bufferedOutcomes.keys()) {
       if (key.startsWith(prefix)) this.#bufferedOutcomes.delete(key);
+    }
+  }
+
+  #settingsContext(): SettingsRuntimeContext {
+    const client = this.#requireClient();
+    const token = this.#clientToken;
+    if (!token) throw new Error("Codex App Server is unavailable");
+    return { client, token, generation: this.#generation };
+  }
+
+  #assertSettingsContext(
+    context: SettingsRuntimeContext,
+    action: string,
+  ): void {
+    if (
+      !this.#ready || context.client !== this.#client ||
+      context.token !== this.#clientToken ||
+      context.generation !== this.#generation
+    ) {
+      throw new Error(`Codex runtime changed while ${action}`);
     }
   }
 

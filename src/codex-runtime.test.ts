@@ -71,6 +71,7 @@ class FakeClient implements CodexRuntimeClient {
   readonly configWriteBehaviors: Array<() => Promise<void>> = [];
   readonly turnIds: Array<string | Promise<string>> = [];
   listModelCalls = 0;
+  configReadCalls = 0;
   closeCalls = 0;
 
   startThread(): Promise<CodexThreadSession> {
@@ -104,6 +105,7 @@ class FakeClient implements CodexRuntimeClient {
   }
 
   readConfigDefaults(): Promise<ConfigDefaults> {
+    this.configReadCalls++;
     return Promise.resolve(this.configDefaults);
   }
 
@@ -380,6 +382,181 @@ describe("CodexRuntime updates model settings", () => {
       "thread unavailable",
     );
     assertEquals(client.configWrites, []);
+    await runtime.stop();
+  });
+});
+
+describe("CodexRuntime serializes mixed model and effort updates", () => {
+  it("validates a queued effort against the preceding model update", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    const modelUpdate = deferred<void>();
+    client.models.push(modelFixture("gpt-b", "high", ["high"]));
+    client.threadUpdateBehaviors.push(
+      () => modelUpdate.promise,
+      () => Promise.resolve(),
+    );
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const settingModel = runtime.setModel("thread-1", "gpt-b");
+    await waitFor(
+      () => client.threadUpdates.length === 1,
+      "blocked model update",
+    );
+    const settingEffort = runtime.setEffort("thread-1", "high");
+
+    modelUpdate.resolve();
+    assertEquals(await settingModel, {
+      status: "updated",
+      settings: { model: "gpt-b", effort: "high" },
+      threadUpdated: true,
+      defaultPersisted: true,
+      effortAdjusted: true,
+    });
+    assertEquals(await settingEffort, {
+      status: "updated",
+      settings: { model: "gpt-b", effort: "high" },
+      threadUpdated: true,
+      defaultPersisted: true,
+      effortAdjusted: false,
+    });
+    assertEquals(client.threadUpdates, [
+      {
+        threadId: "thread-1",
+        patch: { model: "gpt-b", effort: "high" },
+      },
+      { threadId: "thread-1", patch: { effort: "high" } },
+    ]);
+    assertEquals((await runtime.getModelSettings("thread-1")).settings, {
+      model: "gpt-b",
+      effort: "high",
+    });
+    await runtime.stop();
+  });
+});
+
+describe("CodexRuntime isolates queued settings across restart", () => {
+  it("drops queued old-generation thread updates without blocking new work", async () => {
+    const factory = new FakeFactory();
+    const firstClient = new FakeClient();
+    const replacement = new FakeClient();
+    const oldThreadUpdate = deferred<void>();
+    firstClient.threadUpdateBehaviors.push(() => oldThreadUpdate.promise);
+    factory.queue.push(firstClient, replacement);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const oldInFlight = runtime.setEffort("thread-1", "low");
+    await waitFor(
+      () => firstClient.threadUpdates.length === 1,
+      "old in-flight thread update",
+    );
+    const oldQueued = runtime.setEffort("thread-1", "medium");
+
+    firstClient.exit();
+    await waitFor(
+      () => runtime.ready && runtime.generation === 2,
+      "thread queue runtime restart",
+    );
+    const current = runtime.setEffort("thread-1", "low");
+    await waitFor(
+      () => replacement.threadUpdates.length === 1,
+      "new-generation thread update",
+    );
+    assertEquals(replacement.threadUpdates, [{
+      threadId: "thread-1",
+      patch: { effort: "low" },
+    }]);
+
+    oldThreadUpdate.resolve();
+    await assertRejects(
+      () => oldInFlight,
+      Error,
+      "runtime changed while updating thread settings",
+    );
+    await assertRejects(
+      () => oldQueued,
+      Error,
+      "runtime changed while updating thread settings",
+    );
+    assertEquals(await current, {
+      status: "updated",
+      settings: { model: "gpt-a", effort: "low" },
+      threadUpdated: true,
+      defaultPersisted: true,
+      effortAdjusted: false,
+    });
+    assertEquals((await runtime.getModelSettings("thread-1")).settings, {
+      model: "gpt-a",
+      effort: "low",
+    });
+    assertEquals(replacement.threadUpdates.length, 1);
+    await runtime.stop();
+  });
+
+  it("drops queued old-generation config writes without blocking new writes", async () => {
+    const factory = new FakeFactory();
+    const firstClient = new FakeClient();
+    const replacement = new FakeClient();
+    const oldConfigWrite = deferred<void>();
+    firstClient.configWriteBehaviors.push(() => oldConfigWrite.promise);
+    factory.queue.push(firstClient, replacement);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const oldInFlight = runtime.setEffort(undefined, "low");
+    await waitFor(
+      () => firstClient.configWrites.length === 1,
+      "old in-flight config write",
+    );
+    const oldQueued = runtime.setEffort(undefined, "medium");
+    await waitFor(
+      () => firstClient.configReadCalls === 2,
+      "old queued config read",
+    );
+    await Promise.resolve();
+
+    firstClient.exit();
+    await waitFor(
+      () => runtime.ready && runtime.generation === 2,
+      "config queue runtime restart",
+    );
+    const current = runtime.setEffort(undefined, "low");
+    await waitFor(
+      () => replacement.configWrites.length === 1,
+      "new-generation config write",
+    );
+    assertEquals(replacement.configWrites, [{ effort: "low" }]);
+
+    oldConfigWrite.resolve();
+    assertEquals(await oldInFlight, {
+      status: "updated",
+      settings: { model: "gpt-a", effort: "low" },
+      threadUpdated: false,
+      defaultPersisted: false,
+      effortAdjusted: false,
+      persistenceError:
+        "Codex runtime changed while persisting default settings",
+    });
+    assertEquals(await oldQueued, {
+      status: "updated",
+      settings: { model: "gpt-a", effort: "medium" },
+      threadUpdated: false,
+      defaultPersisted: false,
+      effortAdjusted: false,
+      persistenceError:
+        "Codex runtime changed while persisting default settings",
+    });
+    assertEquals(await current, {
+      status: "updated",
+      settings: { model: "gpt-a", effort: "low" },
+      threadUpdated: false,
+      defaultPersisted: true,
+      effortAdjusted: false,
+    });
+    assertEquals(replacement.configWrites.length, 1);
     await runtime.stop();
   });
 });
