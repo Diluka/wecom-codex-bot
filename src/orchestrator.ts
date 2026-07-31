@@ -152,6 +152,9 @@ type ForceRaceResult<T> =
   | { type: "error"; error: unknown }
   | { type: "forced" };
 
+type SendWithForceResult = "sent" | "forced";
+type RequestPhase = "pre_turn" | "turn" | "reply";
+
 interface ActiveTurn {
   threadId: string;
   turnId?: string;
@@ -169,6 +172,7 @@ interface RequestTrace {
   startedAt: number;
   threadId?: string;
   turnId?: string;
+  phase: RequestPhase;
   terminal: boolean;
 }
 
@@ -213,6 +217,16 @@ const TERMINAL_REQUEST_STATUSES = new Set<RequestStatus>([
   "interrupted",
   "runtime_lost",
 ]);
+
+function isSupersedable(trace?: RequestTrace): trace is RequestTrace {
+  return Boolean(trace && !trace.terminal && trace.phase === "pre_turn");
+}
+
+function isInterruptible(active?: ActiveTurn): active is ActiveTurn {
+  return Boolean(
+    active && !active.trace.terminal && active.trace.phase === "turn",
+  );
+}
 
 const HELP = [
   "可用命令：",
@@ -308,12 +322,15 @@ export class ConversationOrchestrator {
               "Codex App Server 暂不可用，请稍后重试。",
             ),
         );
+        this.#emitRequestStatus(trace, "completed", {
+          reason: "runtime_unavailable",
+        });
         return;
       }
 
       const slot = this.#slot(message.conversationKey);
       const superseded = slot.pending ??
-        (!slot.active ? slot.current : undefined);
+        (isSupersedable(slot.current) ? slot.current : undefined);
       slot.pending = trace;
       if (superseded) {
         this.#emitRequestStatus(superseded, "superseded", {
@@ -321,7 +338,9 @@ export class ConversationOrchestrator {
         });
       }
       this.#emitRequestStatus(trace, "queued");
-      if (slot.active) this.#requestInterrupt(slot, message.msgId);
+      if (isInterruptible(slot.active)) {
+        this.#requestInterrupt(slot, message.msgId);
+      }
       if (!slot.drain) {
         slot.drain = this.#drain(message.conversationKey, slot).finally(() => {
           slot.drain = undefined;
@@ -342,7 +361,7 @@ export class ConversationOrchestrator {
     const slot = this.#slot(message.conversationKey);
     if (command === "/new") {
       const superseded = slot.pending ??
-        (!slot.active ? slot.current : undefined);
+        (isSupersedable(slot.current) ? slot.current : undefined);
       slot.pending = undefined;
       slot.resetPending = message;
       if (superseded) {
@@ -352,7 +371,7 @@ export class ConversationOrchestrator {
       }
     }
 
-    if (slot.active) this.#requestInterrupt(slot);
+    if (isInterruptible(slot.active)) this.#requestInterrupt(slot);
     if (!slot.drain) {
       slot.drain = this.#drain(message.conversationKey, slot).finally(() => {
         slot.drain = undefined;
@@ -381,7 +400,7 @@ export class ConversationOrchestrator {
     for (const slot of this.#slots.values()) {
       this.#clearInterruptRetry(slot);
       const pending = slot.pending;
-      const current = !slot.active ? slot.current : undefined;
+      const current = isSupersedable(slot.current) ? slot.current : undefined;
       slot.pending = undefined;
       slot.resetPending = undefined;
       if (pending) {
@@ -395,7 +414,7 @@ export class ConversationOrchestrator {
         });
       }
       if (slot.drain) drains.push(slot.drain);
-      if (!slot.active) continue;
+      if (!isInterruptible(slot.active)) continue;
       this.#requestShutdown(slot);
     }
     if (drains.length === 0) return;
@@ -567,6 +586,7 @@ export class ConversationOrchestrator {
       lateInterruptRequested: false,
       interruptStatusEmitted: false,
     };
+    trace.phase = "turn";
     slot.active = active;
     slot.interruptRequested = false;
     slot.interruptFailures = 0;
@@ -601,6 +621,7 @@ export class ConversationOrchestrator {
       })),
     ]);
     if (startResult.type === "forced") {
+      trace.phase = "reply";
       this.#observeLateStart(active, start);
       try {
         await this.#finishTurnOutput(turnOutput, {
@@ -616,6 +637,7 @@ export class ConversationOrchestrator {
     }
 
     if (startResult.type === "error") {
+      trace.phase = "reply";
       try {
         await this.#finishTurnOutput(turnOutput, undefined, control);
       } finally {
@@ -630,6 +652,7 @@ export class ConversationOrchestrator {
     trace.turnId = handle.turnId;
     if (active.interruptWhenReady) this.#requestInterrupt(slot);
     if (control.forced) {
+      trace.phase = "reply";
       void handle.completion.catch(() => undefined);
       const forcedOutcome = await control.forceSignal;
       try {
@@ -668,6 +691,7 @@ export class ConversationOrchestrator {
           error: errorMessage(completionError),
         };
       }
+      trace.phase = "reply";
       this.#emitRequestStatus(trace, "turn_completed", {
         reason: interruptedOutcome.status,
         ...(interruptedOutcome.error
@@ -694,6 +718,8 @@ export class ConversationOrchestrator {
     } catch (error) {
       outcome = { status: "failed", error: errorMessage(error) };
     }
+    trace.phase = "reply";
+    const superseded = Boolean(slot.resetPending || slot.pending);
     this.#emitRequestStatus(trace, "turn_completed", {
       reason: outcome.status,
       ...(outcome.error ? { error: outcome.error } : {}),
@@ -719,7 +745,6 @@ export class ConversationOrchestrator {
       this.#clearActive(slot, active);
     }
 
-    const superseded = Boolean(slot.resetPending || slot.pending);
     if (
       outcome.status === "completed" && outcome.finalAnswer && !superseded &&
       !this.#shuttingDown
@@ -812,8 +837,8 @@ export class ConversationOrchestrator {
     message: RoutedMessage,
     text: string,
     final = false,
-  ): Promise<void> {
-    if (control.forced) return;
+  ): Promise<SendWithForceResult> {
+    if (control.forced) return "forced";
     let send: Promise<void>;
     try {
       send = this.#output.send(message, text, final);
@@ -828,6 +853,7 @@ export class ConversationOrchestrator {
       control.forceSignal.then(() => ({ type: "forced" as const })),
     ]);
     if (result.type === "error") throw result.error;
+    return result.type;
   }
 
   async #sendRequestWithForce(
@@ -836,6 +862,7 @@ export class ConversationOrchestrator {
     text: string,
     final = false,
   ): Promise<void> {
+    trace.phase = "reply";
     if (control.forced) {
       this.#emitRequestStatus(trace, "reply_skipped", {
         reason: "shutdown",
@@ -843,15 +870,21 @@ export class ConversationOrchestrator {
       return;
     }
     this.#emitRequestStatus(trace, "reply_sending");
+    let result: SendWithForceResult;
     try {
-      await this.#sendWithForce(control, trace.message, text, final);
+      result = await this.#sendWithForce(
+        control,
+        trace.message,
+        text,
+        final,
+      );
     } catch (error) {
       this.#emitRequestStatus(trace, "failed", {
         error: errorMessage(error),
       });
       throw error;
     }
-    if (control.forced) {
+    if (result === "forced") {
       this.#emitRequestStatus(trace, "reply_skipped", {
         reason: "shutdown",
       });
@@ -864,6 +897,7 @@ export class ConversationOrchestrator {
     trace: RequestTrace,
     send: () => Promise<void>,
   ): Promise<void> {
+    trace.phase = "reply";
     this.#emitRequestStatus(trace, "reply_sending");
     try {
       await send();
@@ -1080,6 +1114,7 @@ export class ConversationOrchestrator {
     return {
       message,
       startedAt: this.#now(),
+      phase: "pre_turn",
       terminal: false,
     };
   }
@@ -1137,7 +1172,8 @@ export class ConversationOrchestrator {
     let active = 0;
     let pending = 0;
     for (const slot of this.#slots.values()) {
-      if (slot.active) active++;
+      const activeTrace = slot.current ?? slot.active?.trace;
+      if (activeTrace && !activeTrace.terminal) active++;
       if (slot.pending || slot.resetPending) pending++;
     }
     return { active, pending };
