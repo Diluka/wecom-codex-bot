@@ -21,6 +21,7 @@ const RESERVED_LOG_FIELDS = new Set([
   "name",
   "v",
 ]);
+const OMIT_LOG_VALUE = Symbol("omit-log-value");
 const REQUEST_SEGMENTER = new Intl.Segmenter(undefined, {
   granularity: "grapheme",
 });
@@ -156,11 +157,13 @@ function redactFields(
   seen.set(fields, result);
   for (const key of Object.keys(fields)) {
     if (RESERVED_LOG_FIELDS.has(key)) continue;
-    result[redactSecrets(key, secrets)] = redactValue(
+    const redacted = redactValue(
       fields[key],
       secrets,
       seen,
     );
+    if (redacted === OMIT_LOG_VALUE) continue;
+    result[redactSecrets(key, secrets)] = redacted;
   }
   return result;
 }
@@ -170,6 +173,12 @@ function redactValue(
   secrets: readonly string[],
   seen = new WeakMap<object, unknown>(),
 ): unknown {
+  if (
+    value === undefined || typeof value === "function" ||
+    typeof value === "symbol" || typeof value === "bigint"
+  ) {
+    return OMIT_LOG_VALUE;
+  }
   if (typeof value === "string") return redactSecrets(value, secrets);
   if (value instanceof Error) {
     return redactSecrets(loggerMessage(value), secrets);
@@ -181,14 +190,19 @@ function redactValue(
   if (Array.isArray(value)) {
     const result: unknown[] = [];
     seen.set(value, result);
-    for (const entry of value) result.push(redactValue(entry, secrets, seen));
+    for (const entry of value) {
+      const redacted = redactValue(entry, secrets, seen);
+      result.push(redacted === OMIT_LOG_VALUE ? null : redacted);
+    }
     return result;
   }
 
   const result: LogFields = Object.create(null);
   seen.set(value, result);
   for (const [key, entry] of Object.entries(value)) {
-    result[redactSecrets(key, secrets)] = redactValue(entry, secrets, seen);
+    const redacted = redactValue(entry, secrets, seen);
+    if (redacted === OMIT_LOG_VALUE) continue;
+    result[redactSecrets(key, secrets)] = redacted;
   }
   return result;
 }

@@ -131,6 +131,36 @@ describe("createLogger", () => {
       /"nested":\{"scope":"nested-scope","time":123,"level":30,"pid":992001,"hostname":"nested-host","msg":"nested-msg","name":"nested-name","v":992002\}/,
     );
   });
+
+  it("drops nested JSON hooks and other unsafe values", () => {
+    const capture = captureLogs();
+    const logger = createLogger({
+      secrets: ["actual-secret"],
+      destination: capture.destination,
+    });
+
+    logger.request.info("received", {
+      nested: {
+        ordinary: "hello actual-secret",
+        callback: () => "actual-secret",
+        symbolValue: Symbol("actual-secret"),
+        toJSON() {
+          return {
+            forged: "actual-secret",
+            ordinary: "forged",
+          };
+        },
+      },
+    });
+    logger.flush();
+
+    const output = capture.output();
+    assertEquals(output.includes("actual-secret"), false);
+    assertMatch(output, /"nested":\{"ordinary":"hello \[REDACTED\]"\}/);
+    for (const omitted of ["forged", "callback", "symbolValue", "toJSON"]) {
+      assertEquals(output.includes(omitted), false);
+    }
+  });
 });
 
 describe("summarizeRequest", () => {
