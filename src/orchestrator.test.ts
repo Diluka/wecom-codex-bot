@@ -4288,24 +4288,28 @@ describe("ConversationOrchestrator settings barriers", () => {
     const resetting = orchestrator.handleText(
       message("single:alice", "new", "/new"),
     );
-    await new Promise((resolve) => setTimeout(resolve, 0));
     const startsWhileEarlierMutationBlocked = codex.startThreadAttempts;
     const changingEffort = orchestrator.handleText(
       message("single:alice", "effort", "/effort low"),
     );
+    let resetSettled = false;
+    let effortSettled = false;
+    void resetting.then(() => {
+      resetSettled = true;
+    });
+    void changingEffort.then(() => {
+      effortSettled = true;
+    });
 
     modelGate.resolve();
     await waitFor(() => codex.effortChanges.length === 1);
     await waitFor(() => codex.startThreadAttempts === 1);
-    const resetSettledBeforeLaterMutation = await Promise.race([
-      resetting.then(() => true as const),
-      new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
-    ]);
+    await waitFor(() => resetSettled);
+    assertEquals(effortSettled, false);
     effortGate.resolve();
     await Promise.all([switching, resetting, changingEffort]);
 
     assertEquals(startsWhileEarlierMutationBlocked, 0);
-    assertEquals(resetSettledBeforeLaterMutation, true);
   });
 });
 
