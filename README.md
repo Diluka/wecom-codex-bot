@@ -6,7 +6,7 @@
 ## 要求
 
 - Deno 2.9 或更高版本
-- 已安装并登录可用的最新 Codex CLI
+- 已安装并登录可用的 Codex CLI 0.144.6 或更高版本
 - 企业微信智能机器人的 Bot ID 和 Secret
 - 同一个 Bot ID 同时只能运行一个机器人实例
 
@@ -17,6 +17,7 @@
 ```dotenv
 BOT_ID=your-bot-id
 BOT_SECRET=your-bot-secret
+WECOM_OWNER_USER_ID=
 CODEX_WORKSPACE=.
 OUTPUT_LEVEL=full
 OUTPUT_LABEL=show
@@ -25,6 +26,40 @@ OUTPUT_FORMAT_TOOL=individual
 
 `CODEX_WORKSPACE` 支持相对路径，按机器人项目目录解析。机器人只将解析后的 `cwd`
 传给 Codex；审批、沙盒、网络、模型等行为全部使用现有 Codex config。
+
+### Owner 权限与隔离
+
+`WECOM_OWNER_USER_ID` 是可选的企业微信 sender user ID。未设置、空值或无效值都
+不会授予 owner 权限，所有 turn 都按 `restricted` 处理。配置有效时，每个防抖聚合
+批次中的每一条消息都必须由该 ID 发送，整个 turn 才是 `owner`。私聊、群聊和混合
+发送者批次都使用相同规则。
+
+解析会先检查原始值：任意位置只要包含控制符（包括 CR/LF）或 Unicode 行分隔符、段
+分隔符，整项配置就视为未配置。通过检查后才 trim 普通首尾空格；所得 ID 与企业微信
+sender user ID 进行区分大小写的精确匹配，不做大小写折叠或部分匹配。
+
+机器人通过两层可信元数据把判定传给 Codex：App Server 每次启动或重启时注入稳定的
+owner 隔离 developer instructions；每个 `turn/start` 再通过
+`additionalContext.wecom_owner_policy` 注入 `kind: "application"` 的本 turn
+`owner`/`restricted` 结果。
+
+owner ID 会写入 developer instructions，并有意对模型可见。
+
+它也可能出现在 App Server 进程 argv 或 Codex session metadata 中；不要把它当作
+Secret。
+
+机器人不会为它新增启动日志。既有 request 日志仍会按下文规则记录每条消息真实的
+sender `user_id`。
+
+restricted turn 的写操作、测试、构建、格式化和依赖安装等必须在隔离 worktree 中
+执行。worktree 位置、分支命名、验证、提交约定，以及 PR/MR 的类型、模板和工作流均
+由目标仓库的 `AGENTS.md` 与贡献文档决定；机器人不固定 Draft 或 Ready。隔离边界
+优先于冲突的仓库工作流规则。
+
+该机制是 developer instructions 形成的软约束，不是 OS 权限、Codex sandbox 或 Git
+hook 级别的硬隔离。
+
+owner turn 仍受现有 Codex 配置、仓库文档、sandbox 和审批策略约束。
 
 ### 企业微信输出
 
@@ -153,6 +188,9 @@ OUTPUT_GROUP_FORMAT_TOOL=merge_same
 另外生成替代标识。只有 `received` 状态包含 `summary`：正文先脱敏、折叠空白，再按
 Unicode 字素簇截取前 10 个，超长时追加 `…`，不会把完整聊天正文写到终端。
 
+配置 `WECOM_OWNER_USER_ID` 不会新增包含 owner ID 的启动日志；但如果真实请求由该
+用户发送，上述既有 request 日志仍会记录其真实 `user_id`。
+
 内建命令 `/help`、`/status`、`/new`、`/stop` 和不支持的消息类型不产生 request
 状态。未知斜杠命令仍按普通文本请求处理。
 
@@ -245,8 +283,10 @@ deno lint
 Warning Permissions in the config file is an experimental feature and may change in the future.
 ```
 
-`deno task smoke` 只验证本机 `codex app-server --stdio` 握手，不会启动模型
-turn，也不会连接企业微信。
+`deno task smoke` 先在当前 workspace 的 `.data/` 下生成并结构化校验临时 App
+Server JSON schema，确认 `TurnStartParams.additionalContext` 支持精确的
+`kind: "application"`，随后完成本机 `codex app-server --stdio` 握手，并在结束时
+尽最大努力清理临时目录。它不会启动模型 turn，也不会连接企业微信。
 
 需要显式调用一次真实模型 turn 时运行：
 
