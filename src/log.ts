@@ -11,6 +11,16 @@ const SCOPES = [
 ] as const;
 const REQUEST_WARN = new Set(["runtime_unavailable", "shutdown_discarded"]);
 const REQUEST_ERROR = new Set(["failed", "runtime_lost"]);
+const RESERVED_LOG_FIELDS = new Set([
+  "scope",
+  "time",
+  "level",
+  "pid",
+  "hostname",
+  "msg",
+  "name",
+  "v",
+]);
 const REQUEST_SEGMENTER = new Intl.Segmenter(undefined, {
   granularity: "grapheme",
 });
@@ -128,13 +138,31 @@ function wrapLogger(
   ): void => {
     const safeMessage = redactSecrets(loggerMessage(message), secrets);
     if (fields === undefined) logger[level](safeMessage);
-    else logger[level](redactValue(fields, secrets), safeMessage);
+    else logger[level](redactFields(fields, secrets), safeMessage);
   };
   return {
     info: (message, fields) => write("info", message, fields),
     warn: (message, fields) => write("warn", message, fields),
     error: (message, fields) => write("error", message, fields),
   };
+}
+
+function redactFields(
+  fields: LogFields,
+  secrets: readonly string[],
+): LogFields {
+  const result: LogFields = Object.create(null);
+  const seen = new WeakMap<object, unknown>();
+  seen.set(fields, result);
+  for (const key of Object.keys(fields)) {
+    if (RESERVED_LOG_FIELDS.has(key)) continue;
+    result[redactSecrets(key, secrets)] = redactValue(
+      fields[key],
+      secrets,
+      seen,
+    );
+  }
+  return result;
 }
 
 function redactValue(

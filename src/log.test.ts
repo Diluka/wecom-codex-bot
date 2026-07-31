@@ -80,6 +80,57 @@ describe("createLogger", () => {
       assertEquals(output.includes(`[${scope}] ready`), true);
     }
   });
+
+  it("prevents top-level fields from overriding logger metadata", () => {
+    const capture = captureLogs();
+    const logger = createLogger({ destination: capture.destination });
+
+    logger.request.info("received", {
+      scope: "spoofed-scope",
+      time: 0,
+      level: 60,
+      pid: 991_001,
+      hostname: "spoofed-host",
+      msg: "spoofed-msg",
+      name: "spoofed-name",
+      v: 991_002,
+      regular: "kept",
+      nested: {
+        scope: "nested-scope",
+        time: 123,
+        level: 30,
+        pid: 992_001,
+        hostname: "nested-host",
+        msg: "nested-msg",
+        name: "nested-name",
+        v: 992_002,
+      },
+    });
+    logger.flush();
+
+    const line = capture.output().trimEnd();
+    assertMatch(
+      line,
+      /^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3} [+-]\d{4}\] INFO: \[request\] received /,
+    );
+    for (
+      const spoofed of [
+        "spoofed-scope",
+        "spoofed-host",
+        "spoofed-msg",
+        "spoofed-name",
+        "991001",
+        "991002",
+      ]
+    ) {
+      assertEquals(line.includes(spoofed), false);
+    }
+    assertMatch(line, /"regular":"kept"/);
+    assertMatch(
+      line,
+      /"nested":\{"scope":"nested-scope","time":123,"level":30,"pid":992001,"hostname":"nested-host","msg":"nested-msg","name":"nested-name","v":992002\}/,
+    );
+  });
 });
 
 describe("summarizeRequest", () => {
