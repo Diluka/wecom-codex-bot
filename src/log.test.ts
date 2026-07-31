@@ -50,7 +50,7 @@ describe("createLogger", () => {
     assertMatch(lines[0], /"chat_id":"room-1"/);
     assertMatch(
       lines[1],
-      / ERROR: \[codex\] failed .*"error":"Error: failed \[REDACTED\]"/,
+      / ERROR: \[codex\] failed .*"error":\{"type":"Error","message":"failed \[REDACTED\]","stack":"Error: failed \[REDACTED\]\\n/,
     );
     assertEquals(output.includes("actual-secret"), false);
     assertEquals(output.includes("[REDACTED]"), true);
@@ -170,6 +170,81 @@ describe("createLogger", () => {
     for (const omitted of ["forged", "callback", "symbolValue", "toJSON"]) {
       assertEquals(output.includes(omitted), false);
     }
+  });
+
+  it("sanitizes native child bindings without wrapping child", () => {
+    const capture = captureLogs();
+    const logger: Logger = createLogger({
+      secrets: ["actual-secret"],
+      destination: capture.destination,
+    });
+    const requestLogger = logger.child({
+      scope: "request",
+      component: "actual-secret",
+      time: 991001,
+      pid: 991002,
+      hostname: "spoofed-host",
+      msg: "spoofed-message",
+      name: "spoofed-name",
+      v: 991003,
+    });
+
+    requestLogger.info("ready");
+    logger.flush();
+
+    const output = capture.output().trimEnd();
+    assertMatch(output, / INFO: \[request\] ready /);
+    assertMatch(output, /"component":"\[REDACTED\]"/);
+    for (
+      const forbidden of [
+        "actual-secret",
+        "spoofed-host",
+        "spoofed-message",
+        "spoofed-name",
+        "991001",
+        "991002",
+        "991003",
+      ]
+    ) {
+      assertEquals(output.includes(forbidden), false);
+    }
+  });
+
+  it("keeps multiline messages on one physical log line", () => {
+    const capture = captureLogs();
+    const logger: Logger = createLogger({ destination: capture.destination });
+
+    logger.child({ scope: "codex" }).info(
+      { source: "app_server" },
+      "first line\nsecond line\r\nthird line",
+    );
+    logger.flush();
+
+    const output = capture.output().trimEnd();
+    assertEquals(output.split("\n").length, 1);
+    assertMatch(output, /first line\\nsecond line\\nthird line/);
+  });
+
+  it("preserves secret-safe structured error diagnostics", () => {
+    const capture = captureLogs();
+    const logger: Logger = createLogger({
+      secrets: ["actual-secret"],
+      destination: capture.destination,
+    });
+    const error = new Error("failed actual-secret", {
+      cause: new Error("caused by actual-secret"),
+    });
+
+    logger.child({ scope: "lifecycle" }).error({ error }, "failed");
+    logger.flush();
+
+    const output = capture.output().trimEnd();
+    assertEquals(output.split("\n").length, 1);
+    assertEquals(output.includes("actual-secret"), false);
+    assertMatch(output, /"error":\{"type":"Error"/);
+    assertMatch(output, /"message":"failed \[REDACTED\]"/);
+    assertMatch(output, /"stack":"Error: failed \[REDACTED\]\\n/);
+    assertMatch(output, /"cause":\{"type":"Error"/);
   });
 });
 

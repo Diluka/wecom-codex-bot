@@ -14,6 +14,7 @@ const RESERVED_LOG_FIELDS = new Set([
   "name",
   "v",
 ]);
+const REDACT_PATHS = [...RESERVED_LOG_FIELDS, "*"];
 const OMIT_LOG_VALUE = Symbol("omit-log-value");
 const REQUEST_SEGMENTER = new Intl.Segmenter(undefined, {
   granularity: "grapheme",
@@ -60,6 +61,25 @@ export function createLogger(options: LoggerOptions = {}): Logger {
   });
   const root = pino({
     base: null,
+    redact: {
+      // Explicit paths preserve the actual key; Pino reports wildcard keys as
+      // an internal symbol when serializing child bindings.
+      paths: REDACT_PATHS,
+      censor(value, path) {
+        const key = path[0];
+        if (
+          key !== "scope" && key !== "msg" && RESERVED_LOG_FIELDS.has(key)
+        ) {
+          return undefined;
+        }
+        const redacted = redactValue(value, secrets);
+        if (redacted === OMIT_LOG_VALUE) return undefined;
+        return (key === "scope" || key === "msg") &&
+            typeof redacted === "string"
+          ? singleLine(redacted)
+          : redacted;
+      },
+    },
     hooks: {
       logMethod(args, method) {
         const sanitizedArgs = args.map((argument, index) =>
@@ -117,6 +137,9 @@ function sanitizeLogArgument(
   secrets: readonly string[],
 ): unknown {
   if (isFirst && isLogFields(value)) return redactFields(value, secrets);
+  if (typeof value === "string") {
+    return singleLine(redactSecrets(value, secrets));
+  }
   const redacted = redactValue(value, secrets);
   return redacted === OMIT_LOG_VALUE ? null : redacted;
 }
@@ -159,7 +182,24 @@ function redactValue(
   }
   if (typeof value === "string") return redactSecrets(value, secrets);
   if (value instanceof Error) {
-    return redactSecrets(loggerMessage(value), secrets);
+    const previous = seen.get(value);
+    if (previous !== undefined) return previous;
+    const result: LogFields = Object.create(null);
+    seen.set(value, result);
+    result.type = redactSecrets(value.name, secrets);
+    result.message = redactSecrets(value.message, secrets);
+    if (value.stack) result.stack = redactSecrets(value.stack, secrets);
+    if (value.cause !== undefined) {
+      const cause = redactValue(value.cause, secrets, seen);
+      if (cause !== OMIT_LOG_VALUE) result.cause = cause;
+    }
+    for (const [key, entry] of Object.entries(value)) {
+      if (key === "cause") continue;
+      const redacted = redactValue(entry, secrets, seen);
+      if (redacted === OMIT_LOG_VALUE) continue;
+      result[redactSecrets(key, secrets)] = redacted;
+    }
+    return result;
   }
   if (value === null || typeof value !== "object") return value;
 
@@ -185,7 +225,6 @@ function redactValue(
   return result;
 }
 
-function loggerMessage(value: unknown): string {
-  if (value instanceof Error) return `${value.name}: ${value.message}`;
-  return String(value);
+function singleLine(value: string): string {
+  return value.replace(/\r\n|\r|\n/gu, "\\n");
 }

@@ -58,7 +58,10 @@ describe("finishSmoke", () => {
     assertStrictEquals(thrown, primaryError);
     assertEquals(harness.flushes(), 1);
     assertMatch(harness.output(), / ERROR: \[codex\] close_failed /);
-    assertMatch(harness.output(), /"error":"Error: close failed"/);
+    assertMatch(
+      harness.output(),
+      /"error":\{"type":"Error","message":"close failed","stack":"Error: close failed\\n/,
+    );
   });
 
   it("throws a close failure when the primary operation succeeded", async () => {
