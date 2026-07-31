@@ -24,20 +24,11 @@ export interface InboundText extends InboundMessage {
 
 type Listener = (...args: unknown[]) => void;
 type MaybePromise<T> = T | Promise<T>;
-type SdkLogLevel = "info" | "warn" | "error";
-
-function sdkLog(level: SdkLogLevel, message: string): void {
-  const logger = level === "info"
-    ? console.info
-    : level === "warn"
-    ? console.warn
-    : console.error;
-  logger(`[wecom-sdk] ${message}`);
-}
+export type SdkLogLevel = "info" | "warn" | "error";
 
 export function createSafeSdkLogger(
   secret: string,
-  write: (level: SdkLogLevel, message: string) => void = sdkLog,
+  write: (level: SdkLogLevel, message: string) => void = () => {},
 ): Logger {
   const record = (level: SdkLogLevel, message: string): void => {
     write(level, redactSecrets(message, [secret]));
@@ -78,6 +69,7 @@ export interface WeComGatewayOptions {
   onFatal: (error: Error) => MaybePromise<void>;
   onReady?: () => MaybePromise<void>;
   onError?: (error: Error) => void;
+  onSdkLog?: (level: SdkLogLevel, message: string) => void;
 }
 
 function asRecord(value: unknown, label: string): Record<string, unknown> {
@@ -186,7 +178,7 @@ export class WeComGateway {
     this.client = options.client ?? (new WSClient({
       botId: options.botId,
       secret: options.secret,
-      logger: createSafeSdkLogger(options.secret),
+      logger: createSafeSdkLogger(options.secret, options.onSdkLog),
     }) as unknown as WeComClientLike);
     this.#registerListeners();
   }

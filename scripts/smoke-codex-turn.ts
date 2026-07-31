@@ -3,7 +3,7 @@ import {
   CodexAppServerClient,
   type TurnCompletedEvent,
 } from "../src/codex-app-server.ts";
-import { redactSecrets } from "../src/output.ts";
+import { createLogger } from "../src/log.ts";
 
 if (Deno.env.get("RUN_CODEX_TURN") !== "1") {
   throw new Error(
@@ -15,19 +15,20 @@ const workspace = await Deno.realPath(
   resolve(Deno.cwd(), Deno.env.get("CODEX_WORKSPACE") ?? "."),
 );
 const secret = Deno.env.get("BOT_SECRET") ?? "";
+const logger = createLogger({ secrets: [secret] });
+const codexLogger = logger.child({ scope: "codex" });
 const completed = Promise.withResolvers<TurnCompletedEvent>();
-const client = await CodexAppServerClient.start({
-  cwd: workspace,
-  callbacks: {
-    onTurnCompleted: completed.resolve,
-    onDiagnostic: (message) => {
-      const safe = redactSecrets(message, [secret]);
-      return Deno.stderr.write(new TextEncoder().encode(safe));
-    },
-  },
-});
+let client: CodexAppServerClient | undefined;
 
 try {
+  client = await CodexAppServerClient.start({
+    cwd: workspace,
+    callbacks: {
+      onTurnCompleted: completed.resolve,
+      onDiagnostic: (message) =>
+        codexLogger.info({ source: "app_server" }, message.trimEnd()),
+    },
+  });
   const threadId = await client.startThread();
   const turnId = await client.startTurn(
     threadId,
@@ -40,9 +41,17 @@ try {
   if (result.status !== "completed" || !result.finalMessage?.trim()) {
     throw new Error(`Codex turn ended with status ${result.status}`);
   }
-  console.log("Codex model turn succeeded");
+  codexLogger.info({
+    workspace,
+    thread_id: threadId,
+    turn_id: turnId,
+  }, "model_turn_succeeded");
 } finally {
-  await client.close();
+  try {
+    await client?.close();
+  } finally {
+    logger.flush();
+  }
 }
 
 async function withTimeout<T>(
