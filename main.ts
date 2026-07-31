@@ -4,6 +4,7 @@ import { CodexRuntime } from "./src/codex-runtime.ts";
 import { loadConfig } from "./src/config.ts";
 import { BotLifecycle } from "./src/lifecycle.ts";
 import { createLogger, logRequestStatus, summarizeRequest } from "./src/log.ts";
+import { buildOwnerDeveloperInstructions } from "./src/owner-policy.ts";
 import { ConversationOrchestrator } from "./src/orchestrator.ts";
 import { StateStore } from "./src/state.ts";
 import { WeComGateway } from "./src/wecom.ts";
@@ -53,6 +54,7 @@ const shutdown = (code: number, signal?: ShutdownSignal): Promise<void> => {
 
 const runtime = new CodexRuntime({
   workspace: config.workspace,
+  developerInstructions: buildOwnerDeveloperInstructions(config.ownerUserId),
   onDiagnostic: (message) =>
     codexLogger.info({ source: "app_server" }, message.trimEnd()),
   onFatal: (error) => {
@@ -91,6 +93,7 @@ const orchestrator = new ConversationOrchestrator({
   codex: runtime,
   output,
   workspace: config.workspace,
+  ownerUserId: config.ownerUserId,
   outputSettings: config.outputSettings,
   groupOutputSettings: config.groupOutputSettings,
   onError: (error) => requestLogger.error({ error }, "error"),
