@@ -25,7 +25,8 @@ Codex notifications
   -> WeCom reply/stream
 ```
 
-- 程序入口是 `main.ts`，这里只组装依赖、安装信号处理并统一做终端日志脱敏。
+- 程序入口是 `main.ts`，这里只组装依赖、安装信号处理并统一配置 Pino 日志脱敏、
+  终端输出和 `logs/` 文件 transport。
 - `CODEX_WORKSPACE` 是 Codex 实际工作的目录；它相对进程工作目录解析，标准
   `deno task start` 从仓库根启动时才等同于相对项目根解析。
 - `.data/bot.sqlite` 只保存聊天/thread 绑定、消息去重和 turn
@@ -37,7 +38,7 @@ Codex notifications
 | 文件                         | 职责                                                              |
 | ---------------------------- | ----------------------------------------------------------------- |
 | `main.ts`                    | 加载配置并组装状态库、Codex、企业微信、输出、编排器和生命周期     |
-| `src/config.ts`              | 校验环境变量，解析工作目录和 `OUTPUT_*` 配置                      |
+| `src/config.ts`              | 校验环境变量，解析工作目录、`LOG_LEVEL` 和 `OUTPUT_*` 配置        |
 | `src/owner-policy.ts`        | 规范化 owner ID，判定 turn 权限并生成稳定的隔离 instructions      |
 | `src/wecom.ts`               | 适配企业微信 SDK，规范化单聊/群聊消息，处理连接与回复             |
 | `src/state.ts`               | 使用 `node:sqlite` 同步 API 管理持久状态和消息去重                |
@@ -51,7 +52,8 @@ Codex notifications
 | `src/chat-output.ts`         | 把通用输出能力接到企业微信回复与流式消息                          |
 | `src/lifecycle.ts`           | 固定启动、恢复和优雅关闭顺序                                      |
 | `src/prompt.ts`              | 把不可伪造的聊天/发送者元数据加入 Codex prompt                    |
-| `src/jsonl.ts`、`src/log.ts` | JSONL 读取和脱敏终端日志等小型边界工具                            |
+| `src/process-log.ts`         | 每次启动前轮换旧的 Pino 活跃日志文件                              |
+| `src/jsonl.ts`、`src/log.ts` | JSONL 读取、Pino transport 和脱敏日志等小型边界工具               |
 
 测试与实现共置为 `src/*.test.ts`。修改某个模块时，先读同名测试；这里大量行为
 依赖并发时序，测试往往比类型签名更完整地描述契约。
@@ -206,8 +208,9 @@ git ls-files -co --exclude-standard -z -- '*.ts' '*.json' '*.md' | xargs -0 deno
 
 ## 敏感数据与本地状态
 
-- `.env`、`.data/`、`.codegraph/` 都是本地内容，不得提交。不要回显真实
-  `BOT_ID`、`BOT_SECRET`、Codex 登录信息、聊天标识或 SQLite 内容。
+- `.env`、`.data/`、`.codegraph/`、`.superpowers/` 和 `logs/` 都是本地内容，
+  不得提交。不要回显真实 `BOT_ID`、`BOT_SECRET`、Codex 登录信息、聊天标识或
+  SQLite 内容。
 - App Server 子进程环境会显式移除 `BOT_ID`、`BOT_SECRET` 和
   `WECOM_OWNER_USER_ID`，但 owner ID 仍通过 developer instructions 对模型可见，
   也可能出现在 argv 或 session metadata；如果 `.env` 位于 `CODEX_WORKSPACE` 内，
@@ -224,8 +227,9 @@ git ls-files -co --exclude-standard -z -- '*.ts' '*.json' '*.md' | xargs -0 deno
 不要只根据 README 假定宿主工作区和 SQLite 已被正确持久化。当前 `compose.yml`
 的容器工作目录是 `/app`，默认 `CODEX_WORKSPACE=.` 也解析到
 `/app`，但宿主仓库挂载在 `/home/bot/workspace`；状态库则写到
-`/app/.data/bot.sqlite`，没有独立宿主卷。修改或宣称 Compose
-的工作区编辑、状态持久化行为之前，必须先用实际容器路径验证。
+`/app/.data/bot.sqlite`，没有独立宿主卷。运行日志同样写到未挂载的
+`/app/logs`。修改或宣称 Compose 的工作区编辑、状态或日志持久化行为之前，必须先用
+实际容器路径验证。
 
 容器由 Compose 保持前台运行，使用 `restart: unless-stopped` 和一分钟停止宽限期；
 不要增加后台守护、PID 文件或额外日志包装层。宿主 Codex 配置引用的绝对路径或外部

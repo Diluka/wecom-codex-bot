@@ -5,7 +5,10 @@ import {
   type RequestAuthority,
 } from "./owner-policy.ts";
 import { summarizeRequest } from "./log.ts";
-import { TurnOutputPipeline } from "./output-pipeline.ts";
+import {
+  type OutputDecisionReason,
+  TurnOutputPipeline,
+} from "./output-pipeline.ts";
 import { buildCodexPrompt } from "./prompt.ts";
 import {
   DEFAULT_OUTPUT_SETTINGS,
@@ -143,12 +146,22 @@ export interface ConversationOrchestratorOptions {
   groupOutputSettings?: OutputSettings;
   onError?: (error: Error) => void;
   onRequestStatus?: (event: RequestStatusEvent) => void;
+  onOutputDecision?: (event: OutputDecisionEvent) => void;
   now?: () => number;
   summarizeRequest?: (text: string) => string;
   messageDebounceMs?: number;
   messageDebounceTimers?: OrchestratorTimerApi;
   shutdownGraceMs?: number;
   interruptRetryDelaysMs?: readonly number[];
+}
+
+export interface OutputDecisionEvent {
+  tag: ActivityEvent["tag"];
+  delivery: ActivityEvent["delivery"];
+  threadId?: string;
+  turnId?: string;
+  disposition: "rendered" | "suppressed";
+  reason: OutputDecisionReason;
 }
 
 export interface OrchestratorTimerApi {
@@ -297,6 +310,7 @@ export class ConversationOrchestrator {
   readonly #groupOutputSettings: OutputSettings;
   readonly #onError?: (error: Error) => void;
   readonly #onRequestStatus?: (event: RequestStatusEvent) => void;
+  readonly #onOutputDecision?: (event: OutputDecisionEvent) => void;
   readonly #now: () => number;
   readonly #summarizeRequest: (text: string) => string;
   readonly #messageDebounceMs: number;
@@ -318,6 +332,7 @@ export class ConversationOrchestrator {
       this.#outputSettings;
     this.#onError = options.onError;
     this.#onRequestStatus = options.onRequestStatus;
+    this.#onOutputDecision = options.onOutputDecision;
     this.#now = options.now ?? Date.now;
     this.#summarizeRequest = options.summarizeRequest ?? summarizeRequest;
     this.#messageDebounceMs = options.messageDebounceMs ?? 3_000;
@@ -1295,7 +1310,9 @@ export class ConversationOrchestrator {
     activity: ActivityEvent,
     control?: TurnControl,
   ): Promise<void> {
-    const rendered = turnOutput.pipeline.apply(activity);
+    const decision = turnOutput.pipeline.applyWithDecision(activity);
+    this.#reportOutputDecision(activity, decision);
+    const rendered = decision.output;
     if (rendered === null) {
       if (activity.tag === "SHUTDOWN") turnOutput.shutdownHandled = true;
       return;
@@ -1322,6 +1339,27 @@ export class ConversationOrchestrator {
         rendered.endsWith("\r");
     }
     if (activity.tag === "SHUTDOWN") turnOutput.shutdownHandled = true;
+  }
+
+  #reportOutputDecision(
+    activity: ActivityEvent,
+    decision: {
+      disposition: "rendered" | "suppressed";
+      reason: OutputDecisionReason;
+    },
+  ): void {
+    if (!this.#onOutputDecision) return;
+    try {
+      this.#onOutputDecision({
+        tag: activity.tag,
+        delivery: activity.delivery,
+        ...(activity.threadId ? { threadId: activity.threadId } : {}),
+        ...(activity.turnId ? { turnId: activity.turnId } : {}),
+        ...decision,
+      });
+    } catch {
+      // Output tracing cannot change delivery behavior.
+    }
   }
 
   async #finishTurnOutput(

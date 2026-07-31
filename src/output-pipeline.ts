@@ -18,6 +18,26 @@ interface LineState {
   truncated: boolean;
 }
 
+export type OutputDecisionReason =
+  | "direct"
+  | "direct_missing_body"
+  | "tool_format_summary"
+  | "tool_aggregation"
+  | "level_off"
+  | "no_source"
+  | "no_visible_text"
+  | "full"
+  | "line"
+  | "line_complete"
+  | "excerpt"
+  | "excerpt_complete";
+
+export interface OutputPipelineDecision {
+  output: string | null;
+  disposition: "rendered" | "suppressed";
+  reason: OutputDecisionReason;
+}
+
 /** Applies per-turn aggregation, detail filtering, and label rendering to activity events. */
 export class TurnOutputPipeline {
   readonly #settings: OutputSettings;
@@ -34,17 +54,52 @@ export class TurnOutputPipeline {
   }
 
   apply(event: ActivityEvent): string | null {
+    return this.applyWithDecision(event).output;
+  }
+
+  applyWithDecision(event: ActivityEvent): OutputPipelineDecision {
     this.#releaseCompletedToolResultStream(event);
-    if (event.delivery === "direct") return event.body ?? null;
+    if (event.delivery === "direct") {
+      return event.body === undefined
+        ? suppressed("direct_missing_body")
+        : rendered(event.body, "direct");
+    }
     if (
       this.#settings.toolFormat === "summary" &&
       (event.tag === "TOOL" || event.tag === "TOOL_RESULT")
     ) {
-      return null;
+      return suppressed("tool_format_summary");
     }
 
     const aggregated = this.#aggregate(event);
-    return aggregated ? this.#render(aggregated) : null;
+    if (!aggregated) return suppressed("tool_aggregation");
+
+    const level = this.#settings.levels[aggregated.tag];
+    if (level === "off") return suppressed("level_off");
+
+    const source = sourceText(aggregated);
+    if (source === null) return suppressed("no_source");
+
+    let visible: string | null;
+    let reason: OutputDecisionReason;
+    if (level === "line") {
+      visible = this.#line(aggregated, source);
+      reason = visible === null ? "line_complete" : "line";
+    } else if (level === "excerpt") {
+      visible = this.#excerpt(aggregated, source);
+      reason = visible === null ? "excerpt_complete" : "excerpt";
+    } else {
+      visible = source;
+      reason = "full";
+    }
+    if (!visible) {
+      return suppressed(visible === null ? reason : "no_visible_text");
+    }
+
+    const output = this.#settings.labels[aggregated.tag] === "show"
+      ? `[${aggregated.tag.toLowerCase()}] ${visible}`
+      : visible;
+    return rendered(output, reason);
   }
 
   clear(): void {
@@ -158,25 +213,6 @@ export class TurnOutputPipeline {
     return event.toolId ?? "__turn_fallback_tool__";
   }
 
-  #render(event: ActivityEvent): string | null {
-    const level = this.#settings.levels[event.tag];
-    if (level === "off") return null;
-
-    const source = sourceText(event);
-    if (source === null) return null;
-
-    const rendered = level === "line"
-      ? this.#line(event, source)
-      : level === "excerpt"
-      ? this.#excerpt(event, source)
-      : source;
-    if (!rendered) return null;
-
-    return this.#settings.labels[event.tag] === "show"
-      ? `[${event.tag.toLowerCase()}] ${rendered}`
-      : rendered;
-  }
-
   #excerpt(event: ActivityEvent, source: string): string | null {
     const state = streamState(
       this.#excerpts,
@@ -238,6 +274,17 @@ export class TurnOutputPipeline {
     deleteStreamState(this.#excerpts, "TOOL_RESULT", event.itemId);
     deleteStreamState(this.#lines, "TOOL_RESULT", event.itemId);
   }
+}
+
+function rendered(
+  output: string,
+  reason: OutputDecisionReason,
+): OutputPipelineDecision {
+  return { output, disposition: "rendered", reason };
+}
+
+function suppressed(reason: OutputDecisionReason): OutputPipelineDecision {
+  return { output: null, disposition: "suppressed", reason };
 }
 
 function sourceText(event: ActivityEvent): string | null {

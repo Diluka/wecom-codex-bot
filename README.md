@@ -19,6 +19,7 @@ BOT_ID=your-bot-id
 BOT_SECRET=your-bot-secret
 WECOM_OWNER_USER_ID=
 CODEX_WORKSPACE=.
+LOG_LEVEL=info
 OUTPUT_LEVEL=full
 OUTPUT_LABEL=show
 OUTPUT_FORMAT_TOOL=individual
@@ -186,9 +187,10 @@ OUTPUT_GROUP_FORMAT_TOOL=summary
 它们不再被读取、校验，也不会继续影响运行时行为；迁移时应删除旧变量并改用
 `OUTPUT_*`。
 
-### 终端日志
+### 运行日志
 
-前台终端统一使用 Pino 和 Pino Pretty 输出单行结构化日志，格式如下：
+`LOG_LEVEL` 支持 `info` 和 `debug`，默认 `info`。前台终端使用 Pino Pretty 输出
+单行结构化日志，格式如下：
 
 ```text
 [2026-07-31T14:22:33.456 +0800] INFO: [request] received {"chat_type":"group","chat_id":"room-1","user_id":"alice","msg_id":"m1","summary":"检查订单状态是否完成…","active_count":1,"pending_count":0}
@@ -200,9 +202,9 @@ OUTPUT_GROUP_FORMAT_TOOL=summary
 | scope       | 内容                                         |
 | ----------- | -------------------------------------------- |
 | `request`   | 普通文本请求的状态、计数和编排错误。         |
-| `codex`     | Codex App Server 的诊断和致命错误。          |
+| `codex`     | Codex App Server 的诊断、通知路由和致命错误。 |
 | `wecom`     | 企业微信鉴权、SDK 日志、网关错误和致命错误。 |
-| `output`    | 企业微信回复、流式输出和限流发送错误。       |
+| `output`    | 输出过滤决策、企业微信流式输出和发送错误。   |
 | `lifecycle` | 启动、恢复、信号、清理和关闭状态。           |
 
 同一普通文本请求的每个状态都会重复携带消息中的真实 `chat_id`、`user_id` 和
@@ -216,9 +218,29 @@ Unicode 字素簇截取前 10 个，超长时追加 `…`，不会把完整聊�
 内建命令 `/help`、`/status`、`/new`、`/stop` 和不支持的消息类型不产生 request
 状态。未知斜杠命令仍按普通文本请求处理。
 
-Codex 的原始 `ActivityEvent` 不写终端日志，只经过企业微信输出管线。
+`debug` 会额外记录两类安全的结构化决策：
 
-`OUTPUT_*` 不影响上述终端日志，本项目也不提供 `LOG_*` 配置。
+- `codex/notification_route`：App Server 通知的方法名、thread/turn、runtime
+  generation，以及通知被投递、缓冲或忽略的原因。
+- `output/activity_decision`：活动标签、投递类型，以及内容被渲染或抑制的原因；例如
+  `tool_format_summary`、`level_off`、`line_complete`。
+
+DEBUG 日志不会记录聊天正文、reasoning summary 文本、命令、参数、工具输出、
+`toolId` 或具体 `itemId`。因此可用下面的配置判断 App Server 是否发出了 reasoning
+summary，以及它是否在输出管线中被过滤：
+
+```dotenv
+LOG_LEVEL=debug
+OUTPUT_FORMAT_TOOL=summary
+```
+
+每次启动时，旧的 `logs/wecom-codex-bot.log` 会先按 UTC 启动时间改名，例如
+`logs/wecom-codex-bot.20260731T081322123Z.log`；同一进程随后始终写新的活跃文件，
+进程内不再轮换。终端 target 使用 `pino-pretty`，文件 target 使用 Pino 内置的
+`pino/file` 并写 JSONL。日志目录初始化失败时，服务继续使用终端日志。
+
+`OUTPUT_*` 不影响运行日志。`logs/` 是本地运行状态并已被 Git 忽略；文件中仍包含
+排障所需的 chat/thread/turn 标识，不应提交或公开。
 
 所有结构化字段和消息都会在 Pino 边界递归脱敏。
 
@@ -253,8 +275,9 @@ docker compose down
 ```
 
 容器收到停止请求时会向机器人发送 `SIGTERM`，最多等待一分钟完成现有的优雅
-退出流程。`restart: unless-stopped` 负责异常退出后的自动重启，日志由 Docker
-保存并轮换，不另外写后台日志文件。
+退出流程。`restart: unless-stopped` 负责异常退出后的自动重启。Docker 仍收集终端
+输出；进程也会写容器内的 `/app/logs`，当前 Compose 没有为它配置宿主卷，重建容器
+后这些文件不会保留。
 
 不要同时运行本地 `deno task start` 和 Compose 服务，否则两个实例会争用同一个
 企业微信 Bot ID。Codex config 中如果引用了宿主机专有的命令或绝对路径，需要让

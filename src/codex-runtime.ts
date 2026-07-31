@@ -40,6 +40,24 @@ export type CodexRuntimeClientFactory = (
 
 type MaybePromise<T> = T | Promise<T>;
 
+export interface CodexRuntimeTrace {
+  method: string;
+  decision: "routed" | "buffered" | "ignored";
+  reason:
+    | "stale_generation"
+    | "missing_turn_ids"
+    | "adapter_ignored"
+    | "turn_owned_by_orchestrator"
+    | "delivered"
+    | "buffered"
+    | "terminal_turn"
+    | "no_matching_turn";
+  generation: number;
+  threadId?: string;
+  turnId?: string;
+  tag?: ActivityEvent["tag"];
+}
+
 export interface CodexRuntimeOptions {
   workspace: string;
   developerInstructions?: string;
@@ -47,6 +65,7 @@ export interface CodexRuntimeOptions {
   delay?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   onFatal?: (error: Error) => MaybePromise<void>;
   onDiagnostic?: (message: string) => MaybePromise<void>;
+  onTrace?: (trace: CodexRuntimeTrace) => MaybePromise<void>;
 }
 
 interface ActiveTurn {
@@ -100,6 +119,7 @@ export class CodexRuntime implements CodexPort {
   ) => Promise<void>;
   readonly #onFatal?: (error: Error) => MaybePromise<void>;
   readonly #onDiagnostic?: (message: string) => MaybePromise<void>;
+  readonly #onTrace?: (trace: CodexRuntimeTrace) => MaybePromise<void>;
   readonly #activeTurns = new Map<string, ActiveTurn>();
   readonly #bufferedActivities = new Map<string, ActivityEvent[]>();
   readonly #bufferedOutcomes = new Map<string, TurnOutcome>();
@@ -131,6 +151,7 @@ export class CodexRuntime implements CodexPort {
     this.#delay = options.delay ?? defaultDelay;
     this.#onFatal = options.onFatal;
     this.#onDiagnostic = options.onDiagnostic;
+    this.#onTrace = options.onTrace;
   }
 
   get ready(): boolean {
@@ -295,16 +316,53 @@ export class CodexRuntime implements CodexPort {
   }
 
   #handleNotification(token: object, event: AppServerNotification): void {
-    if (token !== this.#clientToken) return;
     const ids = notificationIds(event.params);
-    if (!ids) return;
+    if (token !== this.#clientToken) {
+      this.#trace({
+        method: event.method,
+        decision: "ignored",
+        reason: "stale_generation",
+        generation: this.#generation,
+        ...(ids ?? {}),
+      });
+      return;
+    }
+    if (!ids) {
+      this.#trace({
+        method: event.method,
+        decision: "ignored",
+        reason: "missing_turn_ids",
+        generation: this.#generation,
+      });
+      return;
+    }
     for (const update of describeSubagentStatusUpdates(event)) {
       this.#recordSubagentStatus(ids.threadId, ids.turnId, update);
     }
     const activity = describeCodexNotification(event);
     // Terminal TURN output is owned by the orchestrator and TurnOutcome.
-    if (!activity || activity.tag === "TURN") return;
-    this.#routeActivity(ids.threadId, ids.turnId, activity);
+    if (!activity) {
+      this.#trace({
+        method: event.method,
+        decision: "ignored",
+        reason: "adapter_ignored",
+        generation: this.#generation,
+        ...ids,
+      });
+      return;
+    }
+    if (activity.tag === "TURN") {
+      this.#trace({
+        method: event.method,
+        decision: "ignored",
+        reason: "turn_owned_by_orchestrator",
+        generation: this.#generation,
+        ...ids,
+        tag: activity.tag,
+      });
+      return;
+    }
+    this.#routeActivity(ids.threadId, ids.turnId, activity, event.method);
   }
 
   #handleThreadStarted(token: object, event: ThreadStartedEvent): void {
@@ -526,20 +584,65 @@ export class CodexRuntime implements CodexPort {
     threadId: string,
     turnId: string,
     activity: ActivityEvent,
+    traceMethod?: string,
   ): void {
     const key = turnKey(threadId, turnId);
-    if (this.#terminalTurnKeys.has(key)) return;
+    if (this.#terminalTurnKeys.has(key)) {
+      this.#routeTrace(traceMethod, threadId, turnId, activity, {
+        decision: "ignored",
+        reason: "terminal_turn",
+      });
+      return;
+    }
     // A terminal event observed before startTurn resolves is also terminal.
-    if (this.#bufferedOutcomes.has(key)) return;
+    if (this.#bufferedOutcomes.has(key)) {
+      this.#routeTrace(traceMethod, threadId, turnId, activity, {
+        decision: "ignored",
+        reason: "terminal_turn",
+      });
+      return;
+    }
     const active = this.#activeTurns.get(key);
     if (active) {
       this.#deliverActivity(active.onActivity, activity);
+      this.#routeTrace(traceMethod, threadId, turnId, activity, {
+        decision: "routed",
+        reason: "delivered",
+      });
       return;
     }
-    if (!this.#isPendingTurn(threadId)) return;
+    if (!this.#isPendingTurn(threadId)) {
+      this.#routeTrace(traceMethod, threadId, turnId, activity, {
+        decision: "ignored",
+        reason: "no_matching_turn",
+      });
+      return;
+    }
     const buffered = this.#bufferedActivities.get(key) ?? [];
     buffered.push(activity);
     this.#bufferedActivities.set(key, buffered);
+    this.#routeTrace(traceMethod, threadId, turnId, activity, {
+      decision: "buffered",
+      reason: "buffered",
+    });
+  }
+
+  #routeTrace(
+    method: string | undefined,
+    threadId: string,
+    turnId: string,
+    activity: ActivityEvent,
+    result: Pick<CodexRuntimeTrace, "decision" | "reason">,
+  ): void {
+    if (!method) return;
+    this.#trace({
+      method,
+      ...result,
+      generation: this.#generation,
+      threadId,
+      turnId,
+      tag: activity.tag,
+    });
   }
 
   #deliverActivity(
@@ -747,6 +850,16 @@ export class CodexRuntime implements CodexPort {
       if (result instanceof Promise) void result.catch(() => {});
     } catch {
       // Diagnostic callbacks must never affect runtime state transitions.
+    }
+  }
+
+  #trace(trace: CodexRuntimeTrace): void {
+    if (!this.#onTrace) return;
+    try {
+      const result = this.#onTrace(trace);
+      if (result instanceof Promise) void result.catch(() => {});
+    } catch {
+      // Trace callbacks are observational and cannot affect runtime routing.
     }
   }
 }

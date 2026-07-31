@@ -1,4 +1,10 @@
-import pino, { type LogFn, type Logger, type SerializerFn } from "pino";
+import { once } from "node:events";
+import pino, {
+  type DestinationStream,
+  type LogFn,
+  type Logger,
+  type SerializerFn,
+} from "pino";
 import pretty, { type PrettyOptions } from "pino-pretty";
 import type { LogLevel } from "./config.ts";
 import { redactSecrets } from "./output.ts";
@@ -27,8 +33,17 @@ type LogFields = Record<string, unknown>;
 export interface LoggerOptions {
   secrets?: Iterable<string>;
   destination?: PrettyOptions["destination"];
+  stream?: DestinationStream;
   level?: LogLevel;
 }
+
+export interface LogTransportOptions {
+  level: LogLevel;
+  filePath: string;
+  terminalDestination?: string | number;
+}
+
+export type LogTransport = ReturnType<typeof pino.transport>;
 
 // Structural by design: the orchestrator's later event type needs no import here.
 export interface RequestStatusEventLike {
@@ -51,17 +66,18 @@ export interface RequestStatusEventLike {
 
 export function createLogger(options: LoggerOptions = {}): Logger {
   const secrets = [...(options.secrets ?? [])];
-  const stream = pretty({
-    colorize: false,
-    destination: options.destination,
-    errorLikeObjectKeys: [],
-    ignore: "pid,hostname,scope",
-    messageFormat: (log, messageKey) =>
-      `[${String(log.scope)}] ${String(log[messageKey])}`,
-    singleLine: true,
-    translateTime: "SYS:yyyy-mm-dd'T'HH:MM:ss.l o",
-    sync: true,
-  });
+  const stream = options.stream ??
+    pretty({
+      colorize: false,
+      destination: options.destination,
+      errorLikeObjectKeys: [],
+      ignore: "pid,hostname,scope",
+      messageFormat: (log, messageKey) =>
+        `[${String(log.scope)}] ${String(log[messageKey])}`,
+      singleLine: true,
+      translateTime: "SYS:yyyy-mm-dd'T'HH:MM:ss.l o",
+      sync: true,
+    });
   const root = pino({
     level: options.level ?? "info",
     base: null,
@@ -96,6 +112,52 @@ export function createLogger(options: LoggerOptions = {}): Logger {
 
   protectChildBindingKeys(root, secrets);
   return root;
+}
+
+export function createLogTransport(
+  options: LogTransportOptions,
+): LogTransport {
+  return pino.transport({
+    targets: [
+      {
+        target: "pino-pretty",
+        level: options.level,
+        options: {
+          colorize: false,
+          destination: options.terminalDestination ?? 1,
+          errorLikeObjectKeys: [],
+          ignore: "pid,hostname,scope",
+          messageFormat: "[{scope}] {msg}",
+          singleLine: true,
+          translateTime: "SYS:yyyy-mm-dd'T'HH:MM:ss.l o",
+        },
+      },
+      {
+        target: "pino/file",
+        level: options.level,
+        options: {
+          destination: options.filePath,
+          mkdir: true,
+          append: true,
+          mode: 0o600,
+        },
+      },
+    ],
+  });
+}
+
+export async function waitForLogTransport(
+  transport: LogTransport,
+): Promise<void> {
+  await once(transport, "ready");
+}
+
+export async function closeLogTransport(
+  transport: LogTransport,
+): Promise<void> {
+  const closed = once(transport, "close");
+  transport.end();
+  await closed;
 }
 
 export function summarizeRequest(
