@@ -237,7 +237,8 @@ OUTPUT_FORMAT_TOOL=summary
 每次启动时，旧的 `logs/wecom-codex-bot.log` 会先按 UTC 启动时间改名，例如
 `logs/wecom-codex-bot.20260731T081322123Z.log`；同一进程随后始终写新的活跃文件，
 进程内不再轮换。终端 target 使用 `pino-pretty`，文件 target 使用 Pino 内置的
-`pino/file` 并写 JSONL。日志目录初始化失败时，服务继续使用终端日志。
+`pino/file` 并写 JSONL。日志目录初始化失败或文件 transport 在运行时失效时，服务
+继续使用终端日志。
 
 `OUTPUT_*` 不影响运行日志。`logs/` 是本地运行状态并已被 Git 忽略；文件中仍包含
 排障所需的 chat/thread/turn 标识，不应提交或公开。

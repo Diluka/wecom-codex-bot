@@ -40,10 +40,25 @@ export interface LoggerOptions {
 export interface LogTransportOptions {
   level: LogLevel;
   filePath: string;
-  terminalDestination?: string | number;
+  terminalDestination?: PrettyOptions["destination"];
+  onFileError?: (error: Error) => void;
 }
 
-export type LogTransport = ReturnType<typeof pino.transport>;
+type FileTransport = ReturnType<typeof pino.transport> & {
+  readonly ready: boolean;
+  readonly destroyed: boolean;
+  readonly closed: boolean;
+};
+
+type RemovableMultiStream = ReturnType<typeof pino.multistream> & {
+  readonly lastId: number;
+  remove(id: number): RemovableMultiStream;
+};
+
+export interface LogTransport {
+  stream: DestinationStream;
+  file: FileTransport;
+}
 
 // Structural by design: the orchestrator's later event type needs no import here.
 export interface RequestStatusEventLike {
@@ -117,46 +132,56 @@ export function createLogger(options: LoggerOptions = {}): Logger {
 export function createLogTransport(
   options: LogTransportOptions,
 ): LogTransport {
-  return pino.transport({
-    targets: [
-      {
-        target: "pino-pretty",
-        level: options.level,
-        options: {
-          colorize: false,
-          destination: options.terminalDestination ?? 1,
-          errorLikeObjectKeys: [],
-          ignore: "pid,hostname,scope",
-          messageFormat: "[{scope}] {msg}",
-          singleLine: true,
-          translateTime: "SYS:yyyy-mm-dd'T'HH:MM:ss.l o",
-        },
-      },
-      {
-        target: "pino/file",
-        level: options.level,
-        options: {
-          destination: options.filePath,
-          mkdir: true,
-          append: true,
-          mode: 0o600,
-        },
-      },
-    ],
+  const terminal = pretty({
+    colorize: false,
+    destination: options.terminalDestination,
+    errorLikeObjectKeys: [],
+    ignore: "pid,hostname,scope",
+    messageFormat: (log, messageKey) =>
+      `[${String(log.scope)}] ${String(log[messageKey])}`,
+    singleLine: true,
+    translateTime: "SYS:yyyy-mm-dd'T'HH:MM:ss.l o",
+    sync: true,
   });
+  const file = pino.transport({
+    target: "pino/file",
+    options: {
+      destination: options.filePath,
+      mkdir: true,
+      append: true,
+      mode: 0o600,
+    },
+  }) as FileTransport;
+  const stream = pino.multistream([
+    { level: options.level, stream: terminal },
+  ]) as RemovableMultiStream;
+  stream.add({ level: options.level, stream: file });
+  const fileStreamId = stream.lastId;
+  let fileAttached = true;
+
+  file.on("error", (error: Error) => {
+    if (!fileAttached) return;
+    fileAttached = false;
+    stream.remove(fileStreamId);
+    options.onFileError?.(error);
+  });
+
+  return { stream, file };
 }
 
 export async function waitForLogTransport(
   transport: LogTransport,
 ): Promise<void> {
-  await once(transport, "ready");
+  if (transport.file.ready) return;
+  await once(transport.file, "ready");
 }
 
 export async function closeLogTransport(
   transport: LogTransport,
 ): Promise<void> {
-  const closed = once(transport, "close");
-  transport.end();
+  if (transport.file.closed) return;
+  const closed = once(transport.file, "close");
+  if (!transport.file.destroyed) transport.file.end();
   await closed;
 }
 

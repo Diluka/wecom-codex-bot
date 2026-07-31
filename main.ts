@@ -30,23 +30,19 @@ try {
   logTransport = createLogTransport({
     level: config.logLevel,
     filePath: processLog.activePath,
+    onFileError: () =>
+      console.error(
+        "Pino file transport failed; terminal logging remains active",
+      ),
   });
   await waitForLogTransport(logTransport);
-  logTransport.on(
-    "error",
-    () =>
-      console.error(
-        "Pino log transport failed; check logs directory permissions",
-      ),
-  );
 } catch (error) {
-  logTransport = undefined;
   processLogError = error;
 }
 const logger = createLogger({
   secrets: [config.botSecret],
   level: config.logLevel,
-  stream: logTransport,
+  stream: logTransport?.stream,
 });
 const requestLogger = logger.child({ scope: "request" });
 const codexLogger = logger.child({ scope: "codex" });
