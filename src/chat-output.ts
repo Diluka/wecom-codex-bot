@@ -8,7 +8,6 @@ import {
   ConversationSendQueue,
   splitUtf8,
   StreamController,
-  type StreamControllerOptions,
   WeComSink,
 } from "./output.ts";
 
@@ -26,19 +25,12 @@ export interface WeComChatOutputOptions {
   gateway: WeComReplyGateway;
   onError?: (error: Error) => void;
   queue?: ConversationSendQueue;
-  streamControllerOptions?: Pick<
-    StreamControllerOptions,
-    "maxFinishAttempts" | "retryDelayMs" | "timers"
-  >;
 }
 
 /** Delivers direct and streaming responses through WeCom. */
 export class WeComChatOutput implements ChatOutput {
   readonly #gateway: WeComReplyGateway;
   readonly #onError?: (error: Error) => void;
-  readonly #streamControllerOptions: WeComChatOutputOptions[
-    "streamControllerOptions"
-  ];
   readonly #queue: ConversationSendQueue;
   readonly #sink: WeComSink;
   readonly #active = new Set<StreamController>();
@@ -47,7 +39,6 @@ export class WeComChatOutput implements ChatOutput {
     this.#gateway = options.gateway;
     this.#onError = options.onError;
     this.#queue = options.queue ?? new ConversationSendQueue();
-    this.#streamControllerOptions = options.streamControllerOptions;
     this.#sink = new WeComSink({
       queue: this.#queue,
       send: async (frame, streamId, content, finish) => {
@@ -102,7 +93,6 @@ export class WeComChatOutput implements ChatOutput {
 
   startProgress(message: RoutedText): Promise<ProgressHandle> {
     const controller = new StreamController({
-      ...this.#streamControllerOptions,
       conversationKey: message.conversationKey,
       frame: message.frame,
       sink: this.#sink,

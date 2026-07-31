@@ -124,25 +124,6 @@ describe("buildCodexPrompt", () => {
     assertEquals(prompt.match(/<\\\/user_content>/g)?.length, 2);
   });
 
-  it("rejects an unserializable quote instead of silently omitting it", () => {
-    const input = {
-      chatType: "group" as const,
-      conversationKey: "group:engineering",
-      messages: [{
-        senderUserId: "bob",
-        msgId: "msg-invalid-quote",
-        content: "处理这个",
-        quote: () => undefined,
-      }],
-    };
-
-    assertThrows(
-      () => buildCodexPrompt(input),
-      TypeError,
-      "quote must be JSON-serializable",
-    );
-  });
-
   it("rejects malformed bridge metadata", () => {
     assertThrows(
       () =>

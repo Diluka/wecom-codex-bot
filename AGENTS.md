@@ -221,10 +221,11 @@ git ls-files -co --exclude-standard -z -- '*.ts' '*.json' '*.md' | xargs -0 deno
   SQLite 内容。
 - Codex 生命周期日志只记录方法、标识、类型、状态、耗时、长度和路由结果，不得写入
   聊天正文、reasoning summary、命令、参数或工具输出。经过 Pino log method 的
-  字符串只会单行化并限制为最多 100 个 Unicode 字素簇，不会检测或脱敏敏感值。高频
-  delta 按 method/thread/turn/item 聚合，在 item、turn 完成或进程退出时记录累计
-  chunk 数和长度；不得逐块重复打印生命周期、路由或工具结果决策日志。App Server
-  原始 stderr 只记录 chunk 长度，不记录原文。
+  消息和顶层字符串字段只会单行化，并限制为最多 100 个 Unicode 字素簇。普通嵌套
+  结构由 Pino 原生处理；这些处理不会检测或脱敏敏感值。高频 delta 按
+  method/thread/turn/item 聚合。它只在 item、turn 完成或进程退出时记录累计 chunk
+  数和长度。不得逐块重复打印生命周期、路由或工具结果决策日志。App Server 原始
+  stderr 只记录 chunk 长度，不记录原文。
 - App Server 子进程环境会显式移除 `BOT_ID`、`BOT_SECRET` 和
   `WECOM_OWNER_USER_ID`，但 owner ID 仍通过 developer instructions 对模型可见，
   也可能出现在 argv 或 session metadata；如果 `.env` 位于 `CODEX_WORKSPACE` 内，

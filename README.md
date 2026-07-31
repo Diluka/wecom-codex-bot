@@ -267,10 +267,12 @@ turn、非预期进程退出和无法恢复的 fatal。App Server 原始 stderr 
 
 机器人新增的 Codex 生命周期、决策和 App Server stderr 日志不会记录聊天正文、
 reasoning summary 文本、命令、参数或工具输出；它们只记录功能性元数据。企业微信
-SDK 属于上游原始诊断流，仍可能包含文本片段。经过 Pino log method 的消息和字符串
-字段只会单行化并按 Unicode 字素簇截断到最多 100 个字符，不会检测或脱敏敏感值。
-因此可用下面的配置判断 App Server 是否发出了 reasoning summary，以及它是否在输出
-管线中被过滤：
+SDK 属于上游原始诊断流，仍可能包含文本片段。经过 Pino log method 的消息和顶层
+字符串字段只会单行化并按 Unicode 字素簇截断到最多 100 个字符；普通嵌套结构由
+Pino 原生处理。上述过程不会检测或脱敏敏感值。
+
+因此可用下面的配置判断 App Server 是否发出了 reasoning summary。该配置也能判断
+输出管线是否将其过滤：
 
 ```dotenv
 LOG_LEVEL=debug

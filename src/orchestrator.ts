@@ -164,8 +164,6 @@ export interface ConversationOrchestratorOptions {
   onRequestStatus?: (event: RequestStatusEvent) => void;
   onOutputDecision?: (event: OutputDecisionEvent) => void;
   now?: () => number;
-  summarizeRequest?: (text: string) => string;
-  messageDebounceMs?: number;
   messageDebounceTimers?: OrchestratorTimerApi;
   shutdownGraceMs?: number;
   interruptRetryDelaysMs?: readonly number[];
@@ -288,6 +286,7 @@ const TERMINAL_REQUEST_STATUSES = new Set<RequestStatus>([
   "interrupted",
   "runtime_lost",
 ]);
+const MESSAGE_DEBOUNCE_MS = 3_000;
 
 function hasLiveTraces(request?: PendingRequest): request is PendingRequest {
   return Boolean(request?.traces.some((trace) => !trace.terminal));
@@ -431,8 +430,6 @@ export class ConversationOrchestrator {
   readonly #onRequestStatus?: (event: RequestStatusEvent) => void;
   readonly #onOutputDecision?: (event: OutputDecisionEvent) => void;
   readonly #now: () => number;
-  readonly #summarizeRequest: (text: string) => string;
-  readonly #messageDebounceMs: number;
   readonly #messageDebounceTimers: OrchestratorTimerApi;
   readonly #shutdownGraceMs: number;
   readonly #interruptRetryDelaysMs: readonly number[];
@@ -456,8 +453,6 @@ export class ConversationOrchestrator {
     this.#onRequestStatus = options.onRequestStatus;
     this.#onOutputDecision = options.onOutputDecision;
     this.#now = options.now ?? Date.now;
-    this.#summarizeRequest = options.summarizeRequest ?? summarizeRequest;
-    this.#messageDebounceMs = options.messageDebounceMs ?? 3_000;
     this.#messageDebounceTimers = options.messageDebounceTimers ??
       systemMessageDebounceTimers;
     this.#shutdownGraceMs = options.shutdownGraceMs ?? 30_000;
@@ -466,12 +461,6 @@ export class ConversationOrchestrator {
       2_000,
       4_000,
     ];
-    if (
-      !Number.isFinite(this.#messageDebounceMs) ||
-      this.#messageDebounceMs < 0
-    ) {
-      throw new RangeError("messageDebounceMs must be a non-negative number");
-    }
     if (
       !Number.isFinite(this.#shutdownGraceMs) || this.#shutdownGraceMs < 0
     ) {
@@ -608,17 +597,13 @@ export class ConversationOrchestrator {
     }
 
     const slot = this.#slot(message.conversationKey);
-    if (this.#messageDebounceMs > 0) {
-      await this.#debounceMessage(
-        message.conversationKey,
-        slot,
-        message,
-        trace,
-        settingsBarrier,
-      );
-    } else {
-      await this.#enqueueRequest(message.conversationKey, slot, request);
-    }
+    await this.#debounceMessage(
+      message.conversationKey,
+      slot,
+      message,
+      trace,
+      settingsBarrier,
+    );
   }
 
   async #handleSettingsCommand(
@@ -868,7 +853,7 @@ export class ConversationOrchestrator {
         batch!.resolve,
         batch!.reject,
       );
-    }, this.#messageDebounceMs);
+    }, MESSAGE_DEBOUNCE_MS);
     batch.timer = timer;
     await batch.completion;
   }
@@ -1844,14 +1829,9 @@ export class ConversationOrchestrator {
     terminal: boolean,
   ): void {
     const counts = this.#requestCounts();
-    let summary: string | undefined;
-    if (state === "received") {
-      try {
-        summary = this.#summarizeRequest(trace.message.text);
-      } catch {
-        // Request observation must not alter conversation processing.
-      }
-    }
+    const summary = state === "received"
+      ? summarizeRequest(trace.message.text)
+      : undefined;
     const event: RequestStatusEvent = {
       state,
       chatType: trace.message.chatType,

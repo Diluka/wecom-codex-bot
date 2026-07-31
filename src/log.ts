@@ -6,7 +6,6 @@ import type { LogLevel } from "./config.ts";
 
 const REQUEST_WARN = new Set(["runtime_unavailable", "shutdown_discarded"]);
 const REQUEST_ERROR = new Set(["failed", "runtime_lost"]);
-const OMIT_LOG_VALUE = Symbol("omit-log-value");
 const MAX_LOG_TEXT_LENGTH = 100;
 const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, {
   granularity: "grapheme",
@@ -217,11 +216,9 @@ function normalizeLogArgument(
   isFirst: boolean,
 ): unknown {
   if (isFirst && isLogFields(value)) return normalizeFields(value);
-  if (typeof value === "string") {
-    return normalizeText(value);
-  }
-  const normalized = normalizeValue(value);
-  return normalized === OMIT_LOG_VALUE ? null : normalized;
+  if (typeof value === "string") return normalizeText(value);
+  if (value instanceof Error) return normalizeError(value);
+  return value;
 }
 
 function isLogFields(value: unknown): value is LogFields {
@@ -230,68 +227,42 @@ function isLogFields(value: unknown): value is LogFields {
 }
 
 function normalizeFields(fields: LogFields): LogFields {
-  const result: LogFields = Object.create(null);
-  const seen = new WeakMap<object, unknown>();
-  seen.set(fields, result);
-  for (const key of Object.keys(fields)) {
-    const normalized = normalizeValue(fields[key], seen);
-    if (normalized === OMIT_LOG_VALUE) continue;
-    result[normalizeText(key)] = normalized;
+  const result: LogFields = {};
+  for (const [key, value] of Object.entries(fields)) {
+    result[key] = typeof value === "string"
+      ? normalizeText(value)
+      : value instanceof Error
+      ? normalizeError(value)
+      : value;
   }
   return result;
 }
 
-function normalizeValue(
-  value: unknown,
-  seen = new WeakMap<object, unknown>(),
-): unknown {
-  if (
-    value === undefined || typeof value === "function" ||
-    typeof value === "symbol" || typeof value === "bigint"
-  ) {
-    return OMIT_LOG_VALUE;
-  }
-  if (typeof value === "string") return normalizeText(value);
-  if (value instanceof Error) {
-    const previous = seen.get(value);
-    if (previous !== undefined) return previous;
-    const result: LogFields = Object.create(null);
-    seen.set(value, result);
-    result.type = normalizeText(value.name);
-    result.message = normalizeText(value.message);
-    if (value.stack) result.stack = normalizeStackFrame(value.stack);
-    if (value.cause !== undefined) {
-      const cause = normalizeValue(value.cause, seen);
-      if (cause !== OMIT_LOG_VALUE) result.cause = cause;
-    }
-    for (const [key, entry] of Object.entries(value)) {
-      if (key === "cause") continue;
-      const normalized = normalizeValue(entry, seen);
-      if (normalized === OMIT_LOG_VALUE) continue;
-      result[normalizeText(key)] = normalized;
-    }
-    return result;
-  }
-  if (value === null || typeof value !== "object") return value;
+function normalizeError(
+  error: Error,
+  seen = new WeakMap<Error, LogFields>(),
+): LogFields {
+  const previous = seen.get(error);
+  if (previous) return previous;
 
-  const previous = seen.get(value);
-  if (previous !== undefined) return previous;
-  if (Array.isArray(value)) {
-    const result: unknown[] = [];
-    seen.set(value, result);
-    for (const entry of value) {
-      const normalized = normalizeValue(entry, seen);
-      result.push(normalized === OMIT_LOG_VALUE ? null : normalized);
-    }
-    return result;
+  const result: LogFields = {
+    type: normalizeText(error.name),
+    message: normalizeText(error.message),
+  };
+  seen.set(error, result);
+  if (error.stack) result.stack = normalizeStackFrame(error.stack);
+  if (error.cause !== undefined) {
+    result.cause = error.cause instanceof Error
+      ? normalizeError(error.cause, seen)
+      : error.cause;
   }
-
-  const result: LogFields = Object.create(null);
-  seen.set(value, result);
-  for (const [key, entry] of Object.entries(value)) {
-    const normalized = normalizeValue(entry, seen);
-    if (normalized === OMIT_LOG_VALUE) continue;
-    result[normalizeText(key)] = normalized;
+  for (const [key, value] of Object.entries(error)) {
+    if (key === "cause") continue;
+    result[key] = typeof value === "string"
+      ? normalizeText(value)
+      : value instanceof Error
+      ? normalizeError(value, seen)
+      : value;
   }
   return result;
 }

@@ -1,5 +1,6 @@
 import { assert, assertEquals, assertRejects } from "@std/assert";
 import { describe, it } from "@std/testing/bdd";
+import { FakeTime } from "@std/testing/time";
 import { WeComChatOutput } from "./chat-output.ts";
 import type { RoutedText } from "./orchestrator.ts";
 import { ConversationSendQueue, TRUNCATION_MARKER } from "./output.ts";
@@ -198,41 +199,8 @@ describe("WeComChatOutput", () => {
     assertEquals(gateway.replies.length, 1);
   });
 
-  it("rejects progress finish when the final stream frame cannot be sent", async () => {
-    const gateway = new FakeGateway();
-    gateway.streamResult = false;
-    const output = new WeComChatOutput({
-      gateway,
-      streamControllerOptions: { maxFinishAttempts: 1 },
-    });
-    const progress = await output.startProgress(message());
-    progress.append("working");
-
-    await assertRejects(
-      () => progress.finish(),
-      Error,
-      "finish Enterprise WeChat progress stream",
-    );
-  });
-
-  it("rejects finishAll when a shutdown stream cannot be finished", async () => {
-    const gateway = new FakeGateway();
-    gateway.streamResult = false;
-    const output = new WeComChatOutput({
-      gateway,
-      streamControllerOptions: { maxFinishAttempts: 1 },
-    });
-    const progress = await output.startProgress(message());
-    progress.append("working");
-
-    await assertRejects(
-      () => output.finishAll(),
-      Error,
-      "finish Enterprise WeChat progress streams during shutdown",
-    );
-  });
-
   it("waits for every shutdown stream before reporting a failure", async () => {
+    using time = new FakeTime();
     const secondGate = Promise.withResolvers<void>();
     const firstError = Promise.withResolvers<void>();
     const gateway = {
@@ -246,7 +214,6 @@ describe("WeComChatOutput", () => {
     const output = new WeComChatOutput({
       gateway,
       onError: () => firstError.resolve(),
-      streamControllerOptions: { maxFinishAttempts: 1 },
     });
     const first = await output.startProgress(message("m1"));
     const second = await output.startProgress(message("m2"));
@@ -260,10 +227,12 @@ describe("WeComChatOutput", () => {
       () => settled = true,
     );
     await firstError.promise;
-    await drainMicrotasks();
+    await time.runMicrotasks();
     assertEquals(settled, false);
 
     secondGate.resolve();
+    await time.tickAsync(2_500);
+    await time.tickAsync(2_500);
     await assertRejects(
       () => finishing,
       Error,

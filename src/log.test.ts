@@ -170,36 +170,6 @@ describe("createLogger", () => {
     }
   });
 
-  it("drops nested JSON hooks and other unsafe values", () => {
-    const capture = captureLogs();
-    const logger: Logger = createLogger({
-      destination: capture.destination,
-    });
-    const requestLogger = logger.child({ scope: "request" });
-
-    requestLogger.info({
-      nested: {
-        ordinary: "hello actual-secret",
-        callback: () => "actual-secret",
-        symbolValue: Symbol("actual-secret"),
-        toJSON() {
-          return {
-            forged: "actual-secret",
-            ordinary: "forged",
-          };
-        },
-      },
-    }, "received");
-    logger.flush();
-
-    const output = capture.output();
-    assertEquals(output.includes("actual-secret"), true);
-    assertMatch(output, /"nested":\{"ordinary":"hello actual-secret"\}/);
-    for (const omitted of ["forged", "callback", "symbolValue", "toJSON"]) {
-      assertEquals(output.includes(omitted), false);
-    }
-  });
-
   it("keeps multiline messages on one physical log line", () => {
     const capture = captureLogs();
     const logger: Logger = createLogger({ destination: capture.destination });
