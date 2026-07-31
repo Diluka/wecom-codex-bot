@@ -91,6 +91,93 @@ describe("TurnOutputPipeline", () => {
     );
   });
 
+  it("keeps content while suppressing tool details in summary format", () => {
+    const pipeline = new TurnOutputPipeline(
+      outputSettings({ toolFormat: "summary" }),
+    );
+
+    assertEquals(
+      pipeline.apply(progress({
+        tag: "CONTENT",
+        body: "Deciding sequential tool execution",
+      })),
+      "[content] Deciding sequential tool execution",
+    );
+    assertEquals(pipeline.apply(toolStarted("tool-1")), null);
+    assertEquals(
+      pipeline.apply(progress({
+        tag: "TOOL_RESULT",
+        itemId: "tool-1",
+        body: "command output",
+      })),
+      null,
+    );
+    assertEquals(
+      pipeline.apply(progress({
+        tag: "TOOL_RESULT",
+        body: "fallback tool output",
+      })),
+      null,
+    );
+    assertEquals(pipeline.apply(toolCompleted("tool-1")), null);
+  });
+
+  it("preserves non-tool progress in summary format", () => {
+    const pipeline = new TurnOutputPipeline(
+      outputSettings({ toolFormat: "summary" }),
+    );
+
+    for (
+      const [tag, body] of [
+        ["PLAN", "1. Run tests"],
+        ["SUBAGENT", "amber-otter：正在工作"],
+        ["WARNING", "watch out"],
+        ["ERROR", "failed"],
+      ] as const
+    ) {
+      assertEquals(
+        pipeline.apply(progress({ tag, body })),
+        `[${tag.toLowerCase()}] ${body}`,
+      );
+    }
+  });
+
+  it("keeps direct delivery visible in summary format", () => {
+    const pipeline = new TurnOutputPipeline(
+      outputSettings({
+        level: "off",
+        label: "hide",
+        toolFormat: "summary",
+      }),
+    );
+
+    assertEquals(
+      pipeline.apply({
+        tag: "TOOL_RESULT",
+        body: "direct\nunchanged",
+        delivery: "direct",
+      }),
+      "direct\nunchanged",
+    );
+  });
+
+  it("filters summary content through the content output level", () => {
+    const pipeline = new TurnOutputPipeline(
+      outputSettings({
+        levels: { CONTENT: "off" },
+        toolFormat: "summary",
+      }),
+    );
+
+    assertEquals(
+      pipeline.apply(progress({
+        tag: "CONTENT",
+        body: "Deciding sequential tool execution",
+      })),
+      null,
+    );
+  });
+
   it("renders subagent status independently from tool aggregation settings", () => {
     const event = progress({
       tag: "SUBAGENT",

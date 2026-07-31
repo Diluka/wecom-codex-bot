@@ -112,6 +112,7 @@ describe("loadConfig", () => {
       "individual",
       "merge_same",
       "merge_all",
+      "summary",
     ]);
 
     const config = await loadConfig(configEnv(), Deno.cwd());
@@ -137,6 +138,29 @@ describe("loadConfig", () => {
     assertEquals(group, config.outputSettings);
     assertEquals(group.levels === config.outputSettings.levels, false);
     assertEquals(group.labels === config.outputSettings.labels, false);
+  });
+
+  it("accepts summary as the global tool output format", async () => {
+    const config = await loadConfig(
+      configEnv({ OUTPUT_FORMAT_TOOL: " summary " }),
+      Deno.cwd(),
+    );
+
+    assertEquals(config.outputSettings.toolFormat, "summary");
+    assertEquals(config.groupOutputSettings.toolFormat, "summary");
+  });
+
+  it("lets the group summary format override the global format", async () => {
+    const config = await loadConfig(
+      configEnv({
+        OUTPUT_FORMAT_TOOL: "merge_all",
+        OUTPUT_GROUP_FORMAT_TOOL: " summary ",
+      }),
+      Deno.cwd(),
+    );
+
+    assertEquals(config.outputSettings.toolFormat, "merge_all");
+    assertEquals(config.groupOutputSettings.toolFormat, "summary");
   });
 
   it("applies group globals before group tag overrides", async () => {
