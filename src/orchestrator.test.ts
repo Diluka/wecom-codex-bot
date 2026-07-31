@@ -1,4 +1,4 @@
-import { assertEquals, assertMatch } from "@std/assert";
+import { assertEquals, assertMatch, assertStringIncludes } from "@std/assert";
 import { describe, it } from "@std/testing/bdd";
 import {
   type ChatOutput,
@@ -365,6 +365,28 @@ describe("ConversationOrchestrator", () => {
       text: "测试正常",
       final: true,
     });
+  });
+
+  it("forwards quoted content to the Codex turn prompt", async () => {
+    const { codex, orchestrator } = setup();
+    const quote = {
+      msgtype: "image",
+      image: {
+        url: "https://example.invalid/quoted",
+        aeskey: "quote-key",
+      },
+    };
+    const request = {
+      ...message("group:engineering", "m-quote", "处理这个", "bob"),
+      quote,
+    };
+
+    const running = orchestrator.handleText(request);
+    await waitFor(() => codex.starts.length === 1);
+
+    assertStringIncludes(codex.starts[0].prompt, JSON.stringify(quote));
+    codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
+    await running;
   });
 
   it("separates consecutive progress events in the final stream text", async () => {

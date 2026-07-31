@@ -392,6 +392,7 @@ export class ConversationOrchestrator {
       senderUserId: message.senderUserId,
       msgId: message.msgId,
       content: message.text,
+      quote: message.quote,
     });
 
     const active: ActiveTurn = {
