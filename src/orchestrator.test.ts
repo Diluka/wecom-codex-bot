@@ -14,6 +14,11 @@ import {
 } from "./orchestrator.ts";
 import type { ActivityEvent } from "./activity-event.ts";
 import { WeComChatOutput } from "./chat-output.ts";
+import type {
+  CodexModel,
+  ModelSettingsSnapshot,
+  ModelSettingsUpdateResult,
+} from "./model-settings.ts";
 import { OUTPUT_TAGS, type OutputSettings } from "./output-settings.ts";
 import { ConversationSendQueue } from "./output.ts";
 
@@ -128,6 +133,26 @@ interface StartedTurn {
   resolve: (outcome: TurnOutcome) => void;
 }
 
+function modelFixture(
+  model: string,
+  defaultReasoningEffort: string,
+  efforts: readonly string[],
+): CodexModel {
+  return {
+    id: model,
+    model,
+    displayName: model,
+    description: `${model} description`,
+    hidden: false,
+    isDefault: false,
+    defaultReasoningEffort,
+    supportedReasoningEfforts: efforts.map((reasoningEffort) => ({
+      reasoningEffort,
+      description: `${reasoningEffort} description`,
+    })),
+  };
+}
+
 class FakeCodex implements CodexPort {
   ready = true;
   generation = 1;
@@ -142,6 +167,26 @@ class FakeCodex implements CodexPort {
   readonly resumeThreadErrors: Error[] = [];
   readonly interruptGates: Promise<void>[] = [];
   readonly interruptErrors: Error[] = [];
+  settingsSnapshot: ModelSettingsSnapshot = {
+    settings: { model: "gpt-a", effort: "medium" },
+    selectedModel: modelFixture("gpt-a", "medium", ["low", "medium"]),
+    models: [
+      modelFixture("gpt-a", "medium", ["low", "medium"]),
+      modelFixture("gpt-b", "high", ["medium", "high"]),
+    ],
+    source: "default",
+  };
+  nextSettingsResult: ModelSettingsUpdateResult = {
+    status: "updated",
+    settings: { model: "gpt-b", effort: "high" },
+    threadUpdated: false,
+    defaultPersisted: true,
+    effortAdjusted: false,
+  };
+  readonly modelChanges: Array<{ threadId?: string; model: string }> = [];
+  readonly effortChanges: Array<{ threadId?: string; effort: string }> = [];
+  readonly settingsLookups: Array<string | undefined> = [];
+  readonly settingsErrors: Error[] = [];
   threadSequence = 0;
   turnSequence = 0;
   startThreadAttempts = 0;
@@ -162,6 +207,23 @@ class FakeCodex implements CodexPort {
     if (gate) await gate;
     const error = this.resumeThreadErrors.shift();
     if (error) throw error;
+  }
+
+  getModelSettings(threadId?: string): Promise<ModelSettingsSnapshot> {
+    this.settingsLookups.push(threadId);
+    const error = this.settingsErrors.shift();
+    if (error) return Promise.reject(error);
+    return Promise.resolve(this.settingsSnapshot);
+  }
+
+  setModel(threadId: string | undefined, model: string) {
+    this.modelChanges.push({ threadId, model });
+    return Promise.resolve(this.nextSettingsResult);
+  }
+
+  setEffort(threadId: string | undefined, effort: string) {
+    this.effortChanges.push({ threadId, effort });
+    return Promise.resolve(this.nextSettingsResult);
   }
 
   async startTurn(
@@ -558,6 +620,12 @@ describe("ConversationOrchestrator", () => {
     await orchestrator.handleText(
       message("single:alice", "status", "/status"),
     );
+    await orchestrator.handleText(
+      message("single:alice", "model", "/model"),
+    );
+    await orchestrator.handleText(
+      message("single:alice", "effort", "/effort"),
+    );
     await orchestrator.handleText(message("single:alice", "new", "/new"));
     await orchestrator.handleUnsupported(
       message("single:alice", "image", ""),
@@ -572,6 +640,311 @@ describe("ConversationOrchestrator", () => {
     assertEquals(requestEvents[0].state, "received");
     codex.starts[0].resolve({ status: "completed" });
     await unknown;
+  });
+  it("treats lookalike model and effort commands as ordinary text", async () => {
+    const { codex, orchestrator, requestEvents } = setup();
+
+    const modelLookalike = orchestrator.handleText(
+      message("single:alice", "model-lookalike", "/models"),
+    );
+    await waitFor(() => codex.starts.length === 1);
+    codex.starts[0].resolve({ status: "completed" });
+    await modelLookalike;
+    const effortLookalike = orchestrator.handleText(
+      message("single:alice", "effort-lookalike", "/effortful high"),
+    );
+    await waitFor(() => codex.starts.length === 2);
+    codex.starts[1].resolve({ status: "completed" });
+    await effortLookalike;
+
+    assertEquals(
+      requestEvents.filter(({ state }) => state === "received").map(
+        ({ msgId }) => msgId,
+      ),
+      ["model-lookalike", "effort-lookalike"],
+    );
+  });
+  it("shows model and effort choices without starting turns", async () => {
+    const { codex, orchestrator, output, requestEvents } = setup();
+    codex.startTurnErrors.push(
+      new Error("model query became a prompt"),
+      new Error("effort query became a prompt"),
+    );
+
+    await orchestrator.handleText(
+      message("single:alice", "model", "/model"),
+    );
+    await orchestrator.handleText(
+      message("single:alice", "effort", "/effort"),
+    );
+
+    const modelReply = output.sent.find(({ msgId }) => msgId === "model")!
+      .text;
+    assertMatch(modelReply, /当前模型：`gpt-a`/);
+    assertMatch(modelReply, /可选模型：`gpt-a`、`gpt-b`/);
+    assertMatch(modelReply, /用法：`\/model <model-id>`/);
+    const effortReply = output.sent.find(({ msgId }) => msgId === "effort")!
+      .text;
+    assertMatch(effortReply, /当前推理强度：`medium`/);
+    assertMatch(effortReply, /当前模型支持：`low`、`medium`/);
+    assertMatch(effortReply, /用法：`\/effort <level>`/);
+    assertEquals(codex.startTurnAttempts, 0);
+    assertEquals(requestEvents, []);
+  });
+  it("switches model and effort for a bound conversation", async () => {
+    const { codex, orchestrator, output, state } = setup();
+    state.bindConversation("single:alice", "single", "thread-existing");
+    codex.nextSettingsResult = {
+      status: "updated",
+      settings: { model: "gpt-b", effort: "high" },
+      threadUpdated: true,
+      defaultPersisted: true,
+      effortAdjusted: true,
+    };
+
+    await orchestrator.handleText(
+      message("single:alice", "model", "/model gpt-b"),
+    );
+    codex.nextSettingsResult = {
+      status: "updated",
+      settings: { model: "gpt-b", effort: "medium" },
+      threadUpdated: true,
+      defaultPersisted: true,
+      effortAdjusted: false,
+    };
+    await orchestrator.handleText(
+      message("single:alice", "effort", "/effort medium"),
+    );
+
+    assertEquals(codex.modelChanges, [{
+      threadId: "thread-existing",
+      model: "gpt-b",
+    }]);
+    assertEquals(codex.effortChanges, [{
+      threadId: "thread-existing",
+      effort: "medium",
+    }]);
+    assertMatch(
+      output.sent.find(({ msgId }) => msgId === "model")!.text,
+      /模型.*`gpt-b`.*推理强度.*`high`/,
+    );
+    assertMatch(
+      output.sent.find(({ msgId }) => msgId === "model")!.text,
+      /自动调整.*`high`/,
+    );
+    assertMatch(
+      output.sent.find(({ msgId }) => msgId === "effort")!.text,
+      /新会话默认值/,
+    );
+    assertEquals(codex.starts.length, 0);
+  });
+  it("saves an unbound model switch as the global default", async () => {
+    const { codex, orchestrator, output } = setup();
+
+    await orchestrator.handleText(
+      message("single:alice", "model", "/model gpt-b"),
+    );
+
+    assertEquals(codex.modelChanges, [{ threadId: undefined, model: "gpt-b" }]);
+    assertMatch(output.sent[0].text, /全局默认.*已保存/);
+    assertEquals(codex.starts.length, 0);
+  });
+  it("keeps an active turn on its old settings while switching the next task", async () => {
+    const { codex, orchestrator, output } = setup();
+    const running = orchestrator.handleText(
+      message("single:alice", "work", "work"),
+    );
+    await waitFor(() => codex.starts.length === 1);
+    codex.nextSettingsResult = {
+      status: "updated",
+      settings: { model: "gpt-b", effort: "high" },
+      threadUpdated: true,
+      defaultPersisted: true,
+      effortAdjusted: false,
+    };
+
+    await orchestrator.handleText(
+      message("single:alice", "model", "/model gpt-b"),
+    );
+
+    assertEquals(codex.modelChanges, [{
+      threadId: "thread-1",
+      model: "gpt-b",
+    }]);
+    assertEquals(codex.interrupts, []);
+    assertMatch(
+      output.sent.find(({ msgId }) => msgId === "model")!.text,
+      /当前任务.*旧设置.*后续任务/,
+    );
+    codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
+    await running;
+  });
+  it("rejects unavailable model and effort values without starting turns", async () => {
+    const { codex, orchestrator, output } = setup();
+    codex.nextSettingsResult = {
+      status: "invalid_model",
+      availableModels: ["gpt-a", "gpt-b"],
+    };
+
+    await orchestrator.handleText(
+      message("single:alice", "model", "/model missing"),
+    );
+    codex.nextSettingsResult = {
+      status: "invalid_effort",
+      model: "gpt-a",
+      availableEfforts: ["low", "medium"],
+    };
+    await orchestrator.handleText(
+      message("single:alice", "effort", "/effort ultra"),
+    );
+
+    assertMatch(
+      output.sent.find(({ msgId }) => msgId === "model")!.text,
+      /未知模型。可选模型：`gpt-a`、`gpt-b`/,
+    );
+    assertMatch(
+      output.sent.find(({ msgId }) => msgId === "effort")!.text,
+      /模型 `gpt-a` 不支持该强度。可选强度：`low`、`medium`/,
+    );
+    assertEquals(codex.starts.length, 0);
+  });
+  it("distinguishes partial thread success from complete persistence failure", async () => {
+    const bound = setup();
+    bound.state.bindConversation(
+      "single:alice",
+      "single",
+      "thread-existing",
+    );
+    bound.codex.nextSettingsResult = {
+      status: "updated",
+      settings: { model: "gpt-b", effort: "high" },
+      threadUpdated: true,
+      defaultPersisted: false,
+      effortAdjusted: false,
+      persistenceError: "config unavailable",
+    };
+
+    await bound.orchestrator.handleText(
+      message("single:alice", "bound", "/model gpt-b"),
+    );
+
+    assertMatch(bound.output.sent[0].text, /当前 thread 已切换/);
+    assertMatch(bound.output.sent[0].text, /全局默认.*保存失败/);
+    assertMatch(bound.output.sent[0].text, /config unavailable/);
+
+    const unbound = setup();
+    unbound.codex.nextSettingsResult = {
+      status: "updated",
+      settings: { model: "gpt-a", effort: "low" },
+      threadUpdated: false,
+      defaultPersisted: false,
+      effortAdjusted: false,
+      persistenceError: "defaults read-only",
+    };
+    await unbound.orchestrator.handleText(
+      message("single:alice", "unbound", "/effort low"),
+    );
+
+    assertEquals(unbound.output.sent[0].text, "设置未修改：defaults read-only");
+  });
+  it("reserves malformed settings commands and deduplicates mutations", async () => {
+    const { codex, orchestrator, output, requestEvents } = setup();
+
+    await orchestrator.handleText(
+      message("single:alice", "bad-model", "/model a b"),
+    );
+    await orchestrator.handleText(
+      message("single:alice", "bad-effort", "/effort high extra"),
+    );
+    const duplicate = message("single:alice", "duplicate", "/model gpt-b");
+    await orchestrator.handleText(duplicate);
+    await orchestrator.handleText(duplicate);
+
+    assertEquals(
+      output.sent.find(({ msgId }) => msgId === "bad-model")!.text,
+      "用法：`/model <model-id>`",
+    );
+    assertEquals(
+      output.sent.find(({ msgId }) => msgId === "bad-effort")!.text,
+      "用法：`/effort <level>`",
+    );
+    assertEquals(codex.modelChanges, [{ threadId: undefined, model: "gpt-b" }]);
+    assertEquals(
+      output.sent.filter(({ msgId }) => msgId === "duplicate").length,
+      1,
+    );
+    assertEquals(codex.startTurnAttempts, 0);
+    assertEquals(requestEvents, []);
+  });
+  it("reports model settings in status for bound and unbound conversations", async () => {
+    const bound = setup();
+    bound.state.bindConversation(
+      "single:alice",
+      "single",
+      "thread-existing",
+    );
+    bound.codex.settingsSnapshot = {
+      ...bound.codex.settingsSnapshot,
+      source: "thread",
+    };
+
+    await bound.orchestrator.handleText(
+      message("single:alice", "bound-status", "/status"),
+    );
+
+    const boundStatus = bound.output.sent[0].text;
+    assertMatch(boundStatus, /model: `gpt-a`/);
+    assertMatch(boundStatus, /effort: `medium`/);
+    assertEquals(boundStatus.includes("model: `gpt-a` (default)"), false);
+    assertEquals(bound.codex.settingsLookups, ["thread-existing"]);
+
+    const unbound = setup();
+    await unbound.orchestrator.handleText(
+      message("single:alice", "unbound-status", "/status"),
+    );
+    const unboundStatus = unbound.output.sent[0].text;
+    assertMatch(unboundStatus, /model: `gpt-a` \(default\)/);
+    assertMatch(unboundStatus, /effort: `medium` \(default\)/);
+    assertEquals(unbound.codex.settingsLookups, [undefined]);
+  });
+  it("keeps status available when model settings lookup fails", async () => {
+    const reported: Error[] = [];
+    const { codex, orchestrator, output } = setup({
+      onError: (error: Error) => reported.push(error),
+    });
+    codex.settingsErrors.push(new Error("settings unavailable"));
+
+    await orchestrator.handleText(
+      message("single:alice", "failed-status", "/status"),
+    );
+
+    const failedStatus = output.sent[0].text;
+    assertMatch(failedStatus, /model: `unknown`/);
+    assertMatch(failedStatus, /effort: `unknown`/);
+    assertMatch(failedStatus, /turn: idle/);
+    assertEquals(reported.map(({ message }) => message), [
+      "settings unavailable",
+    ]);
+  });
+  it("recovers settings command ordering after a direct send error", async () => {
+    const { codex, orchestrator, output } = setup();
+    output.sendErrors.push(new Error("direct send failed"));
+
+    const failed = orchestrator.handleText(
+      message("single:alice", "model", "/model"),
+    ).then(() => null, (error) => error);
+    const next = orchestrator.handleText(
+      message("single:alice", "effort", "/effort"),
+    );
+
+    const error = await failed;
+    await next;
+    assertEquals(
+      error instanceof Error ? error.message : error,
+      "direct send failed",
+    );
+    assertEquals(codex.settingsLookups, [undefined, undefined]);
+    assertEquals(output.sent.map(({ msgId }) => msgId), ["model", "effort"]);
   });
   it("isolates request status callback failures from errors and draining", async () => {
     const reported: Error[] = [];
@@ -1608,7 +1981,7 @@ describe("ConversationOrchestrator", () => {
       { msgId: "m1", text: "final", final: true },
     ]);
   });
-  it("keeps help, status, unsupported notices, and start failures direct when levels are off", async () => {
+  it("keeps commands, unsupported notices, and start failures direct when levels are off", async () => {
     const { codex, orchestrator, output } = setup({
       outputSettings: outputSettings("off"),
     });
@@ -1616,6 +1989,10 @@ describe("ConversationOrchestrator", () => {
 
     await orchestrator.handleText(message("single:alice", "help", "/help"));
     await orchestrator.handleText(message("single:alice", "status", "/status"));
+    await orchestrator.handleText(message("single:alice", "model", "/model"));
+    await orchestrator.handleText(
+      message("single:alice", "effort", "/effort"),
+    );
     await orchestrator.handleUnsupported(
       message("single:alice", "image", ""),
       "image",
@@ -1628,8 +2005,24 @@ describe("ConversationOrchestrator", () => {
       /\/new/,
     );
     assertMatch(
+      output.sent.find((entry) => entry.msgId === "help")!.text,
+      /\/model \[model-id\]/,
+    );
+    assertMatch(
+      output.sent.find((entry) => entry.msgId === "help")!.text,
+      /\/effort \[level\]/,
+    );
+    assertMatch(
       output.sent.find((entry) => entry.msgId === "status")!.text,
       /idle/,
+    );
+    assertMatch(
+      output.sent.find((entry) => entry.msgId === "model")!.text,
+      /当前模型/,
+    );
+    assertMatch(
+      output.sent.find((entry) => entry.msgId === "effort")!.text,
+      /当前推理强度/,
     );
     assertMatch(
       output.sent.find((entry) => entry.msgId === "image")!.text,
@@ -1749,7 +2142,7 @@ describe("ConversationOrchestrator", () => {
     assertEquals(output.sent.length, 1);
     assertMatch(output.sent[0].text, /暂不支持.*image/);
   });
-  it("handles help and status without interrupting the active turn", async () => {
+  it("handles inspection commands without interrupting the active turn", async () => {
     const { codex, orchestrator, output } = setup();
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
@@ -1758,6 +2151,8 @@ describe("ConversationOrchestrator", () => {
 
     await orchestrator.handleText(message("single:alice", "m2", "/help"));
     await orchestrator.handleText(message("single:alice", "m3", "/status"));
+    await orchestrator.handleText(message("single:alice", "m4", "/model"));
+    await orchestrator.handleText(message("single:alice", "m5", "/effort"));
     assertEquals(codex.interrupts.length, 0);
     assertMatch(
       output.sent.find((entry) => entry.msgId === "m2")!.text,
@@ -1766,6 +2161,14 @@ describe("ConversationOrchestrator", () => {
     assertMatch(
       output.sent.find((entry) => entry.msgId === "m3")!.text,
       /in_progress/,
+    );
+    assertMatch(
+      output.sent.find((entry) => entry.msgId === "m4")!.text,
+      /当前模型/,
+    );
+    assertMatch(
+      output.sent.find((entry) => entry.msgId === "m5")!.text,
+      /当前推理强度/,
     );
 
     codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
@@ -2499,6 +2902,12 @@ describe("ConversationOrchestrator", () => {
     await timers.advance(500);
     await orchestrator.handleText(
       message("single:alice", "help", "/help"),
+    );
+    await orchestrator.handleText(
+      message("single:alice", "model", "/model"),
+    );
+    await orchestrator.handleText(
+      message("single:alice", "effort", "/effort"),
     );
     await timers.advance(500);
     await orchestrator.handleUnsupported(

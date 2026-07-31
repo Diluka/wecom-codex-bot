@@ -144,8 +144,8 @@ OUTPUT_GROUP_FORMAT_TOOL=summary
 读取，修改 `.env` 后需要重启机器人。
 
 直发消息不经过上述级别和标签过滤。即使所有输出级别均为 `off`，最终回答、
-`/help`、`/status`、`/stop`、不支持消息类型的提示、用户输入请求和直接失败消息仍会
-发送。
+`/help`、`/status`、`/model`、`/effort`、`/stop`、不支持消息类型的提示、用户输入
+请求和直接失败消息仍会发送。
 
 `CODEX_INTERMEDIATE_OUTPUT` 和 `CODEX_STATUS_DETAIL` 这两个旧变量会被静默忽略：
 它们不再被读取、校验，也不会继续影响运行时行为；迁移时应删除旧变量并改用
@@ -175,8 +175,8 @@ OUTPUT_GROUP_FORMAT_TOOL=summary
 另外生成替代标识。只有 `received` 状态包含 `summary`：正文先脱敏、折叠空白，再按
 Unicode 字素簇截取前 10 个，超长时追加 `…`，不会把完整聊天正文写到终端。
 
-内建命令 `/help`、`/status`、`/new`、`/stop` 和不支持的消息类型不产生 request
-状态。未知斜杠命令仍按普通文本请求处理。
+内建命令 `/help`、`/status`、`/model`、`/effort`、`/new`、`/stop` 和不支持的消息
+类型不产生 request 状态。未知斜杠命令仍按普通文本请求处理。
 
 Codex 的原始 `ActivityEvent` 不写终端日志，只经过企业微信输出管线。
 
@@ -226,8 +226,31 @@ docker compose down
 
 - `/new`：中断当前任务并为当前聊天新建 Codex 会话
 - `/stop`：停止当前聊天正在执行或等待的任务，但保留现有 Codex thread
-- `/status`：查看当前聊天的 thread 和 turn 状态
+- `/status`：查看当前聊天的 thread、模型、推理强度和 turn 状态
+- `/model [model-id]`：查看可选模型，或切换模型并保存为新会话默认值
+- `/effort [level]`：查看当前模型支持的推理强度，或切换并保存为新会话默认值
 - `/help`：显示命令帮助
+
+不带参数的 `/model` 会显示当前有效模型和 App Server 返回的模型目录；不带参数的
+`/effort` 会显示当前有效推理强度和当前模型支持的强度。带一个参数时，机器人会先
+校验目录：`/model <model-id>` 切换模型，如果原有推理强度不受新模型支持，会自动改
+为该模型的默认强度；`/effort <level>` 只接受当前模型支持的强度。多余参数只返回
+用法，不会成为 Codex prompt。
+
+如果聊天已绑定 thread，切换会先更新该 thread，再把相同设置写入 Codex 用户级
+config，作为新会话默认值；没有绑定 thread 时只写用户级默认值。thread 更新成功但
+config 写入失败时，回复会明确报告“当前 thread 已切换、全局默认保存失败”；没有
+thread 且 config 写入失败时则报告设置未修改。设置命令不会写入机器人 SQLite。
+
+用户级 config 通过 `config/batchWrite` 写入，并固定使用
+`reloadUserConfig: false`。这不会把用户配置热重载到其他已存在的会话。当前绑定的
+thread 由独立的 `thread/settings/update` 更新。工作区的 project config 仍遵循
+Codex 自身优先级，可能覆盖这里保存的用户级默认值。`/status`、`/model` 和
+`/effort` 显示当前聊天的有效值。
+
+`/model` 和 `/effort` 绕过防抖与任务 slot，不会中断正在执行的 turn。活动 turn
+继续使用启动时的旧设置，当前绑定 thread 的后续 turn 才使用新设置；回复会明确提示
+这一点。
 
 普通文本按 conversation 使用固定 3 秒的尾随防抖窗口。窗口内每收到一条通过
 `msgid` 去重的新消息，等待时间都会从头计算；连续 3 秒没有新消息后，机器人按
@@ -240,11 +263,11 @@ latest-wins：如果已有活动 turn，则请求中断它；如果已有普通 
 一个到期的批次。不同聊天的窗口和任务相互独立，但仍可并发操作同一个工作目录，
 可能产生文件冲突。
 
-`/help`、`/status`、`/new`、`/stop` 和不支持的消息类型都绕过防抖窗口。
-`/help`、`/status` 和不支持消息不会重置窗口或中断任务；`/new` 会取消尚未发送的
-聚合批次，再按原有会话重置流程执行。`/stop` 会立即清除当前聊天的聚合批次、普通
-pending 和待执行的 `/new`，并请求中断活动 turn；它不会删除或替换当前 thread，
-之后的新普通文本仍可开始新的防抖批次。
+内建命令和不支持的消息类型都绕过防抖窗口。`/help`、`/status`、`/model`、
+`/effort` 和不支持消息不会重置窗口或中断任务。`/new` 会取消尚未发送的聚合批次，
+再按原有会话重置流程执行。`/stop` 会立即清除当前聊天的聚合批次、普通 pending 和
+待执行的 `/new`，并请求中断活动 turn；它不会删除或替换当前 thread，之后的新普通
+文本仍可开始新的防抖批次。
 
 机器人关闭时，尚在等待窗口中的批次会直接丢弃。`/stop` 生效后不会再发起旧 turn
 的最终回复，但如果该回复已经进入企业微信发送队列，现有发送接口无法将其撤回。
