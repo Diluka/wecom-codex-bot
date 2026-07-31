@@ -17,6 +17,13 @@ import {
   type CodexRuntimeClientFactory,
 } from "./codex-runtime.ts";
 import type { ActivityEvent } from "./activity-event.ts";
+import type {
+  CodexModel,
+  CodexSettings,
+  CodexThreadSession,
+  ConfigDefaults,
+  SettingsPatch,
+} from "./model-settings.ts";
 
 const EXITED: AppServerProcessStatus = {
   success: false,
@@ -24,24 +31,93 @@ const EXITED: AppServerProcessStatus = {
   signal: null,
 };
 
+function modelFixture(
+  model: string,
+  defaultReasoningEffort: string,
+  efforts: readonly string[],
+): CodexModel {
+  return {
+    id: model,
+    model,
+    displayName: model,
+    description: `${model} description`,
+    hidden: false,
+    isDefault: false,
+    defaultReasoningEffort,
+    supportedReasoningEfforts: efforts.map((reasoningEffort) => ({
+      reasoningEffort,
+      description: `${reasoningEffort} description`,
+    })),
+  };
+}
+
 class FakeClient implements CodexRuntimeClient {
   callbacks: CodexAppServerCallbacks = {};
+  models: CodexModel[] = [
+    modelFixture("gpt-a", "medium", ["low", "medium"]),
+  ];
+  configDefaults: ConfigDefaults = { model: "gpt-a", effort: "medium" };
+  readonly threadSettings = new Map<string, CodexSettings>();
   readonly startedThreads: string[] = [];
   readonly resumedThreads: string[] = [];
   readonly startedTurns: Array<{ threadId: string; prompt: string }> = [];
   readonly interruptedTurns: Array<{ threadId: string; turnId: string }> = [];
+  readonly threadUpdates: Array<{ threadId: string; patch: SettingsPatch }> =
+    [];
+  readonly configWrites: SettingsPatch[] = [];
+  readonly resumeBehaviors: Array<() => Promise<CodexThreadSession>> = [];
+  readonly modelListBehaviors: Array<() => Promise<CodexModel[]>> = [];
+  readonly threadUpdateBehaviors: Array<() => Promise<void>> = [];
+  readonly configWriteBehaviors: Array<() => Promise<void>> = [];
   readonly turnIds: Array<string | Promise<string>> = [];
+  listModelCalls = 0;
   closeCalls = 0;
 
-  startThread(): Promise<string> {
+  startThread(): Promise<CodexThreadSession> {
     const threadId = `thread-${this.startedThreads.length + 1}`;
     this.startedThreads.push(threadId);
-    return Promise.resolve(threadId);
+    return Promise.resolve({
+      threadId,
+      settings: this.threadSettings.get(threadId) ?? {
+        model: "gpt-a",
+        effort: "medium",
+      },
+    });
   }
 
-  resumeThread(threadId: string): Promise<string> {
+  resumeThread(threadId: string): Promise<CodexThreadSession> {
     this.resumedThreads.push(threadId);
-    return Promise.resolve(threadId);
+    const behavior = this.resumeBehaviors.shift();
+    if (behavior) return behavior();
+    return Promise.resolve({
+      threadId,
+      settings: this.threadSettings.get(threadId) ?? {
+        model: "gpt-a",
+        effort: "medium",
+      },
+    });
+  }
+
+  listModels(): Promise<CodexModel[]> {
+    this.listModelCalls++;
+    return this.modelListBehaviors.shift()?.() ?? Promise.resolve(this.models);
+  }
+
+  readConfigDefaults(): Promise<ConfigDefaults> {
+    return Promise.resolve(this.configDefaults);
+  }
+
+  updateThreadSettings(
+    threadId: string,
+    patch: SettingsPatch,
+  ): Promise<void> {
+    this.threadUpdates.push({ threadId, patch });
+    return this.threadUpdateBehaviors.shift()?.() ?? Promise.resolve();
+  }
+
+  writeConfigDefaults(patch: SettingsPatch): Promise<void> {
+    this.configWrites.push(patch);
+    return this.configWriteBehaviors.shift()?.() ?? Promise.resolve();
   }
 
   async startTurn(threadId: string, prompt: string): Promise<string> {
@@ -83,9 +159,10 @@ class FakeFactory {
 function deferred<T>(): {
   promise: Promise<T>;
   resolve: (value: T) => void;
+  reject: (reason?: unknown) => void;
 } {
-  const { promise, resolve } = Promise.withResolvers<T>();
-  return { promise, resolve };
+  const { promise, resolve, reject } = Promise.withResolvers<T>();
+  return { promise, resolve, reject };
 }
 
 async function waitFor(
@@ -112,6 +189,417 @@ function runtimeWith(
     ...overrides,
   });
 }
+
+describe("CodexRuntime caches thread model settings", () => {
+  it("caches thread model settings from starts and coalesced resumes", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    assertEquals(await runtime.startThread(), "thread-1");
+    await runtime.resumeThread("thread-1");
+    await runtime.resumeThread("thread-existing");
+    await runtime.resumeThread("thread-existing");
+
+    assertEquals(client.resumedThreads, ["thread-existing"]);
+    await runtime.stop();
+  });
+});
+
+describe("CodexRuntime validates model settings", () => {
+  it("resolves bound and default model settings snapshots", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    await runtime.resumeThread("thread-1");
+    assertEquals(await runtime.getModelSettings("thread-1"), {
+      settings: { model: "gpt-a", effort: "medium" },
+      selectedModel: client.models[0],
+      models: client.models,
+      source: "thread",
+    });
+    assertEquals(await runtime.getModelSettings(), {
+      settings: { model: "gpt-a", effort: "medium" },
+      selectedModel: client.models[0],
+      models: client.models,
+      source: "default",
+    });
+    await runtime.stop();
+  });
+
+  it("rejects unknown models without writing settings", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    assertEquals(await runtime.setModel("thread-1", "missing-model"), {
+      status: "invalid_model",
+      availableModels: ["gpt-a"],
+    });
+    assertEquals(client.threadUpdates, []);
+    assertEquals(client.configWrites, []);
+    await runtime.stop();
+  });
+
+  it("rejects unsupported efforts without writing settings", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    assertEquals(await runtime.setEffort("thread-1", "high"), {
+      status: "invalid_effort",
+      model: "gpt-a",
+      availableEfforts: ["low", "medium"],
+    });
+    assertEquals(client.threadUpdates, []);
+    assertEquals(client.configWrites, []);
+    await runtime.stop();
+  });
+});
+
+describe("CodexRuntime updates model settings", () => {
+  it("adjusts an unsupported effort when switching a bound thread model", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    client.models.push(modelFixture("gpt-b", "high", ["high"]));
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    assertEquals(await runtime.setModel("thread-1", "gpt-b"), {
+      status: "updated",
+      settings: { model: "gpt-b", effort: "high" },
+      threadUpdated: true,
+      defaultPersisted: true,
+      effortAdjusted: true,
+    });
+    assertEquals(client.threadUpdates[0], {
+      threadId: "thread-1",
+      patch: { model: "gpt-b", effort: "high" },
+    });
+    assertEquals(client.configWrites[0], {
+      model: "gpt-b",
+      effort: "high",
+    });
+    await runtime.stop();
+  });
+
+  it("updates effort without replacing the selected model", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    assertEquals(await runtime.setEffort("thread-1", "low"), {
+      status: "updated",
+      settings: { model: "gpt-a", effort: "low" },
+      threadUpdated: true,
+      defaultPersisted: true,
+      effortAdjusted: false,
+    });
+    assertEquals(client.threadUpdates[0], {
+      threadId: "thread-1",
+      patch: { effort: "low" },
+    });
+    assertEquals(client.configWrites[0], { effort: "low" });
+    await runtime.stop();
+  });
+
+  it("keeps a successful thread update when default persistence fails", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    client.models.push(modelFixture("gpt-b", "high", ["high"]));
+    client.configWriteBehaviors.push(() =>
+      Promise.reject(new Error("config unavailable"))
+    );
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    assertEquals(await runtime.setModel("thread-1", "gpt-b"), {
+      status: "updated",
+      settings: { model: "gpt-b", effort: "high" },
+      threadUpdated: true,
+      defaultPersisted: false,
+      effortAdjusted: true,
+      persistenceError: "config unavailable",
+    });
+    assertEquals((await runtime.getModelSettings("thread-1")).settings, {
+      model: "gpt-b",
+      effort: "high",
+    });
+    assertEquals(client.resumedThreads, ["thread-1"]);
+    await runtime.stop();
+  });
+
+  it("returns a complete persistence failure when no thread is bound", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    client.configWriteBehaviors.push(() =>
+      Promise.reject(new Error("defaults read-only"))
+    );
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    assertEquals(await runtime.setEffort(undefined, "low"), {
+      status: "updated",
+      settings: { model: "gpt-a", effort: "low" },
+      threadUpdated: false,
+      defaultPersisted: false,
+      effortAdjusted: false,
+      persistenceError: "defaults read-only",
+    });
+    assertEquals(client.threadUpdates, []);
+    await runtime.stop();
+  });
+
+  it("does not persist defaults after a thread update fails", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    client.threadUpdateBehaviors.push(() =>
+      Promise.reject(new Error("thread unavailable"))
+    );
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    await assertRejects(
+      () => runtime.setEffort("thread-1", "low"),
+      Error,
+      "thread unavailable",
+    );
+    assertEquals(client.configWrites, []);
+    await runtime.stop();
+  });
+});
+
+describe("CodexRuntime serializes model settings operations", () => {
+  it("coalesces concurrent resumes for one thread", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    const resumed = deferred<CodexThreadSession>();
+    client.resumeBehaviors.push(() => resumed.promise);
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const first = runtime.resumeThread("thread-1");
+    const second = runtime.resumeThread("thread-1");
+    assertEquals(client.resumedThreads, ["thread-1"]);
+    resumed.resolve({
+      threadId: "thread-1",
+      settings: { model: "gpt-a", effort: "medium" },
+    });
+    await Promise.all([first, second]);
+    await runtime.resumeThread("thread-1");
+    await runtime.stop();
+
+    assertEquals(client.resumedThreads, ["thread-1"]);
+  });
+
+  it("runs updates to one thread in arrival order", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    const firstUpdate = deferred<void>();
+    client.threadUpdateBehaviors.push(
+      () => firstUpdate.promise,
+      () => Promise.resolve(),
+    );
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const first = runtime.setEffort("thread-1", "low");
+    await waitFor(
+      () => client.threadUpdates.length === 1,
+      "first thread settings update",
+    );
+    const second = runtime.setEffort("thread-1", "medium");
+    await Promise.resolve();
+    assertEquals(client.threadUpdates, [{
+      threadId: "thread-1",
+      patch: { effort: "low" },
+    }]);
+
+    firstUpdate.resolve();
+    await Promise.all([first, second]);
+    await runtime.stop();
+    assertEquals(client.threadUpdates, [
+      { threadId: "thread-1", patch: { effort: "low" } },
+      { threadId: "thread-1", patch: { effort: "medium" } },
+    ]);
+  });
+
+  it("runs thread RPCs concurrently and serializes global config writes", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    const firstThreadUpdate = deferred<void>();
+    const secondThreadUpdate = deferred<void>();
+    const firstConfigWrite = deferred<void>();
+    const secondConfigWrite = deferred<void>();
+    client.threadUpdateBehaviors.push(
+      () => firstThreadUpdate.promise,
+      () => secondThreadUpdate.promise,
+    );
+    client.configWriteBehaviors.push(
+      () => firstConfigWrite.promise,
+      () => secondConfigWrite.promise,
+    );
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+    await Promise.all([
+      runtime.resumeThread("thread-a"),
+      runtime.resumeThread("thread-b"),
+    ]);
+
+    const first = runtime.setEffort("thread-a", "low");
+    const second = runtime.setEffort("thread-b", "medium");
+    await waitFor(
+      () => client.threadUpdates.length === 2,
+      "concurrent thread settings updates",
+    );
+    firstThreadUpdate.resolve();
+    secondThreadUpdate.resolve();
+    await waitFor(
+      () => client.configWrites.length === 1,
+      "first config write",
+    );
+    firstConfigWrite.resolve();
+    await waitFor(
+      () => client.configWrites.length === 2,
+      "second config write",
+    );
+    secondConfigWrite.resolve();
+
+    await Promise.all([first, second]);
+    await runtime.stop();
+    assertEquals(client.threadUpdates.map(({ threadId }) => threadId), [
+      "thread-a",
+      "thread-b",
+    ]);
+  });
+
+  it("continues config writes after a rejected write", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    const rejectedWrite = deferred<void>();
+    const recoveredWrite = deferred<void>();
+    client.configWriteBehaviors.push(
+      () => rejectedWrite.promise,
+      () => recoveredWrite.promise,
+    );
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const first = runtime.setEffort(undefined, "low");
+    await waitFor(
+      () => client.configWrites.length === 1,
+      "rejected config write",
+    );
+    const second = runtime.setEffort(undefined, "medium");
+    await Promise.resolve();
+    assertEquals(client.configWrites.length, 1);
+
+    rejectedWrite.reject(new Error("first write failed"));
+    assertEquals(await first, {
+      status: "updated",
+      settings: { model: "gpt-a", effort: "low" },
+      threadUpdated: false,
+      defaultPersisted: false,
+      effortAdjusted: false,
+      persistenceError: "first write failed",
+    });
+    await waitFor(
+      () => client.configWrites.length === 2,
+      "recovered config write",
+    );
+    recoveredWrite.resolve();
+    assertEquals(await second, {
+      status: "updated",
+      settings: { model: "gpt-a", effort: "medium" },
+      threadUpdated: false,
+      defaultPersisted: true,
+      effortAdjusted: false,
+    });
+    await runtime.stop();
+  });
+
+  it("drops an old-generation late thread update from the new cache", async () => {
+    const factory = new FakeFactory();
+    const firstClient = new FakeClient();
+    const replacement = new FakeClient();
+    const lateUpdate = deferred<void>();
+    firstClient.threadUpdateBehaviors.push(() => lateUpdate.promise);
+    factory.queue.push(firstClient, replacement);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const updating = runtime.setEffort("thread-1", "low");
+    await waitFor(
+      () => firstClient.threadUpdates.length === 1,
+      "old-generation thread update",
+    );
+    firstClient.exit();
+    await waitFor(
+      () => runtime.ready && runtime.generation === 2,
+      "settings runtime restart",
+    );
+    lateUpdate.resolve();
+    await assertRejects(
+      () => updating,
+      Error,
+      "runtime changed while updating thread settings",
+    );
+
+    assertEquals((await runtime.getModelSettings("thread-1")).settings, {
+      model: "gpt-a",
+      effort: "medium",
+    });
+    await runtime.stop();
+    assertEquals(replacement.resumedThreads, ["thread-1"]);
+  });
+
+  it("loads the model catalog once per generation and refetches after restart", async () => {
+    const factory = new FakeFactory();
+    const firstClient = new FakeClient();
+    const replacement = new FakeClient();
+    const firstCatalog = deferred<CodexModel[]>();
+    firstClient.modelListBehaviors.push(() => firstCatalog.promise);
+    factory.queue.push(firstClient, replacement);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const firstSnapshot = runtime.getModelSettings();
+    const concurrentSnapshot = runtime.getModelSettings();
+    firstCatalog.resolve(firstClient.models);
+    await Promise.all([firstSnapshot, concurrentSnapshot]);
+
+    firstClient.exit();
+    await waitFor(
+      () => runtime.ready && runtime.generation === 2,
+      "catalog runtime restart",
+    );
+    await runtime.getModelSettings();
+    await runtime.getModelSettings();
+    await runtime.stop();
+
+    assertEquals(firstClient.listModelCalls, 1);
+    assertEquals(replacement.listModelCalls, 1);
+  });
+});
 
 describe("CodexRuntime", () => {
   it("starts one client and implements the Codex port operations", async () => {

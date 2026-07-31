@@ -1,5 +1,9 @@
 import type { ActivityEvent } from "./activity-event.ts";
 import { summarizeRequest } from "./log.ts";
+import type {
+  ModelSettingsSnapshot,
+  ModelSettingsUpdateResult,
+} from "./model-settings.ts";
 import { TurnOutputPipeline } from "./output-pipeline.ts";
 import { buildCodexPrompt } from "./prompt.ts";
 import {
@@ -66,6 +70,15 @@ export interface CodexPort {
   readonly generation: number;
   startThread(): Promise<string>;
   resumeThread(threadId: string): Promise<void>;
+  getModelSettings(threadId?: string): Promise<ModelSettingsSnapshot>;
+  setModel(
+    threadId: string | undefined,
+    model: string,
+  ): Promise<ModelSettingsUpdateResult>;
+  setEffort(
+    threadId: string | undefined,
+    effort: string,
+  ): Promise<ModelSettingsUpdateResult>;
   startTurn(
     threadId: string,
     prompt: string,
