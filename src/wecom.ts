@@ -4,7 +4,6 @@ import {
   WSClient,
   type WsFrameHeaders,
 } from "@wecom/aibot-node-sdk";
-import { formatWithOptions } from "node:util";
 import { redactSecrets } from "./output.ts";
 
 export type ChatType = "single" | "group";
@@ -32,34 +31,15 @@ export function createSafeSdkLogger(
   secret: string,
   write: (level: SdkLogLevel, message: string) => void = () => {},
 ): Logger {
-  const record = (
-    level: SdkLogLevel,
-    message: string,
-    args: unknown[],
-  ): void => {
-    // The SDK uses console-style arguments, which Pino does not append unless
-    // the message contains format placeholders. Normalize them before handoff.
-    const completeMessage = formatWithOptions(
-      {
-        breakLength: Infinity,
-        colors: false,
-        compact: true,
-        customInspect: false,
-        depth: null,
-        maxArrayLength: null,
-        maxStringLength: null,
-      },
-      message,
-      ...args,
-    );
-    write(level, redactSecrets(completeMessage, [secret]));
+  const record = (level: SdkLogLevel, message: string): void => {
+    write(level, redactSecrets(message, [secret]));
   };
 
   return {
-    debug: (message, ...args) => record("debug", message, args),
-    info: (message, ...args) => record("info", message, args),
-    warn: (message, ...args) => record("warn", message, args),
-    error: (message, ...args) => record("error", message, args),
+    debug: (message) => record("debug", message),
+    info: (message) => record("info", message),
+    warn: (message) => record("warn", message),
+    error: (message) => record("error", message),
   };
 }
 
