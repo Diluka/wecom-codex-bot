@@ -25,7 +25,7 @@ export interface InboundText extends InboundMessage {
 
 type Listener = (...args: unknown[]) => void;
 type MaybePromise<T> = T | Promise<T>;
-export type SdkLogLevel = "info" | "warn" | "error";
+export type SdkLogLevel = "debug" | "info" | "warn" | "error";
 
 export function createSafeSdkLogger(
   secret: string,
@@ -36,8 +36,7 @@ export function createSafeSdkLogger(
   };
 
   return {
-    // SDK debug messages include complete callback frames and chat bodies.
-    debug: () => {},
+    debug: (message) => record("debug", message),
     info: (message) => record("info", message),
     warn: (message) => record("warn", message),
     error: (message) => record("error", message),
