@@ -446,6 +446,188 @@ describe("ConversationOrchestrator", () => {
     ]);
   });
 
+  it("shows less progress in groups without hiding direct or final replies", async () => {
+    const { codex, orchestrator, output } = setup({
+      outputSettings: outputSettings("full"),
+      groupOutputSettings: outputSettings("off"),
+    });
+    const single = orchestrator.handleText(
+      message("single:alice", "single-less", "single work"),
+    );
+    const group = orchestrator.handleText(
+      message("group:room", "group-less", "group work", "bob"),
+    );
+    await waitFor(() => codex.starts.length === 2);
+    const singleTurn = codex.starts.find((turn) =>
+      turn.prompt.includes("msgid: single-less")
+    )!;
+    const groupTurn = codex.starts.find((turn) =>
+      turn.prompt.includes("msgid: group-less")
+    )!;
+
+    await singleTurn.onActivity({
+      tag: "CONTENT",
+      body: "single progress",
+      delivery: "progress",
+    });
+    await groupTurn.onActivity({
+      tag: "CONTENT",
+      body: "hidden group progress",
+      delivery: "progress",
+    });
+    await groupTurn.onActivity({
+      tag: "CONTENT",
+      body: "group needs input",
+      delivery: "direct",
+    });
+    singleTurn.resolve({
+      status: "completed",
+      finalAnswer: "single final",
+    });
+    groupTurn.resolve({ status: "completed", finalAnswer: "group final" });
+    await Promise.all([single, group]);
+
+    assertEquals(
+      output.progress.find(({ msgId }) => msgId === "single-less")?.chunks,
+      [
+        "[queue] 已提交给 Codex",
+        "\n",
+        "[turn] started",
+        "\n",
+        "[content] single progress",
+        "\n",
+        "[turn] completed",
+      ],
+    );
+    assertEquals(
+      output.progress.find(({ msgId }) => msgId === "group-less")?.chunks,
+      [],
+    );
+    assertEquals(
+      output.sent.filter(({ msgId }) => msgId === "group-less"),
+      [
+        { msgId: "group-less", text: "group needs input", final: false },
+        { msgId: "group-less", text: "group final", final: true },
+      ],
+    );
+    assertEquals(
+      output.sent.find(({ msgId }) => msgId === "single-less"),
+      { msgId: "single-less", text: "single final", final: true },
+    );
+  });
+
+  it("shows more progress in groups without changing single-chat output", async () => {
+    const { codex, orchestrator, output } = setup({
+      outputSettings: outputSettings("off"),
+      groupOutputSettings: outputSettings("full"),
+    });
+    const single = orchestrator.handleText(
+      message("single:alice", "single-more", "single work"),
+    );
+    const group = orchestrator.handleText(
+      message("group:room", "group-more", "group work", "bob"),
+    );
+    await waitFor(() => codex.starts.length === 2);
+    const singleTurn = codex.starts.find((turn) =>
+      turn.prompt.includes("msgid: single-more")
+    )!;
+    const groupTurn = codex.starts.find((turn) =>
+      turn.prompt.includes("msgid: group-more")
+    )!;
+
+    await singleTurn.onActivity({
+      tag: "CONTENT",
+      body: "hidden single progress",
+      delivery: "progress",
+    });
+    await groupTurn.onActivity({
+      tag: "CONTENT",
+      body: "group progress",
+      delivery: "progress",
+    });
+    singleTurn.resolve({ status: "completed" });
+    groupTurn.resolve({ status: "completed" });
+    await Promise.all([single, group]);
+
+    assertEquals(
+      output.progress.find(({ msgId }) => msgId === "single-more")?.chunks,
+      [],
+    );
+    assertEquals(
+      output.progress.find(({ msgId }) => msgId === "group-more")?.chunks,
+      [
+        "[queue] 已提交给 Codex",
+        "\n",
+        "[turn] started",
+        "\n",
+        "[content] group progress",
+        "\n",
+        "[turn] completed",
+      ],
+    );
+  });
+
+  it("keeps single and group tool aggregation profiles isolated", async () => {
+    const singleSettings = outputSettings();
+    const groupSettings = outputSettings();
+    groupSettings.toolFormat = "merge_all";
+    const { codex, orchestrator, output } = setup({
+      outputSettings: singleSettings,
+      groupOutputSettings: groupSettings,
+    });
+    const single = orchestrator.handleText(
+      message("single:alice", "single-tools", "single work"),
+    );
+    const group = orchestrator.handleText(
+      message("group:room", "group-tools", "group work", "bob"),
+    );
+    await waitFor(() => codex.starts.length === 2);
+    const singleTurn = codex.starts.find((turn) =>
+      turn.prompt.includes("msgid: single-tools")
+    )!;
+    const groupTurn = codex.starts.find((turn) =>
+      turn.prompt.includes("msgid: group-tools")
+    )!;
+    const tools: ActivityEvent[] = [
+      {
+        tag: "TOOL",
+        summary: "deno test",
+        body: "started",
+        itemId: "tool-1",
+        toolId: "command:deno test",
+        toolState: "started",
+        delivery: "progress",
+      },
+      {
+        tag: "TOOL",
+        summary: "git status",
+        body: "started",
+        itemId: "tool-2",
+        toolId: "command:git status",
+        toolState: "started",
+        delivery: "progress",
+      },
+    ];
+
+    for (const event of tools) {
+      await singleTurn.onActivity(event);
+      await groupTurn.onActivity(event);
+    }
+    singleTurn.resolve({ status: "completed" });
+    groupTurn.resolve({ status: "completed" });
+    await Promise.all([single, group]);
+
+    const singleChunks =
+      output.progress.find(({ msgId }) => msgId === "single-tools")!.chunks;
+    const groupChunks =
+      output.progress.find(({ msgId }) => msgId === "group-tools")!.chunks;
+    assertEquals(singleChunks.includes("[tool] deno test\nstarted"), true);
+    assertEquals(singleChunks.includes("[tool] git status\nstarted"), true);
+    assertEquals(groupChunks.includes("[tool] tools started"), true);
+    assertEquals(groupChunks.includes("[tool] deno test\nstarted"), false);
+    assertEquals(groupChunks.includes("[tool] git status\nstarted"), false);
+  });
+
   it("keeps help, status, unsupported notices, and start failures direct when levels are off", async () => {
     const { codex, orchestrator, output } = setup({
       outputSettings: outputSettings("off"),
