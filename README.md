@@ -130,7 +130,8 @@ OUTPUT_FORMAT_TOOL=individual
 ```
 
 `summary` 是明确的工具详情隐藏模式。它不会读取 `ActivityEvent.summary` 中记录的
-命令、查询或工具名称，也不会调用模型或根据工具列表自行生成摘要。
+命令、查询或工具名称，也不会调用模型、按工具分类，或根据本轮工具历史动态生成
+摘要。
 
 它只沿用 App Server 通知
 `item/reasoning/summaryTextDelta`。当最终生效的工具格式为 `summary`
@@ -139,13 +140,16 @@ OUTPUT_FORMAT_TOOL=individual
 配置和模型默认值。普通 commentary 目前也属于 `CONTENT`，行为保持不变。
 
 同一 reasoning summary section 的增量会先按 App Server 提供的 `itemId` 和
-`summaryIndex` 累积，再刷新当前企业微信 stream 的最后一个摘要块。连续的新摘要段
-也会轮换这个尾块；一旦出现其他可见进度，旧摘要就会固化，之后的摘要从新尾块开始。
-被输出级别抑制的事件和 direct 消息不会中断这条替换链。
+`summaryIndex` 累积，再原位刷新当前企业微信 stream 的活动摘要尾块。新的 section
+立即接替它时，机器人会先把旧尾块替换为固定的
+`*已完成上一阶段，继续处理中…*`，再显示新摘要。只有摘要完整一行都是 `**bold**`
+时才会转成 `*italic*`；普通文本、行内格式、代码和其他 Markdown 都保持原样。
 
-尾块替换只作用于仍打开的 stream。六分钟轮换已经完成的旧 stream 不会被修改；缺失
-或非法的摘要元数据、被 UTF-8 尾部截断后无法精确匹配的旧块都会安全退化为追加。
-摘要 Markdown 完全沿用 App Server 原文，不会改写粗体、斜体或其他格式。
+一旦出现其他可见进度，当前摘要就会固化，之后的摘要从新的活动尾块开始。被输出级别
+抑制的事件和 direct 消息不会中断这条替换链。企业微信 stream 到达六分钟 scheduled
+rotation 时，机器人会在 finalize 旧 stream 前先把仍有效的活动摘要尾块封口为同一
+固定提示。所有尾块改写都要求记录内容与实际尾部精确匹配；因 UTF-8 截断或其他原因
+不匹配时会保留原文，不会强制覆盖。
 
 摘要仍服从 `OUTPUT_LEVEL_CONTENT` 和 `OUTPUT_LABEL_CONTENT`。如果 App Server
 没有返回 reasoning summary，工具活动就保持静默。工具名称、命令、参数、状态和结果
