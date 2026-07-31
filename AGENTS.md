@@ -56,14 +56,22 @@ Codex notifications
 
 ## 必须保持的运行时不变量
 
-- 同一 conversation 中，进入任务 slot 的普通文本严格串行并采用 latest-wins：活动
-  turn 存在时，新文本请求中断它，且普通 pending 只保留最后一条。不同
-  conversation
-  可以并发，因此会同时修改同一个工作区；不要在没有明确需求时改成全局串行。
-- `/new` 使用独立的 reset pending：它会清掉旧的普通 pending；如果之后又收到普通
-  文本，则先新建 thread，再执行最后一条普通 pending。
-- `/help`、`/status` 和不支持的消息直接回复，不进入任务 slot，也不打断活动
-  turn。
+- 普通文本先按 conversation 使用固定 3 秒 trailing debounce。每条通过 `msgid`
+  去重的新消息重置窗口；到期后按到达顺序聚合为一个请求。群聊成员共享同一个窗口，
+  但每条消息自己的 sender、`msgid` 和 `quote` 都必须保留。整个批次的 progress 和
+  final 使用最后一条消息的企业微信 frame。不同 conversation 的窗口相互独立。
+- 防抖等待不进入任务 slot，也不打断活动 turn。批次到期后才应用原有
+  latest-wins：同一 conversation 中进入 slot 的请求严格串行，活动 turn 存在时由
+  新批次请求中断它，普通 pending 只保留最后一个到期批次。不同 conversation 可以
+  并发，因此会同时修改同一个工作区；不要在没有明确需求时改成全局串行。
+- `/help`、`/status`、`/new`、`/stop` 和不支持的消息绕过防抖。`/help`、`/status`
+  和不支持消息直接回复，不重置等待窗口、不进入任务 slot，也不打断活动 turn。
+- `/new` 会先取消尚未到期的聚合批次，再使用独立的 reset pending：它会清掉旧的
+  普通 pending；如果之后又收到普通文本，则先新建 thread，再执行最后一个到期的
+  普通批次。
+- `/stop` 必须立即清掉当前 conversation 的防抖批次、普通 pending 和 reset
+  pending，并请求中断活动 turn；它保留 thread 绑定。停止后的新普通文本可以重新
+  开始防抖窗口，且停止范围不能影响其他 conversation。
 - 所有普通文本、命令和不支持的消息都必须先通过 `msgid` 去重。
 - App Server 重启后，持久 thread 必须按新的 runtime generation 重新 resume；崩溃
   时活动 turn 结束为 `runtime_lost`，旧 generation 的晚到事件不能泄漏到新 turn。
@@ -75,12 +83,15 @@ Codex notifications
 - 工具生命周期和工具结果是两个独立标签；`OUTPUT_FORMAT_TOOL` 只负责聚合，不决定
   内容是否显示。聚合状态必须在 turn 完成、runtime 重启和关闭时清空。
 - 企业微信发送按 conversation 保序，并为最终回复、流关闭等关键帧保留额度。修改
-  限流、分段或流轮换时，必须保留“常规发送不能饿死关键发送”这一性质。
+  限流、分段或流轮换时，必须保留“常规发送不能饿死关键发送”这一性质。`/stop`
+  生效后不得再发起旧 turn 的 final，但已经进入企业微信发送队列的 final
+  无法撤回。
 - App Server 的交互审批和权限请求当前全部 fail closed。`requestUserInput`
   会把问题直发企业微信、给 App Server 返回空答案并中断
   turn；下一条用户消息会成为新 turn，不是对原请求的进程内续答。
-- 关闭顺序必须保持：停止接收新工作并中断 turn、停止常规输出、完成活动流、断开
-  企业微信、关闭 App Server、最后关闭 SQLite。每一步失败都不能阻止后续清理。
+- 关闭时必须取消并丢弃所有尚未到期的防抖批次，使晚到 timer callback 无效。关闭
+  顺序必须保持：停止接收新工作并中断 turn、停止常规输出、完成活动流、断开企业
+  微信、关闭 App Server、最后关闭 SQLite。每一步失败都不能阻止后续清理。
 
 ## 修改时从哪里落手
 
@@ -89,7 +100,7 @@ Codex notifications
 - JSON-RPC 协议、App Server 超时或子进程退出：先改
   `src/codex-app-server.ts`，再检查
   `src/codex-runtime.ts`；覆盖乱序响应、早到通知、晚到事件和进程不退出等路径。
-- 排队、latest-wins、`/new`、thread 绑定或关闭竞态：改
+- 防抖、排队、latest-wins、`/new`、`/stop`、thread 绑定或关闭竞态：改
   `src/orchestrator.ts`，并同步检查 `src/lifecycle.ts`、`src/state.ts`
   及对应测试。
 - 新增或修改 Codex 事件：先在 `src/codex-events.ts` 保持原始语义，再由

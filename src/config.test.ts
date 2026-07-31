@@ -117,7 +117,82 @@ describe("loadConfig", () => {
     const config = await loadConfig(configEnv(), Deno.cwd());
 
     assertEquals(config.outputSettings, expectedSettings());
+    assertEquals(config.groupOutputSettings, expectedSettings());
     assertEquals(DEFAULT_OUTPUT_SETTINGS, expectedSettings());
+  });
+
+  it("inherits a separate group profile from existing output settings", async () => {
+    const config = await loadConfig(
+      configEnv({
+        OUTPUT_LEVEL: "line",
+        OUTPUT_LEVEL_TOOL: "full",
+        OUTPUT_LABEL: "hide",
+        OUTPUT_LABEL_CONTENT: "show",
+        OUTPUT_FORMAT_TOOL: "merge_same",
+      }),
+      Deno.cwd(),
+    );
+    const group = config.groupOutputSettings;
+
+    assertEquals(group, config.outputSettings);
+    assertEquals(group.levels === config.outputSettings.levels, false);
+    assertEquals(group.labels === config.outputSettings.labels, false);
+  });
+
+  it("applies group globals before group tag overrides", async () => {
+    const config = await loadConfig(
+      configEnv({
+        OUTPUT_LEVEL: "line",
+        OUTPUT_LEVEL_TOOL: "full",
+        OUTPUT_LABEL: "hide",
+        OUTPUT_LABEL_TOOL: "hide",
+        OUTPUT_FORMAT_TOOL: "merge_same",
+        OUTPUT_GROUP_LEVEL: " off ",
+        OUTPUT_GROUP_LEVEL_ERROR: " full ",
+        OUTPUT_GROUP_LABEL: " show ",
+        OUTPUT_GROUP_LABEL_ERROR: " hide ",
+        OUTPUT_GROUP_FORMAT_TOOL: " merge_all ",
+      }),
+      Deno.cwd(),
+    );
+    const group = config.groupOutputSettings;
+
+    assertEquals(group.level, "off");
+    assertEquals(group.levels.TOOL, "off");
+    assertEquals(group.levels.ERROR, "full");
+    assertEquals(group.label, "show");
+    assertEquals(group.labels.TOOL, "show");
+    assertEquals(group.labels.ERROR, "hide");
+    assertEquals(group.toolFormat, "merge_all");
+    assertEquals(config.outputSettings.levels.TOOL, "full");
+    assertEquals(config.outputSettings.labels.TOOL, "hide");
+    assertEquals(config.outputSettings.toolFormat, "merge_same");
+  });
+
+  it("lets group globals increase output while blank values inherit", async () => {
+    const config = await loadConfig(
+      configEnv({
+        OUTPUT_LEVEL: "off",
+        OUTPUT_LEVEL_TOOL: "line",
+        OUTPUT_LABEL: "hide",
+        OUTPUT_FORMAT_TOOL: "merge_same",
+        OUTPUT_GROUP_LEVEL: "full",
+        OUTPUT_GROUP_LEVEL_QUEUE: "  ",
+        OUTPUT_GROUP_LABEL: "\t",
+        OUTPUT_GROUP_LABEL_TOOL: " show ",
+        OUTPUT_GROUP_FORMAT_TOOL: " ",
+      }),
+      Deno.cwd(),
+    );
+    const group = config.groupOutputSettings;
+
+    for (const tag of OUTPUT_TAGS) {
+      assertEquals(group.levels[tag], "full");
+    }
+    assertEquals(group.label, "hide");
+    assertEquals(group.labels.CONTENT, "hide");
+    assertEquals(group.labels.TOOL, "show");
+    assertEquals(group.toolFormat, "merge_same");
   });
 
   it("trims global and per-tag output settings", async () => {
@@ -176,6 +251,11 @@ describe("loadConfig", () => {
         "OUTPUT_LABEL",
         "OUTPUT_LABEL_WARNING",
         "OUTPUT_FORMAT_TOOL",
+        "OUTPUT_GROUP_LEVEL",
+        ...OUTPUT_TAGS.map((tag) => `OUTPUT_GROUP_LEVEL_${tag}`),
+        "OUTPUT_GROUP_LABEL",
+        ...OUTPUT_TAGS.map((tag) => `OUTPUT_GROUP_LABEL_${tag}`),
+        "OUTPUT_GROUP_FORMAT_TOOL",
       ]
     ) {
       const error = await assertRejects(() =>

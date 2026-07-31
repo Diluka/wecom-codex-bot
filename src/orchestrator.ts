@@ -133,12 +133,20 @@ export interface ConversationOrchestratorOptions {
   output: ChatOutput;
   workspace: string;
   outputSettings?: OutputSettings;
+  groupOutputSettings?: OutputSettings;
   onError?: (error: Error) => void;
   onRequestStatus?: (event: RequestStatusEvent) => void;
   now?: () => number;
   summarizeRequest?: (text: string) => string;
+  messageDebounceMs?: number;
+  messageDebounceTimers?: OrchestratorTimerApi;
   shutdownGraceMs?: number;
   interruptRetryDelaysMs?: readonly number[];
+}
+
+export interface OrchestratorTimerApi {
+  setTimeout(callback: () => void, delayMs: number): unknown;
+  clearTimeout(handle: unknown): void;
 }
 
 interface TurnControl {
@@ -158,10 +166,11 @@ type RequestPhase = "pre_turn" | "turn" | "reply";
 interface ActiveTurn {
   threadId: string;
   turnId?: string;
-  trace: RequestTrace;
+  request: PendingRequest;
   turnOutput: TurnOutput;
   control: TurnControl;
   shutdownRequested: boolean;
+  stopRequested: boolean;
   interruptWhenReady: boolean;
   lateInterruptRequested: boolean;
   interruptStatusEmitted: boolean;
@@ -174,6 +183,21 @@ interface RequestTrace {
   turnId?: string;
   phase: RequestPhase;
   terminal: boolean;
+}
+
+interface PendingRequest {
+  message: RoutedText;
+  messages: RoutedText[];
+  traces: RequestTrace[];
+}
+
+interface DebounceBatch {
+  messages: RoutedText[];
+  traces: RequestTrace[];
+  timer?: unknown;
+  completion: Promise<void>;
+  resolve: () => void;
+  reject: (error: unknown) => void;
 }
 
 interface TurnOutput {
@@ -190,8 +214,9 @@ interface TurnOutput {
 }
 
 interface ConversationSlot {
-  pending?: RequestTrace;
-  current?: RequestTrace;
+  debounce?: DebounceBatch;
+  pending?: PendingRequest;
+  current?: PendingRequest;
   resetPending?: RoutedText;
   active?: ActiveTurn;
   control?: TurnControl;
@@ -218,22 +243,40 @@ const TERMINAL_REQUEST_STATUSES = new Set<RequestStatus>([
   "runtime_lost",
 ]);
 
-function isSupersedable(trace?: RequestTrace): trace is RequestTrace {
-  return Boolean(trace && !trace.terminal && trace.phase === "pre_turn");
+function hasLiveTraces(request?: PendingRequest): request is PendingRequest {
+  return Boolean(request?.traces.some((trace) => !trace.terminal));
+}
+
+function isSupersedable(request?: PendingRequest): request is PendingRequest {
+  return Boolean(
+    hasLiveTraces(request) &&
+      request.traces.every((trace) =>
+        trace.terminal || trace.phase === "pre_turn"
+      ),
+  );
 }
 
 function isInterruptible(active?: ActiveTurn): active is ActiveTurn {
   return Boolean(
-    active && !active.trace.terminal && active.trace.phase === "turn",
+    active && hasLiveTraces(active.request) &&
+      active.request.traces.every((trace) =>
+        trace.terminal || trace.phase === "turn"
+      ),
   );
 }
 
 const HELP = [
   "可用命令：",
   "- `/new`：中断当前任务并新建 Codex 会话",
+  "- `/stop`：立即停止当前聊天中正在执行或等待的任务",
   "- `/status`：查看当前聊天的绑定与运行状态",
   "- `/help`：显示本帮助",
 ].join("\n");
+
+const systemMessageDebounceTimers: OrchestratorTimerApi = {
+  setTimeout: (callback, delayMs) => globalThis.setTimeout(callback, delayMs),
+  clearTimeout: (handle) => globalThis.clearTimeout(handle as number),
+};
 
 /** Serializes each conversation's Codex turns, state changes, and output. */
 export class ConversationOrchestrator {
@@ -242,10 +285,13 @@ export class ConversationOrchestrator {
   readonly #output: ChatOutput;
   readonly #workspace: string;
   readonly #outputSettings: OutputSettings;
+  readonly #groupOutputSettings: OutputSettings;
   readonly #onError?: (error: Error) => void;
   readonly #onRequestStatus?: (event: RequestStatusEvent) => void;
   readonly #now: () => number;
   readonly #summarizeRequest: (text: string) => string;
+  readonly #messageDebounceMs: number;
+  readonly #messageDebounceTimers: OrchestratorTimerApi;
   readonly #shutdownGraceMs: number;
   readonly #interruptRetryDelaysMs: readonly number[];
   readonly #slots = new Map<ConversationKey, ConversationSlot>();
@@ -258,16 +304,27 @@ export class ConversationOrchestrator {
     this.#output = options.output;
     this.#workspace = options.workspace;
     this.#outputSettings = options.outputSettings ?? DEFAULT_OUTPUT_SETTINGS;
+    this.#groupOutputSettings = options.groupOutputSettings ??
+      this.#outputSettings;
     this.#onError = options.onError;
     this.#onRequestStatus = options.onRequestStatus;
     this.#now = options.now ?? Date.now;
     this.#summarizeRequest = options.summarizeRequest ?? summarizeRequest;
+    this.#messageDebounceMs = options.messageDebounceMs ?? 3_000;
+    this.#messageDebounceTimers = options.messageDebounceTimers ??
+      systemMessageDebounceTimers;
     this.#shutdownGraceMs = options.shutdownGraceMs ?? 30_000;
     this.#interruptRetryDelaysMs = options.interruptRetryDelaysMs ?? [
       1_000,
       2_000,
       4_000,
     ];
+    if (
+      !Number.isFinite(this.#messageDebounceMs) ||
+      this.#messageDebounceMs < 0
+    ) {
+      throw new RangeError("messageDebounceMs must be a non-negative number");
+    }
     if (
       !Number.isFinite(this.#shutdownGraceMs) || this.#shutdownGraceMs < 0
     ) {
@@ -286,7 +343,10 @@ export class ConversationOrchestrator {
 
   async handleText(message: RoutedText): Promise<void> {
     const command = message.text.trim();
-    if (command === "/help" || command === "/status" || command === "/new") {
+    if (
+      command === "/help" || command === "/status" || command === "/new" ||
+      command === "/stop"
+    ) {
       if (this.#shuttingDown) return;
       if (!this.#state.claimMessage(message.msgId, message.conversationKey)) {
         return;
@@ -299,48 +359,38 @@ export class ConversationOrchestrator {
         await this.#output.send(message, this.#status(message.conversationKey));
         return;
       }
-    } else {
-      const trace = this.#createRequestTrace(message);
-      this.#emitRequestStatus(trace, "received");
-      if (this.#shuttingDown) {
-        this.#emitRequestStatus(trace, "shutdown_discarded", {
-          reason: "shutdown",
-        });
+      if (command === "/stop") {
+        await this.#stopConversation(message);
         return;
       }
-      if (!this.#state.claimMessage(message.msgId, message.conversationKey)) {
-        this.#emitRequestStatus(trace, "duplicate_ignored");
-        return;
+      const slot = this.#slot(message.conversationKey);
+      const debounce = this.#cancelDebounce(slot);
+      if (debounce) {
+        this.#emitRequestStatuses(
+          this.#requestFromBatch(debounce),
+          "superseded",
+          { reason: "reset" },
+        );
+      }
+      const pending = slot.pending;
+      const current = isSupersedable(slot.current) ? slot.current : undefined;
+      slot.pending = undefined;
+      if (pending) {
+        this.#emitRequestStatuses(pending, "superseded", { reason: "reset" });
+      }
+      if (current) {
+        this.#emitRequestStatuses(current, "superseded", { reason: "reset" });
       }
       if (!this.#codex.ready) {
-        this.#emitRequestStatus(trace, "runtime_unavailable");
-        await this.#sendRequestReply(
-          trace,
-          () =>
-            this.#output.send(
-              message,
-              "Codex App Server 暂不可用，请稍后重试。",
-            ),
+        this.#deleteSlotIfIdle(message.conversationKey, slot);
+        await this.#output.send(
+          message,
+          "Codex App Server 暂不可用，请稍后重试。",
         );
-        this.#emitRequestStatus(trace, "completed", {
-          reason: "runtime_unavailable",
-        });
         return;
       }
-
-      const slot = this.#slot(message.conversationKey);
-      const superseded = slot.pending ??
-        (isSupersedable(slot.current) ? slot.current : undefined);
-      slot.pending = trace;
-      if (superseded) {
-        this.#emitRequestStatus(superseded, "superseded", {
-          replacedByMsgId: message.msgId,
-        });
-      }
-      this.#emitRequestStatus(trace, "queued");
-      if (isInterruptible(slot.active)) {
-        this.#requestInterrupt(slot, message.msgId);
-      }
+      slot.resetPending = message;
+      if (isInterruptible(slot.active)) this.#requestInterrupt(slot);
       if (!slot.drain) {
         slot.drain = this.#drain(message.conversationKey, slot).finally(() => {
           slot.drain = undefined;
@@ -350,34 +400,95 @@ export class ConversationOrchestrator {
       return;
     }
 
+    const trace = this.#createRequestTrace(message);
+    this.#emitRequestStatus(trace, "received");
+    if (this.#shuttingDown) {
+      this.#emitRequestStatus(trace, "shutdown_discarded", {
+        reason: "shutdown",
+      });
+      return;
+    }
+    if (!this.#state.claimMessage(message.msgId, message.conversationKey)) {
+      this.#emitRequestStatus(trace, "duplicate_ignored");
+      return;
+    }
+
+    const request: PendingRequest = {
+      message,
+      messages: [message],
+      traces: [trace],
+    };
     if (!this.#codex.ready) {
-      await this.#output.send(
-        message,
-        "Codex App Server 暂不可用，请稍后重试。",
+      this.#emitRequestStatuses(request, "runtime_unavailable");
+      await this.#sendRequestReply(
+        request,
+        () =>
+          this.#output.send(
+            message,
+            "Codex App Server 暂不可用，请稍后重试。",
+          ),
       );
+      this.#emitRequestStatuses(request, "completed", {
+        reason: "runtime_unavailable",
+      });
       return;
     }
 
     const slot = this.#slot(message.conversationKey);
-    if (command === "/new") {
-      const superseded = slot.pending ??
-        (isSupersedable(slot.current) ? slot.current : undefined);
-      slot.pending = undefined;
-      slot.resetPending = message;
-      if (superseded) {
-        this.#emitRequestStatus(superseded, "superseded", {
-          reason: "reset",
-        });
+    if (this.#messageDebounceMs > 0) {
+      await this.#debounceMessage(
+        message.conversationKey,
+        slot,
+        message,
+        trace,
+      );
+    } else {
+      await this.#enqueueRequest(message.conversationKey, slot, request);
+    }
+  }
+
+  async #stopConversation(message: RoutedText): Promise<void> {
+    const slot = this.#slots.get(message.conversationKey);
+    const hasWork = Boolean(
+      slot?.debounce || slot?.pending || slot?.resetPending || slot?.current ||
+        slot?.active || slot?.control,
+    );
+
+    if (slot) {
+      const debounce = this.#cancelDebounce(slot);
+      if (debounce) {
+        this.#emitRequestStatuses(
+          this.#requestFromBatch(debounce),
+          "interrupted",
+          { reason: "stop" },
+        );
       }
+      const pending = slot.pending;
+      slot.pending = undefined;
+      slot.resetPending = undefined;
+      if (pending) {
+        this.#emitRequestStatuses(pending, "interrupted", { reason: "stop" });
+      }
+
+      if (slot.active) {
+        slot.active.stopRequested = true;
+        this.#requestInterrupt(slot, undefined, "stop");
+      } else if (slot.control) {
+        if (isSupersedable(slot.current)) {
+          this.#emitRequestStatuses(slot.current, "interrupted", {
+            reason: "stop",
+          });
+        }
+        slot.control.forceComplete({ status: "interrupted" });
+      }
+
+      this.#deleteSlotIfIdle(message.conversationKey, slot);
     }
 
-    if (isInterruptible(slot.active)) this.#requestInterrupt(slot);
-    if (!slot.drain) {
-      slot.drain = this.#drain(message.conversationKey, slot).finally(() => {
-        slot.drain = undefined;
-      });
-    }
-    await slot.drain;
+    await this.#output.send(
+      message,
+      hasWork ? "已停止当前任务。" : "当前没有正在执行或等待的任务。",
+    );
   }
 
   async handleUnsupported(
@@ -399,17 +510,25 @@ export class ConversationOrchestrator {
     this.#shuttingDown = true;
     for (const slot of this.#slots.values()) {
       this.#clearInterruptRetry(slot);
+      const debounce = this.#cancelDebounce(slot);
       const pending = slot.pending;
       const current = isSupersedable(slot.current) ? slot.current : undefined;
       slot.pending = undefined;
       slot.resetPending = undefined;
+      if (debounce) {
+        this.#emitRequestStatuses(
+          this.#requestFromBatch(debounce),
+          "shutdown_discarded",
+          { reason: "shutdown" },
+        );
+      }
       if (pending) {
-        this.#emitRequestStatus(pending, "shutdown_discarded", {
+        this.#emitRequestStatuses(pending, "shutdown_discarded", {
           reason: "shutdown",
         });
       }
       if (current) {
-        this.#emitRequestStatus(current, "shutdown_discarded", {
+        this.#emitRequestStatuses(current, "shutdown_discarded", {
           reason: "shutdown",
         });
       }
@@ -448,6 +567,128 @@ export class ConversationOrchestrator {
     return slot;
   }
 
+  #deleteSlotIfIdle(
+    conversationKey: ConversationKey,
+    slot: ConversationSlot,
+  ): void {
+    if (
+      this.#slots.get(conversationKey) === slot && !slot.active &&
+      !slot.control && !slot.current && !slot.pending && !slot.resetPending &&
+      !slot.debounce
+    ) {
+      this.#slots.delete(conversationKey);
+    }
+  }
+
+  async #debounceMessage(
+    conversationKey: ConversationKey,
+    slot: ConversationSlot,
+    message: RoutedText,
+    trace: RequestTrace,
+  ): Promise<void> {
+    let batch = slot.debounce;
+    if (!batch) {
+      const completion = Promise.withResolvers<void>();
+      batch = {
+        messages: [],
+        traces: [],
+        completion: completion.promise,
+        resolve: completion.resolve,
+        reject: completion.reject,
+      };
+      slot.debounce = batch;
+    }
+    batch.messages.push(message);
+    batch.traces.push(trace);
+    if (batch.timer !== undefined) {
+      this.#messageDebounceTimers.clearTimeout(batch.timer);
+    }
+    const timer = this.#messageDebounceTimers.setTimeout(() => {
+      if (slot.debounce !== batch || batch.timer !== timer) return;
+      void this.#flushDebounce(conversationKey, slot, batch!).then(
+        batch!.resolve,
+        batch!.reject,
+      );
+    }, this.#messageDebounceMs);
+    batch.timer = timer;
+    await batch.completion;
+  }
+
+  async #flushDebounce(
+    conversationKey: ConversationKey,
+    slot: ConversationSlot,
+    batch: DebounceBatch,
+  ): Promise<void> {
+    if (slot.debounce !== batch) return;
+    slot.debounce = undefined;
+    batch.timer = undefined;
+    const request = this.#requestFromBatch(batch);
+    if (this.#shuttingDown) {
+      this.#emitRequestStatuses(request, "shutdown_discarded", {
+        reason: "shutdown",
+      });
+      this.#deleteSlotIfIdle(conversationKey, slot);
+      return;
+    }
+    if (!this.#codex.ready) {
+      this.#emitRequestStatuses(request, "runtime_unavailable");
+      try {
+        await this.#sendRequestReply(
+          request,
+          () =>
+            this.#output.send(
+              request.message,
+              "Codex App Server 暂不可用，请稍后重试。",
+            ),
+        );
+        this.#emitRequestStatuses(request, "completed", {
+          reason: "runtime_unavailable",
+        });
+      } finally {
+        this.#deleteSlotIfIdle(conversationKey, slot);
+      }
+      return;
+    }
+    await this.#enqueueRequest(conversationKey, slot, request);
+  }
+
+  #cancelDebounce(slot: ConversationSlot): DebounceBatch | undefined {
+    const batch = slot.debounce;
+    if (!batch) return;
+    slot.debounce = undefined;
+    if (batch.timer !== undefined) {
+      this.#messageDebounceTimers.clearTimeout(batch.timer);
+      batch.timer = undefined;
+    }
+    batch.resolve();
+    return batch;
+  }
+
+  async #enqueueRequest(
+    conversationKey: ConversationKey,
+    slot: ConversationSlot,
+    request: PendingRequest,
+  ): Promise<void> {
+    const superseded = slot.pending ??
+      (isSupersedable(slot.current) ? slot.current : undefined);
+    slot.pending = request;
+    if (superseded) {
+      this.#emitRequestStatuses(superseded, "superseded", {
+        replacedByMsgId: request.message.msgId,
+      });
+    }
+    this.#emitRequestStatuses(request, "queued");
+    if (isInterruptible(slot.active)) {
+      this.#requestInterrupt(slot, request.message.msgId);
+    }
+    if (!slot.drain) {
+      slot.drain = this.#drain(conversationKey, slot).finally(() => {
+        slot.drain = undefined;
+      });
+    }
+    await slot.drain;
+  }
+
   async #drain(
     conversationKey: ConversationKey,
     slot: ConversationSlot,
@@ -468,43 +709,38 @@ export class ConversationOrchestrator {
         continue;
       }
 
-      const trace = slot.pending!;
+      const request = slot.pending!;
       slot.pending = undefined;
-      slot.current = trace;
+      slot.current = request;
       const control = this.#createTurnControl();
       slot.control = control;
       try {
-        await this.#runTurn(trace, slot, control);
+        await this.#runTurn(request, slot, control);
       } catch (error) {
-        if (!trace.terminal) {
+        if (hasLiveTraces(request)) {
           const failure = errorMessage(error);
           try {
             await this.#sendRequestWithForce(
               control,
-              trace,
+              request,
               `任务启动失败：${failure}`,
               true,
             );
           } catch {
             // Continue draining newer work when the fallback cannot be sent.
           }
-          this.#emitRequestStatus(trace, "failed", { error: failure });
+          this.#emitRequestStatuses(request, "failed", { error: failure });
         }
       } finally {
         if (slot.active?.control === control) {
           this.#clearActive(slot, slot.active);
         }
         if (slot.control === control) slot.control = undefined;
-        if (slot.current === trace) slot.current = undefined;
+        if (slot.current === request) slot.current = undefined;
       }
     }
 
-    if (
-      !slot.active && !slot.control && !slot.current && !slot.pending &&
-      !slot.resetPending
-    ) {
-      this.#slots.delete(conversationKey);
-    }
+    this.#deleteSlotIfIdle(conversationKey, slot);
   }
 
   async #resetConversation(
@@ -532,22 +768,37 @@ export class ConversationOrchestrator {
   }
 
   async #runTurn(
-    trace: RequestTrace,
+    request: PendingRequest,
     slot: ConversationSlot,
     control: TurnControl,
   ): Promise<void> {
-    const message = trace.message;
-    const threadId = await this.#ensureThread(trace, control);
+    const message = request.message;
+    const threadId = await this.#ensureThread(request, control);
     if (threadId === undefined) return;
 
     // A newer message that arrived while loading the thread wins before any
     // model work is started.
-    if (this.#shuttingDown || slot.resetPending || slot.pending) return;
+    if (
+      !hasLiveTraces(request) || control.forced || this.#shuttingDown ||
+      slot.resetPending || slot.pending
+    ) return;
 
-    const progress = await this.#output.startProgress(message);
+    const prompt = buildCodexPrompt({
+      chatType: message.chatType,
+      conversationKey: message.conversationKey,
+      messages: request.messages.map((item) => ({
+        senderUserId: item.senderUserId,
+        msgId: item.msgId,
+        content: item.text,
+        quote: item.quote,
+      })),
+    });
+    const progress = await this.#startProgressWithForce(message, control);
+    if (progress === undefined) return;
     const turnOutput = this.#createTurnOutput(message, progress);
     if (
-      trace.terminal || this.#shuttingDown || slot.resetPending || slot.pending
+      !hasLiveTraces(request) || control.forced || this.#shuttingDown ||
+      slot.resetPending || slot.pending
     ) {
       await this.#finishTurnOutput(turnOutput, undefined, control);
       return;
@@ -563,30 +814,25 @@ export class ConversationOrchestrator {
       throw error;
     }
     if (
-      trace.terminal || this.#shuttingDown || slot.resetPending || slot.pending
+      !hasLiveTraces(request) || control.forced || this.#shuttingDown ||
+      slot.resetPending || slot.pending
     ) {
       await this.#finishTurnOutput(turnOutput, undefined, control);
       return;
     }
-    const prompt = buildCodexPrompt({
-      chatType: message.chatType,
-      conversationKey: message.conversationKey,
-      senderUserId: message.senderUserId,
-      msgId: message.msgId,
-      content: message.text,
-    });
 
     const active: ActiveTurn = {
       threadId,
-      trace,
+      request,
       turnOutput,
       control,
       shutdownRequested: false,
+      stopRequested: false,
       interruptWhenReady: false,
       lateInterruptRequested: false,
       interruptStatusEmitted: false,
     };
-    trace.phase = "turn";
+    this.#setRequestPhase(request, "turn");
     slot.active = active;
     slot.interruptRequested = false;
     slot.interruptFailures = 0;
@@ -599,7 +845,7 @@ export class ConversationOrchestrator {
     }
 
     let start: Promise<CodexTurnHandle>;
-    this.#emitRequestStatus(trace, "turn_starting");
+    this.#emitRequestStatuses(request, "turn_starting");
     try {
       start = this.#codex.startTurn(
         threadId,
@@ -621,7 +867,7 @@ export class ConversationOrchestrator {
       })),
     ]);
     if (startResult.type === "forced") {
-      trace.phase = "reply";
+      this.#setRequestPhase(request, "reply");
       this.#observeLateStart(active, start);
       try {
         await this.#finishTurnOutput(turnOutput, {
@@ -631,17 +877,22 @@ export class ConversationOrchestrator {
         }, control);
       } finally {
         this.#clearActive(slot, active);
-        this.#emitForcedOutcome(trace, startResult.outcome);
+        this.#emitForcedOutcome(request, startResult.outcome);
       }
       return;
     }
 
     if (startResult.type === "error") {
-      trace.phase = "reply";
+      this.#setRequestPhase(request, "reply");
       try {
         await this.#finishTurnOutput(turnOutput, undefined, control);
       } finally {
         this.#clearActive(slot, active);
+      }
+      if (active.stopRequested) {
+        this.#emitRequestStatuses(request, "reply_skipped", { reason: "stop" });
+        this.#emitRequestStatuses(request, "interrupted", { reason: "stop" });
+        return;
       }
       throw startResult.error;
     }
@@ -649,10 +900,10 @@ export class ConversationOrchestrator {
     const handle = startResult.handle;
 
     active.turnId = handle.turnId;
-    trace.turnId = handle.turnId;
+    this.#setRequestTurnId(request, handle.turnId);
     if (active.interruptWhenReady) this.#requestInterrupt(slot);
     if (control.forced) {
-      trace.phase = "reply";
+      this.#setRequestPhase(request, "reply");
       void handle.completion.catch(() => undefined);
       const forcedOutcome = await control.forceSignal;
       try {
@@ -663,7 +914,7 @@ export class ConversationOrchestrator {
         }, control);
       } finally {
         this.#clearActive(slot, active);
-        this.#emitForcedOutcome(trace, forcedOutcome);
+        this.#emitForcedOutcome(request, forcedOutcome);
       }
       return;
     }
@@ -676,7 +927,7 @@ export class ConversationOrchestrator {
         }, control);
       }
       this.#state.beginTurn(message.conversationKey, handle.turnId);
-      this.#emitRequestStatus(trace, "running");
+      this.#emitRequestStatuses(request, "running");
     } catch (error) {
       this.#requestInterrupt(slot);
       let interruptedOutcome: TurnOutcome;
@@ -691,8 +942,8 @@ export class ConversationOrchestrator {
           error: errorMessage(completionError),
         };
       }
-      trace.phase = "reply";
-      this.#emitRequestStatus(trace, "turn_completed", {
+      this.#setRequestPhase(request, "reply");
+      this.#emitRequestStatuses(request, "turn_completed", {
         reason: interruptedOutcome.status,
         ...(interruptedOutcome.error
           ? { error: interruptedOutcome.error }
@@ -708,9 +959,16 @@ export class ConversationOrchestrator {
         this.#clearActive(slot, active);
       }
       void handle.completion.catch(() => undefined);
+      if (active.stopRequested) {
+        this.#emitRequestStatuses(request, "reply_skipped", { reason: "stop" });
+        this.#emitRequestStatuses(request, "interrupted", { reason: "stop" });
+        return;
+      }
       throw error;
     }
-    if (slot.resetPending || slot.pending) this.#requestInterrupt(slot);
+    if (slot.resetPending || slot.pending) {
+      this.#requestInterrupt(slot);
+    }
 
     let outcome: TurnOutcome;
     try {
@@ -718,64 +976,95 @@ export class ConversationOrchestrator {
     } catch (error) {
       outcome = { status: "failed", error: errorMessage(error) };
     }
-    trace.phase = "reply";
+    this.#setRequestPhase(request, "reply");
     const superseded = Boolean(slot.resetPending || slot.pending);
-    this.#emitRequestStatus(trace, "turn_completed", {
+    this.#emitRequestStatuses(request, "turn_completed", {
       reason: outcome.status,
       ...(outcome.error ? { error: outcome.error } : {}),
     });
 
+    let replyFailed = false;
+    let replyError: unknown;
     try {
       await this.#finishTurnOutput(turnOutput, {
         tag: "TURN",
-        body: outcome.status,
+        body: active.stopRequested ? "interrupted" : outcome.status,
         delivery: "progress",
       }, control);
+
+      if (
+        outcome.status === "completed" && outcome.finalAnswer &&
+        !superseded && !active.stopRequested && !this.#shuttingDown
+      ) {
+        await this.#sendRequestWithForce(
+          control,
+          request,
+          outcome.finalAnswer,
+          true,
+          active,
+        );
+      } else if (
+        outcome.status === "failed" && !superseded &&
+        !active.stopRequested && !this.#shuttingDown
+      ) {
+        await this.#sendRequestWithForce(
+          control,
+          request,
+          `Codex 执行失败：${outcome.error ?? "unknown error"}`,
+          true,
+          active,
+        );
+      } else {
+        const reason = active.stopRequested
+          ? "stop"
+          : superseded
+          ? "superseded"
+          : this.#shuttingDown
+          ? "shutdown"
+          : outcome.status === "completed"
+          ? "no_final_answer"
+          : outcome.status;
+        this.#emitRequestStatuses(request, "reply_skipped", { reason });
+      }
+    } catch (error) {
+      replyFailed = true;
+      replyError = error;
+    } finally {
+      const stopped = active.stopRequested;
       try {
         this.#state.finishTurn(
           message.conversationKey,
           handle.turnId,
-          outcome.status,
-          outcome.error ?? null,
+          stopped ? "interrupted" : outcome.status,
+          stopped ? null : outcome.error ?? null,
         );
       } catch (error) {
         this.#report(error);
       }
-    } finally {
       this.#clearActive(slot, active);
     }
 
-    if (
-      outcome.status === "completed" && outcome.finalAnswer && !superseded &&
-      !this.#shuttingDown
-    ) {
-      await this.#sendRequestWithForce(
-        control,
-        trace,
-        outcome.finalAnswer,
-        true,
-      );
-    } else if (
-      outcome.status === "failed" && !superseded && !this.#shuttingDown
-    ) {
-      await this.#sendRequestWithForce(
-        control,
-        trace,
-        `Codex 执行失败：${outcome.error ?? "unknown error"}`,
-        true,
-      );
-    } else {
-      const reason = superseded
-        ? "superseded"
-        : this.#shuttingDown
-        ? "shutdown"
-        : outcome.status === "completed"
-        ? "no_final_answer"
-        : outcome.status;
-      this.#emitRequestStatus(trace, "reply_skipped", { reason });
+    if (active.stopRequested) {
+      if (hasLiveTraces(request)) {
+        if (replyFailed) {
+          this.#emitRequestStatuses(request, "reply_skipped", {
+            reason: "stop",
+          });
+        }
+        this.#emitRequestStatuses(request, "interrupted", { reason: "stop" });
+      }
+      return;
     }
-    this.#emitRequestStatus(
-      trace,
+    if (replyFailed) {
+      if (hasLiveTraces(request)) {
+        this.#emitRequestStatuses(request, "failed", {
+          error: errorMessage(replyError),
+        });
+      }
+      return;
+    }
+    this.#emitRequestStatuses(
+      request,
       outcomeRequestStatus(outcome.status),
       outcome.error ? { error: outcome.error } : {},
     );
@@ -790,7 +1079,11 @@ export class ConversationOrchestrator {
       progress,
       progressWritten: false,
       progressEndsWithLineBreak: false,
-      pipeline: new TurnOutputPipeline(this.#outputSettings),
+      pipeline: new TurnOutputPipeline(
+        message.chatType === "group"
+          ? this.#groupOutputSettings
+          : this.#outputSettings,
+      ),
       activityTail: Promise.resolve(),
       acceptingActivities: true,
       finished: false,
@@ -832,6 +1125,36 @@ export class ConversationOrchestrator {
     ]);
   }
 
+  async #startProgressWithForce(
+    message: RoutedText,
+    control: TurnControl,
+  ): Promise<ProgressHandle | undefined> {
+    let pending: Promise<ProgressHandle>;
+    try {
+      pending = Promise.resolve(this.#output.startProgress(message));
+    } catch (error) {
+      pending = Promise.reject(error);
+    }
+    const result = await Promise.race([
+      pending.then(
+        (value) => ({ type: "value" as const, value }),
+        (error) => ({ type: "error" as const, error }),
+      ),
+      control.forceSignal.then(() => ({ type: "forced" as const })),
+    ]);
+    if (result.type === "error") throw result.error;
+    if (result.type === "value") return result.value;
+
+    void pending.then(async (progress) => {
+      await this.#finishTurnOutput(
+        this.#createTurnOutput(message, progress),
+        undefined,
+        control,
+      );
+    }, () => undefined).catch((error) => this.#report(error));
+    return undefined;
+  }
+
   async #sendWithForce(
     control: TurnControl,
     message: RoutedMessage,
@@ -858,56 +1181,61 @@ export class ConversationOrchestrator {
 
   async #sendRequestWithForce(
     control: TurnControl,
-    trace: RequestTrace,
+    request: PendingRequest,
     text: string,
     final = false,
+    active?: ActiveTurn,
   ): Promise<void> {
-    trace.phase = "reply";
+    this.#setRequestPhase(request, "reply");
     if (control.forced) {
-      this.#emitRequestStatus(trace, "reply_skipped", {
+      this.#emitRequestStatuses(request, "reply_skipped", {
         reason: "shutdown",
       });
       return;
     }
-    this.#emitRequestStatus(trace, "reply_sending");
+    this.#emitRequestStatuses(request, "reply_sending");
     let result: SendWithForceResult;
     try {
       result = await this.#sendWithForce(
         control,
-        trace.message,
+        request.message,
         text,
         final,
       );
     } catch (error) {
-      this.#emitRequestStatus(trace, "failed", {
-        error: errorMessage(error),
-      });
+      this.#emitRequestStatuses(
+        request,
+        active?.stopRequested ? "interrupted" : "failed",
+        active?.stopRequested
+          ? { reason: "stop" }
+          : { error: errorMessage(error) },
+      );
       throw error;
     }
     if (result === "forced") {
-      this.#emitRequestStatus(trace, "reply_skipped", {
+      this.#emitRequestStatuses(request, "reply_skipped", {
         reason: "shutdown",
       });
     } else {
-      this.#emitRequestStatus(trace, "reply_sent");
+      this.#emitRequestStatuses(request, "reply_sent");
     }
   }
 
   async #sendRequestReply(
-    trace: RequestTrace,
+    request: PendingRequest,
     send: () => Promise<void>,
   ): Promise<void> {
-    trace.phase = "reply";
-    this.#emitRequestStatus(trace, "reply_sending");
+    this.#setRequestPhase(request, "reply");
+    this.#emitRequestStatuses(request, "reply_sending");
     try {
       await send();
     } catch (error) {
-      this.#emitRequestStatus(trace, "failed", {
+      this.#emitRequestStatuses(request, "failed", {
         error: errorMessage(error),
       });
       throw error;
     }
-    this.#emitRequestStatus(trace, "reply_sent");
+    this.#emitRequestStatuses(request, "reply_sent");
   }
 
   #clearActive(slot: ConversationSlot, active: ActiveTurn): void {
@@ -1051,21 +1379,22 @@ export class ConversationOrchestrator {
   async #startAndBindThread(
     message: RoutedText,
     control: TurnControl,
-    trace?: RequestTrace,
+    request?: PendingRequest,
   ): Promise<string | undefined> {
-    if (trace) this.#emitRequestStatus(trace, "thread_starting");
+    if (request) this.#emitRequestStatuses(request, "thread_starting");
     const started = await this.#raceWithForce(
       () => this.#codex.startThread(),
       control,
     );
     if (
-      started.type === "forced" || control.forced || this.#shuttingDown
+      started.type === "forced" || control.forced || this.#shuttingDown ||
+      (request !== undefined && !hasLiveTraces(request))
     ) return undefined;
     if (started.type === "error") throw started.error;
 
-    if (trace) {
-      trace.threadId = started.value;
-      this.#emitRequestStatus(trace, "thread_started");
+    if (request) {
+      this.#setRequestThreadId(request, started.value);
+      this.#emitRequestStatuses(request, "thread_started");
     }
     this.#state.bindConversation(
       message.conversationKey,
@@ -1077,36 +1406,42 @@ export class ConversationOrchestrator {
   }
 
   async #ensureThread(
-    trace: RequestTrace,
+    request: PendingRequest,
     control: TurnControl,
   ): Promise<string | undefined> {
-    const message = trace.message;
+    const message = request.message;
     const existing = this.#state.getConversation(message.conversationKey);
     if (!existing) {
-      const threadId = await this.#startAndBindThread(message, control, trace);
+      const threadId = await this.#startAndBindThread(
+        message,
+        control,
+        request,
+      );
       if (threadId !== undefined) {
-        this.#emitRequestStatus(trace, "thread_ready");
+        this.#emitRequestStatuses(request, "thread_ready");
       }
       return threadId;
     }
 
-    trace.threadId = existing.threadId;
+    this.#setRequestThreadId(request, existing.threadId);
     if (
       this.#loadedThreads.get(existing.threadId) !== this.#codex.generation
     ) {
-      this.#emitRequestStatus(trace, "thread_resuming");
+      this.#emitRequestStatuses(request, "thread_resuming");
       const resumed = await this.#raceWithForce(
         () => this.#codex.resumeThread(existing.threadId),
         control,
       );
       if (
-        resumed.type === "forced" || control.forced || this.#shuttingDown
+        resumed.type === "forced" || control.forced || this.#shuttingDown ||
+        !hasLiveTraces(request)
       ) return undefined;
       if (resumed.type === "error") throw resumed.error;
-      this.#emitRequestStatus(trace, "thread_resumed");
+      this.#emitRequestStatuses(request, "thread_resumed");
       this.#loadedThreads.set(existing.threadId, this.#codex.generation);
     }
-    this.#emitRequestStatus(trace, "thread_ready");
+    if (!hasLiveTraces(request)) return undefined;
+    this.#emitRequestStatuses(request, "thread_ready");
     return existing.threadId;
   }
 
@@ -1119,13 +1454,54 @@ export class ConversationOrchestrator {
     };
   }
 
-  #emitForcedOutcome(trace: RequestTrace, outcome: TurnOutcome): void {
-    this.#emitRequestStatus(trace, "reply_skipped", { reason: "shutdown" });
-    this.#emitRequestStatus(
-      trace,
+  #requestFromBatch(batch: DebounceBatch): PendingRequest {
+    return {
+      message: batch.messages[batch.messages.length - 1],
+      messages: batch.messages,
+      traces: batch.traces,
+    };
+  }
+
+  #setRequestPhase(request: PendingRequest, phase: RequestPhase): void {
+    for (const trace of request.traces) {
+      if (!trace.terminal) trace.phase = phase;
+    }
+  }
+
+  #setRequestThreadId(request: PendingRequest, threadId: string): void {
+    for (const trace of request.traces) {
+      if (!trace.terminal) trace.threadId = threadId;
+    }
+  }
+
+  #setRequestTurnId(request: PendingRequest, turnId: string): void {
+    for (const trace of request.traces) {
+      if (!trace.terminal) trace.turnId = turnId;
+    }
+  }
+
+  #emitForcedOutcome(request: PendingRequest, outcome: TurnOutcome): void {
+    this.#emitRequestStatuses(request, "reply_skipped", { reason: "shutdown" });
+    this.#emitRequestStatuses(
+      request,
       outcomeRequestStatus(outcome.status),
       outcome.error ? { error: outcome.error } : {},
     );
+  }
+
+  #emitRequestStatuses(
+    request: PendingRequest,
+    state: RequestStatus,
+    details: RequestStatusDetails = {},
+  ): void {
+    const traces = request.traces.filter((trace) => !trace.terminal);
+    const terminal = TERMINAL_REQUEST_STATUSES.has(state);
+    if (terminal) {
+      for (const trace of traces) trace.terminal = true;
+    }
+    for (const trace of traces) {
+      this.#dispatchRequestStatus(trace, state, details, terminal);
+    }
   }
 
   #emitRequestStatus(
@@ -1136,6 +1512,15 @@ export class ConversationOrchestrator {
     if (trace.terminal) return;
     const terminal = TERMINAL_REQUEST_STATUSES.has(state);
     if (terminal) trace.terminal = true;
+    this.#dispatchRequestStatus(trace, state, details, terminal);
+  }
+
+  #dispatchRequestStatus(
+    trace: RequestTrace,
+    state: RequestStatus,
+    details: RequestStatusDetails,
+    terminal: boolean,
+  ): void {
     const counts = this.#requestCounts();
     let summary: string | undefined;
     if (state === "received") {
@@ -1172,9 +1557,12 @@ export class ConversationOrchestrator {
     let active = 0;
     let pending = 0;
     for (const slot of this.#slots.values()) {
-      const activeTrace = slot.current ?? slot.active?.trace;
-      if (activeTrace && !activeTrace.terminal) active++;
-      if (slot.pending || slot.resetPending) pending++;
+      const activeRequest = slot.current ?? slot.active?.request;
+      if (hasLiveTraces(activeRequest)) active++;
+      if (
+        slot.resetPending || hasLiveTraces(slot.pending) ||
+        slot.debounce?.traces.some((trace) => !trace.terminal)
+      ) pending++;
     }
     return { active, pending };
   }
@@ -1214,13 +1602,18 @@ export class ConversationOrchestrator {
     );
   }
 
-  #requestInterrupt(slot: ConversationSlot, triggerMsgId?: string): void {
+  #requestInterrupt(
+    slot: ConversationSlot,
+    triggerMsgId?: string,
+    reason?: string,
+  ): void {
     const active = slot.active;
     if (!isInterruptible(active)) return;
     if (!active.interruptStatusEmitted) {
       active.interruptStatusEmitted = true;
-      this.#emitRequestStatus(active.trace, "interrupt_requested", {
+      this.#emitRequestStatuses(active.request, "interrupt_requested", {
         ...(triggerMsgId ? { triggerMsgId } : {}),
+        ...(reason ? { reason } : {}),
       });
     }
     if (!active.turnId) {
@@ -1242,7 +1635,10 @@ export class ConversationOrchestrator {
           this.#report(activityError)
         );
         slot.interruptRequested = false;
-        if (this.#shuttingDown || (!slot.pending && !slot.resetPending)) return;
+        if (
+          this.#shuttingDown ||
+          (!active.stopRequested && !slot.pending && !slot.resetPending)
+        ) return;
 
         const delay = this.#interruptRetryDelaysMs[slot.interruptFailures++];
         if (delay === undefined) return;
@@ -1277,7 +1673,9 @@ export class ConversationOrchestrator {
       `thread: \`${record?.threadId ?? "not bound"}\``,
       `codex: ${this.#codex.ready ? "ready" : "unavailable"}`,
       `turn: ${slot?.active ? "in_progress" : record?.lastStatus ?? "idle"}`,
-      `queued: ${slot?.pending || slot?.resetPending ? "yes" : "no"}`,
+      `queued: ${
+        slot?.debounce || slot?.pending || slot?.resetPending ? "yes" : "no"
+      }`,
       record?.lastError ? `last_error: ${record.lastError}` : "",
     ].filter(Boolean).join("\n");
   }

@@ -92,6 +92,7 @@ const orchestrator = new ConversationOrchestrator({
   output,
   workspace: config.workspace,
   outputSettings: config.outputSettings,
+  groupOutputSettings: config.groupOutputSettings,
   onError: (error) => requestLogger.error({ error }, "error"),
   onRequestStatus: (event) => logRequestStatus(requestLogger, event),
   summarizeRequest: (text) => summarizeRequest(text, [config.botSecret]),
