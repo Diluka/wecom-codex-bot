@@ -389,6 +389,25 @@ describe("ConversationOrchestrator", () => {
     await running;
   });
 
+  it("does not open progress when quoted content cannot be serialized", async () => {
+    const { codex, orchestrator, output } = setup();
+    const request = {
+      ...message("group:engineering", "m-invalid-quote", "处理这个", "bob"),
+      quote: () => undefined,
+    };
+
+    await orchestrator.handleText(request);
+
+    assertEquals(codex.starts.length, 0);
+    assertEquals(output.progress, []);
+    assertEquals(output.sent.length, 1);
+    assertMatch(
+      output.sent[0].text,
+      /任务启动失败：quote must be JSON-serializable/,
+    );
+    assertEquals(output.sent[0].final, true);
+  });
+
   it("separates consecutive progress events in the final stream text", async () => {
     const state = new FakeState();
     const codex = new FakeCodex();
