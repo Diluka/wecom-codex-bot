@@ -28,7 +28,7 @@ OUTPUT_FORMAT_TOOL=individual
 
 ### 企业微信输出
 
-输出配置的全局默认值是：
+现有 `OUTPUT_*` 配置既是私聊配置，也是群聊的默认配置：
 
 ```dotenv
 OUTPUT_LEVEL=full
@@ -36,8 +36,8 @@ OUTPUT_LABEL=show
 OUTPUT_FORMAT_TOOL=individual
 ```
 
-`OUTPUT_LEVEL` 设置所有活动标签的全局输出级别。`OUTPUT_LEVEL_<TAG>`
-可单独覆盖一个标签，留空或未设置时继承全局值。两者都支持：
+`OUTPUT_LEVEL` 设置私聊和默认 profile 中所有活动标签的全局输出级别。
+`OUTPUT_LEVEL_<TAG>` 可单独覆盖一个标签，留空或未设置时继承全局值。两者都支持：
 
 | 值        | 行为                                                                                                         |
 | --------- | ------------------------------------------------------------------------------------------------------------ |
@@ -46,7 +46,8 @@ OUTPUT_FORMAT_TOOL=individual
 | `excerpt` | 输出一个来源流的前 800 个 Unicode 码点；超出时追加一次 `...`，并抑制该来源流的后续片段。                     |
 | `full`    | 保留原始文本，不截断正文。                                                                                   |
 
-支持以下 10 个标签；标签名同时也是 `OUTPUT_LEVEL_<TAG>` 和 `OUTPUT_LABEL_<TAG>`
+支持以下 10 个标签；标签名同时也是 `OUTPUT_LEVEL_<TAG>`、
+`OUTPUT_LABEL_<TAG>`、`OUTPUT_GROUP_LEVEL_<TAG>` 和 `OUTPUT_GROUP_LABEL_<TAG>`
 的后缀：
 
 | 标签          | 说明                                             |
@@ -89,6 +90,36 @@ OUTPUT_LEVEL_TOOL_RESULT=off
 OUTPUT_LABEL_TOOL=hide
 OUTPUT_FORMAT_TOOL=merge_same
 ```
+
+群聊可以用同构的 `OUTPUT_GROUP_*` 变量覆盖这份默认配置。所有群聊变量都留空或
+未设置时，群聊行为与当前私聊/默认配置逐项相同。输出级别和标签样式的优先级是：
+
+```text
+群聊标签级覆盖 > 群聊全局覆盖 > 私聊/默认标签级配置 > 私聊/默认全局配置 > 内置默认值
+```
+
+因此，群聊全局值会覆盖现有标签级配置，再由群聊标签级值设置例外。工具格式的
+优先级是 `OUTPUT_GROUP_FORMAT_TOOL > OUTPUT_FORMAT_TOOL > individual`。例如，让
+群聊整体显示更少、但保留警告和错误：
+
+```dotenv
+OUTPUT_GROUP_LEVEL=off
+OUTPUT_GROUP_LEVEL_WARNING=line
+OUTPUT_GROUP_LEVEL_ERROR=full
+```
+
+也可以让群聊比私聊显示更多，同时改变标签和工具聚合方式：
+
+```dotenv
+OUTPUT_LEVEL=off
+OUTPUT_GROUP_LEVEL=line
+OUTPUT_GROUP_LEVEL_CONTENT=full
+OUTPUT_GROUP_LABEL=hide
+OUTPUT_GROUP_FORMAT_TOOL=merge_same
+```
+
+不需要配置 `OUTPUT_SINGLE_*`：私聊始终使用现有 `OUTPUT_*`。配置只在进程启动时
+读取，修改 `.env` 后需要重启机器人。
 
 直发消息不经过上述级别和标签过滤。即使所有输出级别均为 `off`，最终回答、
 `/help`、`/status`、不支持消息类型的提示、用户输入请求和直接失败消息仍会发送。
