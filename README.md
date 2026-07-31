@@ -289,15 +289,20 @@ docker compose down
 - `/new`：中断当前任务并为当前聊天新建 Codex 会话
 - `/stop`：停止当前聊天正在执行或等待的任务，但保留现有 Codex thread
 - `/status`：查看当前聊天的 thread、模型、推理强度和 turn 状态
-- `/model [model-id]`：查看可选模型，或切换模型并保存为新会话默认值
-- `/effort [level]`：查看当前模型支持的推理强度，或切换并保存为新会话默认值
+- `/model`：查看当前模型和可选模型；`/model <model-id>` 仅机器人 owner
+  可切换模型并保存为新会话默认值
+- `/effort`：查看当前推理强度和可选强度；`/effort <level>` 仅机器人 owner
+  可切换强度并保存为新会话默认值
 - `/help`：显示命令帮助
 
 不带参数的 `/model` 会显示当前有效模型和 App Server 返回的模型目录；不带参数的
-`/effort` 会显示当前有效推理强度和当前模型支持的强度。带一个参数时，机器人会先
-校验目录：`/model <model-id>` 切换模型，如果原有推理强度不受新模型支持，会自动改
-为该模型的默认强度；`/effort <level>` 只接受当前模型支持的强度。多余参数只返回
-用法，不会成为 Codex prompt。
+`/effort` 会显示当前有效推理强度和当前模型支持的强度。这两种查询对所有 sender
+可用。带一个参数的修改命令只允许 `WECOM_OWNER_USER_ID` 配置的机器人 owner
+使用。owner 未配置、配置无效、sender 不匹配或大小写不一致时都会 fail closed。
+拒绝时不读取 thread，也不调用设置写入。授权成功后，机器人再校验目录：
+`/model <model-id>` 切换模型，如果原有推理强度不受新模型支持，会自动改为该模型的
+默认强度；`/effort <level>` 只接受当前模型支持的强度。多余参数只返回用法，不会
+成为 Codex prompt。
 
 如果聊天已绑定 thread，切换会先更新该 thread，再把相同设置写入 Codex 用户级
 config，作为新会话默认值；没有绑定 thread 时只写用户级默认值。thread 更新成功但

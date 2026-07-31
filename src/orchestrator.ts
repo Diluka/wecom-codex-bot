@@ -384,6 +384,9 @@ function settingsUpdateReply(
   return lines.join("\n");
 }
 
+const SETTINGS_MUTATION_DENIED =
+  "权限不足：只有机器人 owner 可以修改模型或推理强度；不带参数的 `/model` 和 `/effort` 仍可查询。";
+
 const HELP = [
   "可用命令：",
   "- `/new`：中断当前任务并新建 Codex 会话",
@@ -609,6 +612,14 @@ export class ConversationOrchestrator {
           ? "用法：`/model <model-id>`"
           : "用法：`/effort <level>`",
       );
+      return;
+    }
+    if (
+      command.value !== undefined &&
+      classifyRequestAuthority(this.#ownerUserId, [message.senderUserId]) !==
+        "owner"
+    ) {
+      await this.#output.send(message, SETTINGS_MUTATION_DENIED);
       return;
     }
 

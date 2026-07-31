@@ -731,8 +731,157 @@ describe("ConversationOrchestrator", () => {
     assertEquals(codex.startTurnAttempts, 0);
     assertEquals(requestEvents, []);
   });
+});
+
+describe("ConversationOrchestrator settings authorization", () => {
+  it("fails closed settings mutations when owner config is missing or invalid", async () => {
+    for (const ownerUserId of [undefined, "owner.team\nadmin"]) {
+      const { codex, orchestrator, output, state } = setup({ ownerUserId });
+
+      await orchestrator.handleText(
+        message("single:alice", "model", "/model gpt-b"),
+      );
+      await orchestrator.handleText(
+        message("single:alice", "effort", "/effort low"),
+      );
+
+      assertEquals(codex.modelChanges, []);
+      assertEquals(codex.effortChanges, []);
+      assertEquals(state.conversationLookups, []);
+      assertEquals(output.sent.length, 2);
+      for (const reply of output.sent) {
+        assertEquals(
+          reply.text,
+          "权限不足：只有机器人 owner 可以修改模型或推理强度；不带参数的 `/model` 和 `/effort` 仍可查询。",
+        );
+      }
+    }
+  });
+  it("authorizes private settings mutations only for the exact owner sender", async () => {
+    const nonOwner = setup({ ownerUserId: "owner.team" });
+    await nonOwner.orchestrator.handleText(
+      message("single:alice", "non-owner", "/model gpt-b", "alice"),
+    );
+    assertEquals(nonOwner.codex.modelChanges, []);
+    assertEquals(nonOwner.output.sent[0].text.includes("owner.team"), false);
+
+    const wrongCase = setup({ ownerUserId: "Owner.Team" });
+    await wrongCase.orchestrator.handleText(
+      message(
+        "single:owner.team",
+        "wrong-case",
+        "/effort low",
+        "owner.team",
+      ),
+    );
+    assertEquals(wrongCase.codex.effortChanges, []);
+
+    const exactOwner = setup({ ownerUserId: "  owner.team  " });
+    await exactOwner.orchestrator.handleText(
+      message(
+        "single:owner.team",
+        "exact-owner",
+        "/model gpt-b",
+        "owner.team",
+      ),
+    );
+    assertEquals(exactOwner.codex.modelChanges, [{
+      threadId: undefined,
+      model: "gpt-b",
+    }]);
+  });
+  it("rejects a non-owner group mutation but permits the owner's direct command", async () => {
+    const { codex, orchestrator, output } = setup({
+      ownerUserId: "owner.team",
+    });
+
+    await orchestrator.handleText(
+      message("group:engineering", "non-owner", "/model gpt-b", "alice"),
+    );
+    assertEquals(codex.modelChanges, []);
+
+    await orchestrator.handleText(
+      message(
+        "group:engineering",
+        "owner",
+        "/effort low",
+        "owner.team",
+      ),
+    );
+
+    assertEquals(codex.effortChanges, [{ threadId: undefined, effort: "low" }]);
+    assertEquals(output.sent.map(({ msgId }) => msgId), ["non-owner", "owner"]);
+    assertEquals(codex.starts, []);
+  });
+  it("keeps restricted settings queries and malformed usage read-only", async () => {
+    const { codex, orchestrator, output } = setup();
+
+    await orchestrator.handleText(
+      message("single:alice", "model-query", "/model"),
+    );
+    await orchestrator.handleText(
+      message("single:alice", "effort-query", "/effort"),
+    );
+    await orchestrator.handleText(
+      message("single:alice", "bad-model", "/model gpt-a extra"),
+    );
+    await orchestrator.handleText(
+      message("single:alice", "bad-effort", "/effort high extra"),
+    );
+
+    assertEquals(codex.settingsLookups, [undefined, undefined]);
+    assertEquals(codex.modelChanges, []);
+    assertEquals(codex.effortChanges, []);
+    assertEquals(
+      output.sent.find(({ msgId }) => msgId === "bad-model")?.text,
+      "用法：`/model <model-id>`",
+    );
+    assertEquals(
+      output.sent.find(({ msgId }) => msgId === "bad-effort")?.text,
+      "用法：`/effort <level>`",
+    );
+  });
+  it("sends one direct denial without leaking owner ID or affecting the active turn", async () => {
+    const { codex, orchestrator, output } = setup({
+      ownerUserId: "owner.team",
+    });
+    const running = orchestrator.handleText(
+      message("single:mallory", "work", "work", "mallory"),
+    );
+    await waitFor(() => codex.starts.length === 1);
+    const startTurnAttempts = codex.startTurnAttempts;
+
+    const unauthorized = message(
+      "single:mallory",
+      "unauthorized",
+      "/model gpt-b",
+      "mallory",
+    );
+    await orchestrator.handleText(unauthorized);
+    await orchestrator.handleText(unauthorized);
+
+    assertEquals(codex.startTurnAttempts, startTurnAttempts);
+    assertEquals(codex.interrupts, []);
+    assertEquals(codex.modelChanges, []);
+    assertEquals(codex.effortChanges, []);
+    assertEquals(output.sent, [{
+      msgId: "unauthorized",
+      text:
+        "权限不足：只有机器人 owner 可以修改模型或推理强度；不带参数的 `/model` 和 `/effort` 仍可查询。",
+      final: false,
+    }]);
+    assertEquals(output.sent[0].text.includes("owner.team"), false);
+
+    codex.starts[0].resolve({ status: "completed" });
+    await running;
+  });
+});
+
+describe("ConversationOrchestrator", () => {
   it("switches model and effort for a bound conversation", async () => {
-    const { codex, orchestrator, output, state } = setup();
+    const { codex, orchestrator, output, state } = setup({
+      ownerUserId: "alice",
+    });
     state.bindConversation("single:alice", "single", "thread-existing");
     codex.nextSettingsResult = {
       status: "updated",
@@ -779,7 +928,7 @@ describe("ConversationOrchestrator", () => {
     assertEquals(codex.starts.length, 0);
   });
   it("saves an unbound model switch as the global default", async () => {
-    const { codex, orchestrator, output } = setup();
+    const { codex, orchestrator, output } = setup({ ownerUserId: "alice" });
 
     await orchestrator.handleText(
       message("single:alice", "model", "/model gpt-b"),
@@ -790,7 +939,7 @@ describe("ConversationOrchestrator", () => {
     assertEquals(codex.starts.length, 0);
   });
   it("keeps an active turn on its old settings while switching the next task", async () => {
-    const { codex, orchestrator, output } = setup();
+    const { codex, orchestrator, output } = setup({ ownerUserId: "alice" });
     const running = orchestrator.handleText(
       message("single:alice", "work", "work"),
     );
@@ -820,7 +969,7 @@ describe("ConversationOrchestrator", () => {
     await running;
   });
   it("rejects unavailable model and effort values without starting turns", async () => {
-    const { codex, orchestrator, output } = setup();
+    const { codex, orchestrator, output } = setup({ ownerUserId: "alice" });
     codex.nextSettingsResult = {
       status: "invalid_model",
       availableModels: ["gpt-a", "gpt-b"],
@@ -849,7 +998,7 @@ describe("ConversationOrchestrator", () => {
     assertEquals(codex.starts.length, 0);
   });
   it("distinguishes partial thread success from complete persistence failure", async () => {
-    const bound = setup();
+    const bound = setup({ ownerUserId: "alice" });
     bound.state.bindConversation(
       "single:alice",
       "single",
@@ -872,7 +1021,7 @@ describe("ConversationOrchestrator", () => {
     assertMatch(bound.output.sent[0].text, /全局默认.*保存失败/);
     assertMatch(bound.output.sent[0].text, /config unavailable/);
 
-    const unbound = setup();
+    const unbound = setup({ ownerUserId: "alice" });
     unbound.codex.nextSettingsResult = {
       status: "updated",
       settings: { model: "gpt-a", effort: "low" },
@@ -888,7 +1037,9 @@ describe("ConversationOrchestrator", () => {
     assertEquals(unbound.output.sent[0].text, "设置未修改：defaults read-only");
   });
   it("reserves malformed settings commands and deduplicates mutations", async () => {
-    const { codex, orchestrator, output, requestEvents } = setup();
+    const { codex, orchestrator, output, requestEvents } = setup({
+      ownerUserId: "alice",
+    });
 
     await orchestrator.handleText(
       message("single:alice", "bad-model", "/model a b"),
@@ -3981,6 +4132,7 @@ describe("ConversationOrchestrator settings barriers", () => {
     const timers = new FakeTimers();
     const modelGate = Promise.withResolvers<void>();
     const { codex, orchestrator } = setup({
+      ownerUserId: "alice",
       messageDebounceMs: 3_000,
       messageDebounceTimers: timers,
     });
@@ -4013,6 +4165,7 @@ describe("ConversationOrchestrator settings barriers", () => {
     const timers = new FakeTimers();
     const modelGate = Promise.withResolvers<void>();
     const { codex, orchestrator } = setup({
+      ownerUserId: "alice",
       messageDebounceMs: 3_000,
       messageDebounceTimers: timers,
     });
@@ -4040,6 +4193,7 @@ describe("ConversationOrchestrator settings shutdown", () => {
     const lookupGate = Promise.withResolvers<void>();
     const reported: Error[] = [];
     const { codex, orchestrator, output, state } = setup({
+      ownerUserId: "alice",
       onError: (error: Error) => reported.push(error),
     });
     codex.settingsLookupGates.push(lookupGate.promise);
@@ -4078,7 +4232,9 @@ describe("ConversationOrchestrator settings shutdown", () => {
 
   it("discards a queued effort change behind a hanging model change", async () => {
     const modelGate = Promise.withResolvers<void>();
-    const { codex, orchestrator, output, state } = setup();
+    const { codex, orchestrator, output, state } = setup({
+      ownerUserId: "alice",
+    });
     codex.modelChangeGates.push(modelGate.promise);
     const model = orchestrator.handleText(
       message("single:alice", "model", "/model gpt-b"),
@@ -4115,6 +4271,7 @@ describe("ConversationOrchestrator settings shutdown", () => {
   it("releases a turn waiting on a hanging mutation when shutdown begins", async () => {
     const modelGate = Promise.withResolvers<void>();
     const { codex, orchestrator, output, state } = setup({
+      ownerUserId: "alice",
       shutdownGraceMs: 10_000,
     });
     codex.modelChangeGates.push(modelGate.promise);
