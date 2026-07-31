@@ -36,6 +36,12 @@ export class TurnOutputPipeline {
   apply(event: ActivityEvent): string | null {
     this.#releaseCompletedToolResultStream(event);
     if (event.delivery === "direct") return event.body ?? null;
+    if (
+      this.#settings.toolFormat === "summary" &&
+      (event.tag === "TOOL" || event.tag === "TOOL_RESULT")
+    ) {
+      return null;
+    }
 
     const aggregated = this.#aggregate(event);
     return aggregated ? this.#render(aggregated) : null;

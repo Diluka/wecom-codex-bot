@@ -67,21 +67,24 @@ OUTPUT_FORMAT_TOOL=individual
 时继承全局值。`show` 会添加生成的 `[tag]` 前缀，`hide` 只移除这个前缀，不删除或
 隐藏正文，也不改变输出级别。
 
-`OUTPUT_FORMAT_TOOL` 只选择工具生命周期的格式或聚合方式，默认 `individual`：
+`OUTPUT_FORMAT_TOOL` 选择工具输出格式，默认 `individual`：
 
 | 值           | 行为                                                                                                               |
 | ------------ | ------------------------------------------------------------------------------------------------------------------ |
 | `individual` | 每个工具调用分别显示启动与完成事件。                                                                               |
 | `merge_same` | 同一 turn 内相同工具的并发调用按工具身份聚合，只显示第一次启动和最后一次完成。                                     |
 | `merge_all`  | 将当前同时活动的所有工具聚合为一组；每组只显示首次启动和最后一次完成，引用计数归零后释放，之后启动的工具进入新组。 |
+| `summary`    | 保留 App Server 返回的 reasoning summary `CONTENT`，抑制普通 `TOOL` 生命周期和全部普通 `TOOL_RESULT` 工具详情。    |
 
-聚合使用活动调用的引用计数，而不是简单布尔缓存：每次启动增加计数、每次完成减少
-计数，最后一个活动调用完成时释放该组状态；缓存和计数状态也会在 turn 结束、App
-Server 重启和机器人关闭时释放。
+前三种格式只处理工具生命周期的呈现方式：`individual`、`merge_same` 和
+`merge_all`。工具生命周期和工具结果是否可见，仍由对应的输出级别决定。
+`merge_same` 和 `merge_all` 使用活动调用的引用计数，而不是简单布尔缓存：每次启动
+增加计数、每次完成减少计数，最后一个活动调用完成时释放该组状态；
+缓存和计数状态也会在 turn 结束、App Server 重启和机器人关闭时释放。
 
-`OUTPUT_FORMAT_TOOL` 永远不决定内容是否可见。工具生命周期与工具结果分别由独立的
-`OUTPUT_LEVEL_TOOL` 和 `OUTPUT_LEVEL_TOOL_RESULT` 控制。例如，只显示无标签的工具
-生命周期首行、隐藏工具结果，并聚合相同工具：
+工具生命周期与工具结果分别由独立的 `OUTPUT_LEVEL_TOOL` 和
+`OUTPUT_LEVEL_TOOL_RESULT` 控制。例如，只显示无标签的工具生命周期首行、隐藏工具
+结果，并聚合相同工具：
 
 ```dotenv
 OUTPUT_LEVEL=off
@@ -89,6 +92,24 @@ OUTPUT_LEVEL_TOOL=line
 OUTPUT_LEVEL_TOOL_RESULT=off
 OUTPUT_LABEL_TOOL=hide
 OUTPUT_FORMAT_TOOL=merge_same
+```
+
+`summary` 是明确的工具详情隐藏模式。它不会读取 `ActivityEvent.summary` 中记录的
+命令、查询或工具名称，也不会调用模型或根据工具列表自行生成摘要。
+
+它只沿用 App Server 通知 `item/reasoning/summaryTextDelta`。该通知已作为
+`CONTENT` 流式输出。普通 commentary 目前也属于 `CONTENT`，行为保持不变。
+
+摘要仍服从 `OUTPUT_LEVEL_CONTENT` 和 `OUTPUT_LABEL_CONTENT`。如果 App Server
+没有返回 reasoning summary，工具活动就保持静默。工具名称、命令、参数、状态和结果
+不会作为后备内容，`tools started` 等通用占位信息也不会显示。
+
+下面的配置会显示不带标签的完整内容摘要。所有工具详情都会被隐藏：
+
+```dotenv
+OUTPUT_FORMAT_TOOL=summary
+OUTPUT_LEVEL_CONTENT=full
+OUTPUT_LABEL_CONTENT=hide
 ```
 
 群聊可以用同构的 `OUTPUT_GROUP_*` 变量覆盖这份默认配置。所有群聊变量都留空或
@@ -108,14 +129,15 @@ OUTPUT_GROUP_LEVEL_WARNING=line
 OUTPUT_GROUP_LEVEL_ERROR=full
 ```
 
-也可以让群聊比私聊显示更多，同时改变标签和工具聚合方式：
+也可以让群聊比私聊显示更多，同时改变标签并只保留 App Server 的 reasoning
+summary：
 
 ```dotenv
 OUTPUT_LEVEL=off
 OUTPUT_GROUP_LEVEL=line
 OUTPUT_GROUP_LEVEL_CONTENT=full
 OUTPUT_GROUP_LABEL=hide
-OUTPUT_GROUP_FORMAT_TOOL=merge_same
+OUTPUT_GROUP_FORMAT_TOOL=summary
 ```
 
 不需要配置 `OUTPUT_SINGLE_*`：私聊始终使用现有 `OUTPUT_*`。配置只在进程启动时

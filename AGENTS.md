@@ -43,8 +43,8 @@ Codex notifications
 | `src/codex-runtime.ts`       | 把 App Server 包装成可重启的 Codex port，路由早到事件和 turn 结果 |
 | `src/orchestrator.ts`        | 核心会话状态机：命令、排队、中断、thread 恢复和最终回复           |
 | `src/codex-events.ts`        | 将允许公开的 Codex 通知转换为原始 `ActivityEvent`                 |
-| `src/output-settings.ts`     | 定义并解析输出级别、标签和工具聚合配置                            |
-| `src/output-pipeline.ts`     | 按来源流过滤、截断、加标签并聚合工具生命周期                      |
+| `src/output-settings.ts`     | 定义并解析输出级别、标签和工具格式配置                            |
+| `src/output-pipeline.ts`     | 按来源流过滤、截断、加标签并格式化工具输出                        |
 | `src/output.ts`              | UTF-8 安全切分、脱敏、限流、发送串行化和流轮换                    |
 | `src/chat-output.ts`         | 把通用输出能力接到企业微信回复与流式消息                          |
 | `src/lifecycle.ts`           | 固定启动、恢复和优雅关闭顺序                                      |
@@ -80,8 +80,12 @@ Codex notifications
 - `ActivityEvent.delivery === "direct"` 有意绕过 `OUTPUT_LEVEL_*` 和标签过滤。
   最终回答、帮助、状态、直接错误和用户输入请求即使所有输出级别为 `off`
   也要可见。
-- 工具生命周期和工具结果是两个独立标签；`OUTPUT_FORMAT_TOOL` 只负责聚合，不决定
-  内容是否显示。聚合状态必须在 turn 完成、runtime 重启和关闭时清空。
+- 工具生命周期和工具结果是两个独立标签。`individual`、`merge_same` 和
+  `merge_all` 只处理生命周期格式。
+- `summary` 保留 App Server reasoning summary 对应的 `CONTENT`，并抑制普通
+  `TOOL`、`TOOL_RESULT` 详情。摘要仍服从 `CONTENT` 的级别和标签规则；没有摘要时
+  不得回退或伪造工具摘要。
+- 聚合状态必须在 turn 完成、runtime 重启和关闭时清空。
 - 企业微信发送按 conversation 保序，并为最终回复、流关闭等关键帧保留额度。修改
   限流、分段或流轮换时，必须保留“常规发送不能饿死关键发送”这一性质。`/stop`
   生效后不得再发起旧 turn 的 final，但已经进入企业微信发送队列的 final
