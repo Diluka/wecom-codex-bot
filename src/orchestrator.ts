@@ -19,6 +19,7 @@ import {
   DEFAULT_OUTPUT_SETTINGS,
   type OutputSettings,
 } from "./output-settings.ts";
+import type { ProgressTail } from "./progress-tail.ts";
 import type {
   ChatType,
   ConversationKey,
@@ -99,7 +100,7 @@ export interface CodexPort {
 }
 
 export interface ProgressHandle {
-  append(text: string, replaceTail?: boolean): void;
+  append(text: string, progressTail?: ProgressTail): void;
   finish(): Promise<void>;
   detach(): void;
 }
@@ -1588,7 +1589,7 @@ export class ConversationOrchestrator {
         await this.#output.send(turnOutput.message, rendered);
       }
     } else {
-      turnOutput.progress.append(rendered, decision.progressTail !== undefined);
+      turnOutput.progress.append(rendered, decision.progressTail);
     }
     if (activity.tag === "SHUTDOWN") turnOutput.shutdownHandled = true;
   }

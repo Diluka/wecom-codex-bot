@@ -17,7 +17,6 @@ export const CONTINUATION_MARKER = "[Progress continues in a new stream]";
 
 const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
-const LEGACY_PROGRESS_TAIL_KEY = "\0legacy-replaceable-tail";
 const encoder = new TextEncoder();
 
 function byteLength(value: string): number {
@@ -575,19 +574,6 @@ interface TrackedProgressTail extends ProgressTail {
   content: string;
 }
 
-function normalizeProgressTail(
-  content: string,
-  progressTail: ProgressTail | boolean | undefined,
-): ProgressTail | undefined {
-  if (progressTail === true) {
-    return {
-      key: LEGACY_PROGRESS_TAIL_KEY,
-      completedText: content,
-    };
-  }
-  return progressTail || undefined;
-}
-
 export interface StreamControllerOptions {
   conversationKey: string;
   frame: unknown;
@@ -664,11 +650,11 @@ export class StreamController {
 
   appendBlock(
     content: string,
-    progressTail?: ProgressTail | boolean,
+    progressTail?: ProgressTail,
   ): this {
     if (this.#finished) throw new Error("stream is already finished");
 
-    const nextTail = normalizeProgressTail(content, progressTail);
+    const nextTail = progressTail;
     const previous = this.#replaceableTail;
     if (nextTail && previous) {
       if (nextTail.key === previous.key) {

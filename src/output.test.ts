@@ -476,7 +476,7 @@ describe("StreamController", () => {
     });
 
     controller.appendBlock("*live summary*", tail("item", 0));
-    await timers.advance(9 * 60_000);
+    await timers.advance(6 * 60_000);
 
     const oldFinal = calls.find(({ streamId, finish }) =>
       streamId === "stream-1" && finish
@@ -500,7 +500,7 @@ describe("StreamController", () => {
     const rawSummary = `${"x".repeat(40)}raw summary`;
 
     controller.appendBlock(rawSummary, tail("item", 0));
-    await timers.advance(9 * 60_000);
+    await timers.advance(6 * 60_000);
 
     const oldFinal = calls.find(({ streamId, finish }) =>
       streamId === "stream-1" && finish
@@ -519,8 +519,8 @@ describe("StreamController", () => {
     });
 
     controller.appendBlock("turn started");
-    controller.appendBlock("summary first\n", true);
-    controller.appendBlock("summary second", true);
+    controller.appendBlock("summary first\n", tail("item", 0));
+    controller.appendBlock("summary second", tail("item", 0));
     assertEquals(await controller.finish(), true);
 
     assertEquals(calls.at(-1)?.content, "turn started\nsummary second");
@@ -536,8 +536,8 @@ describe("StreamController", () => {
     });
 
     controller.appendBlock("before");
-    controller.appendBlock("\nfirst summary", true);
-    controller.appendBlock("second summary", true);
+    controller.appendBlock("\nfirst summary", tail("item", 0));
+    controller.appendBlock("second summary", tail("item", 0));
     assertEquals(await controller.finish(), true);
 
     assertEquals(calls.at(-1)?.content, "before\nsecond summary");
@@ -552,10 +552,10 @@ describe("StreamController", () => {
       streamIdFactory: () => "stream-1",
     });
 
-    controller.appendBlock("summary first", true);
+    controller.appendBlock("summary first", tail("item", 0));
     controller.appendBlock("ordinary commentary");
-    controller.appendBlock("summary second", true);
-    controller.appendBlock("summary third", true);
+    controller.appendBlock("summary second", tail("item", 0));
+    controller.appendBlock("summary third", tail("item", 0));
     assertEquals(await controller.finish(), true);
 
     assertEquals(
@@ -576,14 +576,14 @@ describe("StreamController", () => {
       streamIdFactory: () => ids.shift() ?? "unexpected",
     });
 
-    controller.appendBlock("summary before rotation", true);
+    controller.appendBlock("summary before rotation", tail("item", 0));
     await timers.advance(6 * 60_000);
-    controller.appendBlock("summary after rotation", true);
+    controller.appendBlock("summary after rotation", tail("item", 0));
     assertEquals(await controller.finish(), true);
 
     const finished = calls.filter(({ finish }) => finish);
     assertEquals(finished[0].streamId, "stream-1");
-    assertEquals(finished[0].content, "summary before rotation");
+    assertEquals(finished[0].content, COMPLETED_SUMMARY);
     assertEquals(finished[1].streamId, "stream-2");
     assertMatch(finished[1].content, /summary after rotation/);
   });
@@ -773,7 +773,7 @@ describe("StreamController", () => {
     controller.appendBlock("before rotation");
     const rotating = timers.advance(6 * 60_000);
     await finishStarted.promise;
-    controller.appendBlock("during rotation", true);
+    controller.appendBlock("during rotation", tail("item", 0));
     finishGate.resolve();
     await rotating;
 
@@ -820,7 +820,7 @@ describe("StreamController", () => {
     controller.appendBlock("before rotation");
     const rotating = timers.advance(6 * 60_000);
     await finishStarted.promise;
-    controller.appendBlock("during rotation", true);
+    controller.appendBlock("during rotation", tail("item", 0));
     finishGate.resolve();
     await rotating;
     assertEquals(await controller.flush(), true);

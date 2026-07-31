@@ -23,6 +23,7 @@ import type {
 } from "./model-settings.ts";
 import { OUTPUT_TAGS, type OutputSettings } from "./output-settings.ts";
 import { ConversationSendQueue } from "./output.ts";
+import type { ProgressTail } from "./progress-tail.ts";
 
 function message(
   conversationKey: `single:${string}` | `group:${string}`,
@@ -280,17 +281,22 @@ interface FakeProgressEntry {
   msgId: string;
   chunks: string[];
   finished: boolean;
-  replaceableChunkIndex?: number;
+  progressTail?: ProgressTail & { chunkIndex: number };
 }
 
 function appendProgressChunk(
   entry: FakeProgressEntry,
   text: string,
-  replaceTail = false,
+  progressTail?: ProgressTail,
 ): void {
-  if (replaceTail && entry.replaceableChunkIndex !== undefined) {
-    entry.chunks[entry.replaceableChunkIndex] = text;
-    return;
+  const previous = entry.progressTail;
+  if (progressTail && previous) {
+    if (progressTail.key === previous.key) {
+      entry.chunks[previous.chunkIndex] = text;
+      entry.progressTail = { ...progressTail, chunkIndex: previous.chunkIndex };
+      return;
+    }
+    entry.chunks[previous.chunkIndex] = previous.completedText;
   }
 
   const current = entry.chunks.join("");
@@ -301,8 +307,8 @@ function appendProgressChunk(
     entry.chunks.push("\n");
   }
   entry.chunks.push(text);
-  entry.replaceableChunkIndex = replaceTail
-    ? entry.chunks.length - 1
+  entry.progressTail = progressTail
+    ? { ...progressTail, chunkIndex: entry.chunks.length - 1 }
     : undefined;
 }
 
@@ -333,12 +339,12 @@ class FakeOutput implements ChatOutput {
     };
     this.progress.push(entry);
     return {
-      append: (text: string, replaceTail = false) => {
+      append: (text: string, progressTail?: ProgressTail) => {
         if (entry.finished) {
           this.lateProgressAppends.push({ msgId: message.msgId, text });
           return;
         }
-        appendProgressChunk(entry, text, replaceTail);
+        appendProgressChunk(entry, text, progressTail);
       },
       finish: () => {
         entry.finished = true;
@@ -446,12 +452,12 @@ class QueueBlockedOutput implements ChatOutput {
     };
     this.progress.push(entry);
     return Promise.resolve({
-      append: (text: string, replaceTail = false) => {
+      append: (text: string, progressTail?: ProgressTail) => {
         if (entry.finished) {
           this.lateProgressAppends.push({ msgId: message.msgId, text });
           return;
         }
-        appendProgressChunk(entry, text, replaceTail);
+        appendProgressChunk(entry, text, progressTail);
       },
       finish: async () => {
         const attempt = await this.#queue.enqueueCritical(
@@ -2328,7 +2334,7 @@ describe("ConversationOrchestrator", () => {
       finish: true,
     }]);
   });
-  it("replaces only the consecutive reasoning summary tail", async () => {
+  it("preserves keyed summary transitions across suppressed and direct events", async () => {
     const settings = outputSettings();
     settings.toolFormat = "summary";
     const { codex, orchestrator, output } = setup({
@@ -2349,8 +2355,7 @@ describe("ConversationOrchestrator", () => {
       delivery: "progress",
     });
 
-    await turn.onActivity(summary("Checking ", 0));
-    await turn.onActivity(summary("tests", 0));
+    await turn.onActivity(summary("**first ", 0));
     await turn.onActivity({
       tag: "TOOL",
       summary: "deno test",
@@ -2358,20 +2363,20 @@ describe("ConversationOrchestrator", () => {
       toolState: "started",
       delivery: "progress",
     });
-    await turn.onActivity(summary("**Running**", 1));
+    await turn.onActivity(summary("section", 0));
     await turn.onActivity({
       tag: "CONTENT",
       body: "needs input",
       delivery: "direct",
     });
-    await turn.onActivity(summary("After direct", 2));
+    await turn.onActivity(summary("**", 0));
+    await turn.onActivity(summary("**second section**", 1));
     await turn.onActivity({
       tag: "CONTENT",
       body: "visible commentary",
       delivery: "progress",
     });
-    await turn.onActivity(summary("Final ", 3));
-    await turn.onActivity(summary("summary", 3));
+    await turn.onActivity(summary(" resumed", 1));
     turn.resolve({ status: "completed" });
     await running;
 
@@ -2380,11 +2385,13 @@ describe("ConversationOrchestrator", () => {
       "\n",
       "[turn] started",
       "\n",
-      "[content] After direct",
+      "[content] *已完成上一阶段，继续处理中…*",
+      "\n",
+      "[content] *second section*",
       "\n",
       "[content] visible commentary",
       "\n",
-      "[content] Final summary",
+      "[content] **second section** resumed",
       "\n",
       "[turn] completed",
     ]);
