@@ -148,6 +148,26 @@ function restoreEnv(name: string, value: string | undefined): void {
   else Deno.env.set(name, value);
 }
 
+function modelFixture(
+  id: string,
+  defaultEffort: string,
+  efforts: readonly string[],
+): JsonObject {
+  return {
+    id,
+    model: id,
+    displayName: `Display ${id}`,
+    description: `Description for ${id}`,
+    hidden: false,
+    isDefault: id === "gpt-a",
+    defaultReasoningEffort: defaultEffort,
+    supportedReasoningEfforts: efforts.map((reasoningEffort) => ({
+      reasoningEffort,
+      description: `${reasoningEffort} effort`,
+    })),
+  };
+}
+
 describe("CodexAppServerClient", () => {
   it("classifies messages by checking method before id", () => {
     equal(
@@ -210,8 +230,10 @@ describe("CodexAppServerClient", () => {
       await client?.close();
     }
   });
+});
 
-  it("uses increasing RPC ids and only the allowed thread and turn overrides", async () => {
+describe("CodexAppServerClient thread settings", () => {
+  it("parses thread settings while using only the allowed RPC overrides", async () => {
     const fake = new FakeAppServerProcess();
     const client = await CodexAppServerClient.start({
       cwd: "/workspace/project",
@@ -219,7 +241,11 @@ describe("CodexAppServerClient", () => {
         if (message.method === "thread/start") {
           fake.send({
             id: message.id,
-            result: { thread: { id: "thread-new" } },
+            result: {
+              thread: { id: "thread-new" },
+              model: "gpt-test",
+              reasoningEffort: "medium",
+            },
           });
         } else if (message.method === "thread/resume") {
           fake.send({
@@ -228,6 +254,8 @@ describe("CodexAppServerClient", () => {
               thread: {
                 id: message.params && (message.params as JsonObject).threadId,
               },
+              model: "gpt-test",
+              reasoningEffort: "high",
             },
           });
         } else if (message.method === "turn/start") {
@@ -239,8 +267,14 @@ describe("CodexAppServerClient", () => {
     });
 
     try {
-      equal(await client.startThread(), "thread-new");
-      equal(await client.resumeThread("thread-existing"), "thread-existing");
+      deepStrictEqual(await client.startThread(), {
+        threadId: "thread-new",
+        settings: { model: "gpt-test", effort: "medium" },
+      });
+      deepStrictEqual(await client.resumeThread("thread-existing"), {
+        threadId: "thread-existing",
+        settings: { model: "gpt-test", effort: "high" },
+      });
       equal(await client.startTurn("thread-existing", "Run tests"), "turn-new");
       await client.interrupt("thread-existing", "turn-new");
 
@@ -275,6 +309,72 @@ describe("CodexAppServerClient", () => {
     }
   });
 
+  it("normalizes absent or null thread settings effort to null", async () => {
+    const fake = new FakeAppServerProcess();
+    const client = await CodexAppServerClient.start({
+      cwd: "/workspace/project",
+      spawn: createSpawn(fake, [], (message) => {
+        if (message.method === "thread/start") {
+          fake.send({
+            id: message.id,
+            result: { thread: { id: "thread-new" }, model: "gpt-test" },
+          });
+        } else if (message.method === "thread/resume") {
+          fake.send({
+            id: message.id,
+            result: {
+              thread: { id: "thread-existing" },
+              model: "gpt-test",
+              reasoningEffort: null,
+            },
+          });
+        }
+      }),
+    });
+
+    try {
+      deepStrictEqual(await client.startThread(), {
+        threadId: "thread-new",
+        settings: { model: "gpt-test", effort: null },
+      });
+      deepStrictEqual(await client.resumeThread("thread-existing"), {
+        threadId: "thread-existing",
+        settings: { model: "gpt-test", effort: null },
+      });
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("rejects malformed thread settings responses", async () => {
+    const fake = new FakeAppServerProcess();
+    let startCount = 0;
+    const client = await CodexAppServerClient.start({
+      cwd: "/workspace/project",
+      spawn: createSpawn(fake, [], (message) => {
+        if (message.method !== "thread/start") return;
+        startCount += 1;
+        fake.send({
+          id: message.id,
+          result: startCount === 1
+            ? { thread: { id: "thread-new" }, reasoningEffort: "medium" }
+            : {
+              thread: { id: "thread-new" },
+              model: "gpt-test",
+              reasoningEffort: "",
+            },
+        });
+      }),
+    });
+
+    try {
+      await rejects(client.startThread(), /missing model/);
+      await rejects(client.startThread(), /missing reasoningEffort/);
+    } finally {
+      await client.close();
+    }
+  });
+
   it("correlates pending RPC responses by id even out of order", async () => {
     const fake = new FakeAppServerProcess();
     const client = await CodexAppServerClient.start({
@@ -295,19 +395,181 @@ describe("CodexAppServerClient", () => {
 
       fake.send({
         id: resumeRequest.id,
-        result: { thread: { id: "resumed" } },
+        result: {
+          thread: { id: "resumed" },
+          model: "gpt-resumed",
+          reasoningEffort: null,
+        },
       });
-      fake.send({ id: startRequest.id, result: { thread: { id: "started" } } });
+      fake.send({
+        id: startRequest.id,
+        result: {
+          thread: { id: "started" },
+          model: "gpt-started",
+          reasoningEffort: "low",
+        },
+      });
 
       deepStrictEqual(await Promise.all([started, resumed]), [
-        "started",
-        "resumed",
+        {
+          threadId: "started",
+          settings: { model: "gpt-started", effort: "low" },
+        },
+        {
+          threadId: "resumed",
+          settings: { model: "gpt-resumed", effort: null },
+        },
       ]);
     } finally {
       await client.close();
     }
   });
+});
 
+describe("CodexAppServerClient lists models and updates settings", () => {
+  it("lists models and updates thread and config settings", async () => {
+    const fake = new FakeAppServerProcess();
+    const pageOneModel = modelFixture("gpt-a", "medium", ["low", "medium"]);
+    const pageTwoModel = modelFixture("gpt-b", "high", ["medium", "high"]);
+    const client = await CodexAppServerClient.start({
+      cwd: "/workspace/project",
+      spawn: createSpawn(fake, [], (message) => {
+        if (message.method === "model/list") {
+          const params = message.params as JsonObject;
+          fake.send({
+            id: message.id,
+            result: params.cursor === null
+              ? { data: [pageOneModel], nextCursor: "page-2" }
+              : { data: [pageTwoModel], nextCursor: null },
+          });
+        } else if (message.method === "config/read") {
+          fake.send({
+            id: message.id,
+            result: {
+              config: {
+                model: "gpt-a",
+                model_reasoning_effort: "medium",
+              },
+            },
+          });
+        } else if (
+          message.method === "thread/settings/update" ||
+          message.method === "config/batchWrite"
+        ) {
+          fake.send({ id: message.id, result: {} });
+        }
+      }),
+    });
+
+    try {
+      deepStrictEqual(await client.listModels(), [pageOneModel, pageTwoModel]);
+      deepStrictEqual(await client.readConfigDefaults(), {
+        model: "gpt-a",
+        effort: "medium",
+      });
+      await client.updateThreadSettings("thread-1", {
+        model: "gpt-b",
+        effort: "high",
+      });
+      await client.writeConfigDefaults({ model: "gpt-b", effort: "high" });
+      await client.writeConfigDefaults({});
+
+      const modelRequests = fake.received.filter((message) =>
+        message.method === "model/list"
+      );
+      deepStrictEqual(modelRequests.map(({ params }) => params), [
+        { cursor: null, limit: 100, includeHidden: true },
+        { cursor: "page-2", limit: 100, includeHidden: true },
+      ]);
+      const configRead = fake.received.find((message) =>
+        message.method === "config/read"
+      )!;
+      deepStrictEqual(configRead.params, {
+        cwd: "/workspace/project",
+        includeLayers: false,
+      });
+      const threadUpdate = fake.received.find((message) =>
+        message.method === "thread/settings/update"
+      )!;
+      deepStrictEqual(threadUpdate.params, {
+        threadId: "thread-1",
+        model: "gpt-b",
+        effort: "high",
+      });
+      const configWrites = fake.received.filter((message) =>
+        message.method === "config/batchWrite"
+      );
+      equal(configWrites.length, 1);
+      deepStrictEqual(configWrites[0].params, {
+        edits: [
+          { keyPath: "model", value: "gpt-b", mergeStrategy: "upsert" },
+          {
+            keyPath: "model_reasoning_effort",
+            value: "high",
+            mergeStrategy: "upsert",
+          },
+        ],
+        reloadUserConfig: false,
+      });
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("rejects malformed model catalog entries", async () => {
+    const fake = new FakeAppServerProcess();
+    const invalidModel = modelFixture("gpt-a", "medium", ["medium"]);
+    invalidModel.supportedReasoningEfforts = [{ reasoningEffort: "medium" }];
+    const client = await CodexAppServerClient.start({
+      cwd: "/workspace/project",
+      spawn: createSpawn(fake, [], (message) => {
+        if (message.method === "model/list") {
+          fake.send({
+            id: message.id,
+            result: { data: [invalidModel], nextCursor: null },
+          });
+        }
+      }),
+    });
+
+    try {
+      await rejects(
+        client.listModels(),
+        /supportedReasoningEfforts\[0\]\.description/,
+      );
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("normalizes absent config defaults and rejects malformed values", async () => {
+    const fake = new FakeAppServerProcess();
+    let readCount = 0;
+    const client = await CodexAppServerClient.start({
+      cwd: "/workspace/project",
+      spawn: createSpawn(fake, [], (message) => {
+        if (message.method !== "config/read") return;
+        readCount += 1;
+        fake.send({
+          id: message.id,
+          result: readCount === 1 ? { config: {} } : { config: { model: 42 } },
+        });
+      }),
+    });
+
+    try {
+      deepStrictEqual(await client.readConfigDefaults(), {
+        model: null,
+        effort: null,
+      });
+      await rejects(client.readConfigDefaults(), /config\.model/);
+    } finally {
+      await client.close();
+    }
+  });
+});
+
+describe("CodexAppServerClient", () => {
   it("exposes consumed scoped notifications and selects the authoritative final message", async () => {
     const fake = new FakeAppServerProcess();
     const observed: Array<{ name: string; value: unknown }> = [];
