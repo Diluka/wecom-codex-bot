@@ -20,6 +20,7 @@ export interface InboundMessage {
 
 export interface InboundText extends InboundMessage {
   text: string;
+  quote?: unknown;
 }
 
 type Listener = (...args: unknown[]) => void;
@@ -150,6 +151,7 @@ export function normalizeTextFrame(frame: unknown): InboundText {
   return {
     ...normalizeMessageFrame(frame),
     text: text.content,
+    ...(body.quote !== undefined ? { quote: body.quote } : {}),
   };
 }
 
