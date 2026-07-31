@@ -247,6 +247,7 @@ describe("TurnOutputPipeline", () => {
         "before **inline** after",
         "`**code**`",
         "\\**escaped**",
+        "**escaped\\**",
         "**incomplete",
       ].entries()
     ) {

@@ -248,7 +248,8 @@ function italicizeBoldLine(line: string): string {
   const trimmed = line.trim();
   if (
     !trimmed.startsWith("**") || !trimmed.endsWith("**") ||
-    trimmed.includes("`") || countBoldMarkers(trimmed) !== 2
+    trimmed.includes("`") || isEscapedAt(trimmed, trimmed.length - 2) ||
+    countBoldMarkers(trimmed) !== 2
   ) {
     return line;
   }
@@ -268,6 +269,18 @@ function countBoldMarkers(value: string): number {
     if (value[index] === "*" && value[index + 1] === "*") count += 1;
   }
   return count;
+}
+
+function isEscapedAt(value: string, index: number): boolean {
+  let backslashes = 0;
+  for (
+    let cursor = index - 1;
+    cursor >= 0 && value[cursor] === "\\";
+    cursor--
+  ) {
+    backslashes += 1;
+  }
+  return backslashes % 2 === 1;
 }
 
 function summaryExcerpt(source: string): string {
