@@ -368,23 +368,34 @@ describe("WeComGateway", () => {
     assertInstanceOf(createWeComClient("bot", "secret"), WSClient);
   });
 
-  it("uses an SDK logger that drops message bodies and redacts retained logs", () => {
+  it("forwards every SDK log level with complete redacted messages", () => {
     const entries: Array<{ level: string; message: string }> = [];
     const logger = createSafeSdkLogger(
       "actual-$ecret",
       (level, message) => entries.push({ level, message }),
     );
-    logger.debug(
-      'body={"text":{"content":"private chat actual-$ecret"}}',
-      { body: { text: { content: "private chat actual-$ecret" } } },
-    );
-    logger.warn("connection warning actual-$ecret", {
-      body: { text: { content: "private chat" } },
-    });
+    logger.debug("callback actual-$ecret:", "debug detail actual-$ecret");
+    logger.info("connected actual-$ecret:", "info detail actual-$ecret");
+    logger.warn("connection actual-$ecret:", "warn detail actual-$ecret");
+    logger.error("failed actual-$ecret:", "error detail actual-$ecret");
 
-    assertEquals(entries, [{
-      level: "warn",
-      message: "connection warning [REDACTED]",
-    }]);
+    assertEquals(entries, [
+      {
+        level: "debug",
+        message: "callback [REDACTED]: debug detail [REDACTED]",
+      },
+      {
+        level: "info",
+        message: "connected [REDACTED]: info detail [REDACTED]",
+      },
+      {
+        level: "warn",
+        message: "connection [REDACTED]: warn detail [REDACTED]",
+      },
+      {
+        level: "error",
+        message: "failed [REDACTED]: error detail [REDACTED]",
+      },
+    ]);
   });
 });
