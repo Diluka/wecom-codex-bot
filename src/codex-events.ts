@@ -19,9 +19,8 @@ export interface SubagentStatusUpdate {
   status: SubagentStatus;
 }
 
-interface ToolIdentity {
+interface ToolMetadata {
   itemId?: string;
-  toolId: string;
   summary: string;
 }
 
@@ -148,39 +147,39 @@ function itemId(params: Record<string, unknown>): string | undefined {
   return text(params.itemId) ?? text(record(params.item)?.id);
 }
 
-function toolIdentity(
+function toolMetadata(
   item: Record<string, unknown>,
   params: Record<string, unknown>,
-): ToolIdentity | null {
+): ToolMetadata | null {
   const id = text(params.itemId) ?? text(item.id);
 
   switch (item.type) {
     case "commandExecution": {
       const command = text(item.command) ?? "commandExecution";
-      return { itemId: id, toolId: `command:${command}`, summary: command };
+      return { itemId: id, summary: command };
     }
     case "fileChange":
-      return { itemId: id, toolId: "file:fileChange", summary: "file change" };
+      return { itemId: id, summary: "file change" };
     case "mcpToolCall": {
       const tool = `${text(item.server) ?? "mcp"}/${
         text(item.tool) ?? "unknown"
       }`;
-      return { itemId: id, toolId: `mcp:${tool}`, summary: tool };
+      return { itemId: id, summary: tool };
     }
     case "dynamicToolCall": {
       const tool = `${text(item.namespace) ?? "dynamic"}/${
         text(item.tool) ?? "unknown"
       }`;
-      return { itemId: id, toolId: `dynamic:${tool}`, summary: tool };
+      return { itemId: id, summary: tool };
     }
     case "collabToolCall":
     case "collabAgentToolCall": {
       const tool = text(item.tool) ?? "collaboration";
-      return { itemId: id, toolId: `collaboration:${tool}`, summary: tool };
+      return { itemId: id, summary: tool };
     }
     case "webSearch": {
       const query = text(item.query) ?? "web search";
-      return { itemId: id, toolId: `web-search:${query}`, summary: query };
+      return { itemId: id, summary: query };
     }
     default:
       return null;
@@ -223,16 +222,15 @@ function toolLifecycle(
   item: Record<string, unknown>,
   params: Record<string, unknown>,
 ): ActivityEvent | null {
-  const identity = toolIdentity(item, params);
-  if (!identity) return null;
+  const metadata = toolMetadata(item, params);
+  if (!metadata) return null;
   const body = state === "completed" ? completedToolBody(item) : undefined;
 
   return scopedEvent(params, {
     tag: "TOOL",
-    summary: identity.summary,
+    summary: metadata.summary,
     ...(body !== undefined ? { body } : {}),
-    ...(identity.itemId ? { itemId: identity.itemId } : {}),
-    toolId: identity.toolId,
+    ...(metadata.itemId ? { itemId: metadata.itemId } : {}),
     toolState: state,
   });
 }
@@ -240,7 +238,6 @@ function toolLifecycle(
 function toolResult(
   params: Record<string, unknown>,
   value: unknown,
-  toolId?: string,
 ): ActivityEvent {
   const body = text(value);
   const id = itemId(params);
@@ -248,7 +245,6 @@ function toolResult(
     tag: "TOOL_RESULT",
     ...(body !== undefined ? { body } : {}),
     ...(id ? { itemId: id } : {}),
-    ...(toolId ? { toolId } : {}),
   });
 }
 
@@ -275,7 +271,7 @@ export function describeCodexNotification(
     case "item/fileChange/outputDelta":
       return toolResult(params, params.delta);
     case "item/mcpToolCall/progress":
-      return toolResult(params, params.message, "mcpToolCall");
+      return toolResult(params, params.message);
     case "item/started": {
       const item = record(params.item);
       return item ? toolLifecycle("started", item, params) : null;

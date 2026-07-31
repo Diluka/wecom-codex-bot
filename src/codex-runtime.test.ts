@@ -1570,7 +1570,6 @@ describe("CodexRuntime", () => {
       {
         tag: "TOOL",
         summary: "collaboration",
-        toolId: "collaboration:collaboration",
         toolState: "started",
         threadId: "parent-concurrent",
         turnId: "turn-concurrent-a",

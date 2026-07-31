@@ -92,14 +92,13 @@ Codex notifications
 - `ActivityEvent.delivery === "direct"` 有意绕过 `OUTPUT_LEVEL_*` 和标签过滤。
   最终回答、帮助、状态、直接错误和用户输入请求即使所有输出级别为 `off`
   也要可见。
-- 工具生命周期和工具结果是两个独立标签。`individual`、`merge_same` 和
-  `merge_all` 只处理生命周期格式。
+- 工具生命周期和工具结果是两个独立标签。`individual`
+  按调用逐一呈现工具生命周期，两个标签分别服从各自的输出级别。
 - `summary` 保留 App Server reasoning summary 对应的 `CONTENT`，并抑制普通
   `TOOL`、`TOOL_RESULT` 详情。摘要仍服从 `CONTENT` 的级别和标签规则；没有摘要时
   不得回退或伪造工具摘要。最终生效的工具格式为 `summary` 时，对应 `turn/start`
-  必须显式传 `summary: "auto"`。其他工具格式必须省略该字段，并继续使用现有 Codex
-  配置和模型默认值。
-- 聚合状态必须在 turn 完成、runtime 重启和关闭时清空。
+  必须显式传 `summary: "auto"`。`individual` 必须省略该字段，并继续使用现有
+  Codex 配置和模型默认值。
 - 企业微信发送按 conversation 保序，并为最终回复、流关闭等关键帧保留额度。修改
   限流、分段或流轮换时，必须保留“常规发送不能饿死关键发送”这一性质。`/stop`
   生效后不得再发起旧 turn 的 final，但已经进入企业微信发送队列的 final

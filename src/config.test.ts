@@ -197,12 +197,7 @@ describe("loadConfig", () => {
     ]);
     assertEquals(OUTPUT_LEVELS, ["off", "line", "excerpt", "full"]);
     assertEquals(OUTPUT_LABELS, ["show", "hide"]);
-    assertEquals(TOOL_OUTPUT_FORMATS, [
-      "individual",
-      "merge_same",
-      "merge_all",
-      "summary",
-    ]);
+    assertEquals(TOOL_OUTPUT_FORMATS, ["individual", "summary"]);
 
     const config = await loadConfig(configEnv(), Deno.cwd());
 
@@ -218,7 +213,7 @@ describe("loadConfig", () => {
         OUTPUT_LEVEL_TOOL: "full",
         OUTPUT_LABEL: "hide",
         OUTPUT_LABEL_CONTENT: "show",
-        OUTPUT_FORMAT_TOOL: "merge_same",
+        OUTPUT_FORMAT_TOOL: "summary",
       }),
       Deno.cwd(),
     );
@@ -242,13 +237,12 @@ describe("loadConfig", () => {
   it("lets the group summary format override the global format", async () => {
     const config = await loadConfig(
       configEnv({
-        OUTPUT_FORMAT_TOOL: "merge_all",
         OUTPUT_GROUP_FORMAT_TOOL: " summary ",
       }),
       Deno.cwd(),
     );
 
-    assertEquals(config.outputSettings.toolFormat, "merge_all");
+    assertEquals(config.outputSettings.toolFormat, "individual");
     assertEquals(config.groupOutputSettings.toolFormat, "summary");
   });
 
@@ -259,12 +253,12 @@ describe("loadConfig", () => {
         OUTPUT_LEVEL_TOOL: "full",
         OUTPUT_LABEL: "hide",
         OUTPUT_LABEL_TOOL: "hide",
-        OUTPUT_FORMAT_TOOL: "merge_same",
+        OUTPUT_FORMAT_TOOL: "summary",
         OUTPUT_GROUP_LEVEL: " off ",
         OUTPUT_GROUP_LEVEL_ERROR: " full ",
         OUTPUT_GROUP_LABEL: " show ",
         OUTPUT_GROUP_LABEL_ERROR: " hide ",
-        OUTPUT_GROUP_FORMAT_TOOL: " merge_all ",
+        OUTPUT_GROUP_FORMAT_TOOL: " individual ",
       }),
       Deno.cwd(),
     );
@@ -276,10 +270,10 @@ describe("loadConfig", () => {
     assertEquals(group.label, "show");
     assertEquals(group.labels.TOOL, "show");
     assertEquals(group.labels.ERROR, "hide");
-    assertEquals(group.toolFormat, "merge_all");
+    assertEquals(group.toolFormat, "individual");
     assertEquals(config.outputSettings.levels.TOOL, "full");
     assertEquals(config.outputSettings.labels.TOOL, "hide");
-    assertEquals(config.outputSettings.toolFormat, "merge_same");
+    assertEquals(config.outputSettings.toolFormat, "summary");
   });
 
   it("lets group globals increase output while blank values inherit", async () => {
@@ -288,7 +282,7 @@ describe("loadConfig", () => {
         OUTPUT_LEVEL: "off",
         OUTPUT_LEVEL_TOOL: "line",
         OUTPUT_LABEL: "hide",
-        OUTPUT_FORMAT_TOOL: "merge_same",
+        OUTPUT_FORMAT_TOOL: "summary",
         OUTPUT_GROUP_LEVEL: "full",
         OUTPUT_GROUP_LEVEL_QUEUE: "  ",
         OUTPUT_GROUP_LABEL: "\t",
@@ -305,7 +299,7 @@ describe("loadConfig", () => {
     assertEquals(group.label, "hide");
     assertEquals(group.labels.CONTENT, "hide");
     assertEquals(group.labels.TOOL, "show");
-    assertEquals(group.toolFormat, "merge_same");
+    assertEquals(group.toolFormat, "summary");
   });
 
   it("trims global and per-tag output settings", async () => {
@@ -315,7 +309,7 @@ describe("loadConfig", () => {
         OUTPUT_LEVEL_TOOL: " full ",
         OUTPUT_LABEL: " hide ",
         OUTPUT_LABEL_CONTENT: " show ",
-        OUTPUT_FORMAT_TOOL: " merge_all ",
+        OUTPUT_FORMAT_TOOL: " summary ",
       }),
       Deno.cwd(),
     );
@@ -326,7 +320,7 @@ describe("loadConfig", () => {
     assertEquals(config.outputSettings.label, "hide");
     assertEquals(config.outputSettings.labels.CONTENT, "show");
     assertEquals(config.outputSettings.labels.TOOL, "hide");
-    assertEquals(config.outputSettings.toolFormat, "merge_all");
+    assertEquals(config.outputSettings.toolFormat, "summary");
   });
 
   it("accepts subagent output-level and label overrides", () => {
@@ -353,6 +347,21 @@ describe("loadConfig", () => {
     for (const tag of OUTPUT_TAGS) {
       assertEquals(config.outputSettings.levels[tag], "line");
       assertEquals(config.outputSettings.labels[tag], "hide");
+    }
+  });
+
+  it("rejects removed merged tool output formats", async () => {
+    for (
+      const name of ["OUTPUT_FORMAT_TOOL", "OUTPUT_GROUP_FORMAT_TOOL"]
+    ) {
+      for (const value of ["merge_same", "merge_all"]) {
+        const error = await assertRejects(() =>
+          loadConfig(configEnv({ [name]: value }), Deno.cwd())
+        );
+
+        assertInstanceOf(error, Error);
+        assertEquals(error.message, `Invalid environment variable: ${name}`);
+      }
     }
   });
 

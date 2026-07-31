@@ -22,7 +22,6 @@ export type OutputDecisionReason =
   | "direct"
   | "direct_missing_body"
   | "tool_format_summary"
-  | "tool_aggregation"
   | "level_off"
   | "no_source"
   | "no_visible_text"
@@ -38,16 +37,11 @@ export interface OutputPipelineDecision {
   reason: OutputDecisionReason;
 }
 
-/** Applies per-turn aggregation, detail filtering, and label rendering to activity events. */
+/** Applies per-turn detail filtering and label rendering to activity events. */
 export class TurnOutputPipeline {
   readonly #settings: OutputSettings;
-  readonly #sameToolByItemId = new Map<string, string>();
-  readonly #sameToolCounts = new Map<string, number>();
-  readonly #sameFallbackCounts = new Map<string, number>();
-  readonly #allToolItems = new Set<string>();
   readonly #excerpts: StreamStates<ExcerptState> = new Map();
   readonly #lines: StreamStates<LineState> = new Map();
-  #allFallbackCount = 0;
 
   constructor(settings: OutputSettings) {
     this.#settings = settings;
@@ -71,22 +65,19 @@ export class TurnOutputPipeline {
       return suppressed("tool_format_summary");
     }
 
-    const aggregated = this.#aggregate(event);
-    if (!aggregated) return suppressed("tool_aggregation");
-
-    const level = this.#settings.levels[aggregated.tag];
+    const level = this.#settings.levels[event.tag];
     if (level === "off") return suppressed("level_off");
 
-    const source = sourceText(aggregated);
+    const source = sourceText(event);
     if (source === null) return suppressed("no_source");
 
     let visible: string | null;
     let reason: OutputDecisionReason;
     if (level === "line") {
-      visible = this.#line(aggregated, source);
+      visible = this.#line(event, source);
       reason = visible === null ? "line_complete" : "line";
     } else if (level === "excerpt") {
-      visible = this.#excerpt(aggregated, source);
+      visible = this.#excerpt(event, source);
       reason = visible === null ? "excerpt_complete" : "excerpt";
     } else {
       visible = source;
@@ -96,121 +87,15 @@ export class TurnOutputPipeline {
       return suppressed(visible === null ? reason : "no_visible_text");
     }
 
-    const output = this.#settings.labels[aggregated.tag] === "show"
-      ? `[${aggregated.tag.toLowerCase()}] ${visible}`
+    const output = this.#settings.labels[event.tag] === "show"
+      ? `[${event.tag.toLowerCase()}] ${visible}`
       : visible;
     return rendered(output, reason);
   }
 
   clear(): void {
-    this.#sameToolByItemId.clear();
-    this.#sameToolCounts.clear();
-    this.#sameFallbackCounts.clear();
-    this.#allToolItems.clear();
-    this.#allFallbackCount = 0;
     this.#excerpts.clear();
     this.#lines.clear();
-  }
-
-  #aggregate(event: ActivityEvent): ActivityEvent | null {
-    if (event.tag !== "TOOL" || !event.toolState) return event;
-
-    switch (this.#settings.toolFormat) {
-      case "merge_same":
-        return this.#mergeSame(event);
-      case "merge_all":
-        return this.#mergeAll(event);
-      default:
-        return event;
-    }
-  }
-
-  #mergeSame(event: ActivityEvent): ActivityEvent | null {
-    const toolId = this.#toolId(event);
-    const firstOrFinal = event.toolState === "started"
-      ? this.#startSame(event.itemId, toolId)
-      : this.#completeSame(event.itemId, toolId);
-    return firstOrFinal ? event : null;
-  }
-
-  #startSame(itemId: string | undefined, toolId: string): boolean {
-    if (itemId) {
-      if (this.#sameToolByItemId.has(itemId)) return false;
-      this.#sameToolByItemId.set(itemId, toolId);
-    } else {
-      const fallbackCount = this.#sameFallbackCounts.get(toolId) ?? 0;
-      this.#sameFallbackCounts.set(toolId, fallbackCount + 1);
-    }
-
-    const count = this.#sameToolCounts.get(toolId) ?? 0;
-    this.#sameToolCounts.set(toolId, count + 1);
-    return count === 0;
-  }
-
-  #completeSame(itemId: string | undefined, fallbackToolId: string): boolean {
-    let toolId = fallbackToolId;
-    if (itemId) {
-      const knownToolId = this.#sameToolByItemId.get(itemId);
-      if (!knownToolId) return false;
-      this.#sameToolByItemId.delete(itemId);
-      toolId = knownToolId;
-    } else {
-      const fallbackCount = this.#sameFallbackCounts.get(toolId) ?? 0;
-      if (fallbackCount <= 0) return false;
-      if (fallbackCount === 1) this.#sameFallbackCounts.delete(toolId);
-      else this.#sameFallbackCounts.set(toolId, fallbackCount - 1);
-    }
-
-    const count = this.#sameToolCounts.get(toolId) ?? 0;
-    if (count <= 0) return false;
-    if (count === 1) {
-      this.#sameToolCounts.delete(toolId);
-      return true;
-    }
-    this.#sameToolCounts.set(toolId, count - 1);
-    return false;
-  }
-
-  #mergeAll(event: ActivityEvent): ActivityEvent | null {
-    const firstOrFinal = event.toolState === "started"
-      ? this.#startAll(event.itemId)
-      : this.#completeAll(event.itemId);
-    if (!firstOrFinal) return null;
-
-    return {
-      tag: "TOOL",
-      body: event.toolState === "started" ? "tools started" : "tools completed",
-      delivery: "progress",
-    };
-  }
-
-  #startAll(itemId: string | undefined): boolean {
-    const wasEmpty = this.#activeAllToolCount() === 0;
-    if (itemId) {
-      if (this.#allToolItems.has(itemId)) return false;
-      this.#allToolItems.add(itemId);
-    } else {
-      this.#allFallbackCount++;
-    }
-    return wasEmpty;
-  }
-
-  #completeAll(itemId: string | undefined): boolean {
-    if (itemId) {
-      if (!this.#allToolItems.delete(itemId)) return false;
-    } else {
-      if (this.#allFallbackCount <= 0) return false;
-      this.#allFallbackCount--;
-    }
-    return this.#activeAllToolCount() === 0;
-  }
-
-  #activeAllToolCount(): number {
-    return this.#allToolItems.size + this.#allFallbackCount;
-  }
-
-  #toolId(event: ActivityEvent): string {
-    return event.toolId ?? "__turn_fallback_tool__";
   }
 
   #excerpt(event: ActivityEvent, source: string): string | null {

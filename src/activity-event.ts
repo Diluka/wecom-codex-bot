@@ -10,7 +10,6 @@ export interface ActivityEvent {
   threadId?: string;
   turnId?: string;
   itemId?: string;
-  toolId?: string;
   toolState?: ActivityToolState;
   delivery: ActivityDelivery;
 }
