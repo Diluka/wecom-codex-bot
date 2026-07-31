@@ -1,4 +1,9 @@
-import { assertEquals, assertMatch, assertStrictEquals } from "@std/assert";
+import {
+  assertEquals,
+  assertMatch,
+  assertRejects,
+  assertStrictEquals,
+} from "@std/assert";
 import { describe, it } from "@std/testing/bdd";
 
 import type {
@@ -290,6 +295,239 @@ describe("CodexRuntime", () => {
     await runtime.stop();
   });
 
+  it("clears early subagent state when a turn start rejects before activation", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    let rejectFirstTurn!: (reason?: unknown) => void;
+    const firstTurn = new Promise<string>((_resolve, reject) => {
+      rejectFirstTurn = reject;
+    });
+    client.turnIds.push(firstTurn, "turn-retry");
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const failedStart = runtime.startTurn("parent-retry", "first", () => {});
+    await waitFor(() => client.startedTurns.length === 1, "first turn RPC");
+    client.callbacks.onNotification?.({
+      method: "item/started",
+      params: {
+        threadId: "parent-retry",
+        turnId: "turn-retry",
+        item: {
+          type: "collabAgentToolCall",
+          receiverThreadIds: ["child-retry"],
+        },
+      },
+    });
+    rejectFirstTurn(new Error("first turn failed"));
+    await assertRejects(() => failedStart, Error, "first turn failed");
+
+    const activities: ActivityEvent[] = [];
+    const retry = await runtime.startTurn(
+      "parent-retry",
+      "retry",
+      (activity) => {
+        activities.push(activity);
+      },
+    );
+    client.callbacks.onThreadStarted?.({
+      threadId: "child-retry",
+      parentThreadId: "parent-retry",
+      agentNickname: "stale-name",
+    });
+
+    assertEquals(
+      activities.filter((activity) => activity.tag === "SUBAGENT"),
+      [],
+    );
+
+    client.callbacks.onTurnCompleted?.({
+      threadId: "parent-retry",
+      turnId: "turn-retry",
+      status: "completed",
+      error: null,
+    });
+    await retry.completion;
+    await runtime.stop();
+  });
+
+  it("keeps active subagent state when another turn start rejects", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    let rejectFailedTurn!: (reason?: unknown) => void;
+    const failedTurn = new Promise<string>((_resolve, reject) => {
+      rejectFailedTurn = reject;
+    });
+    client.turnIds.push("turn-active", failedTurn);
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const activities: ActivityEvent[] = [];
+    const active = await runtime.startTurn(
+      "parent-active",
+      "active",
+      (activity) => {
+        activities.push(activity);
+      },
+    );
+    client.callbacks.onNotification?.({
+      method: "item/started",
+      params: {
+        threadId: "parent-active",
+        turnId: "turn-active",
+        item: {
+          type: "collabAgentToolCall",
+          receiverThreadIds: ["child-active"],
+        },
+      },
+    });
+
+    const failedStart = runtime.startTurn("parent-active", "failed", () => {});
+    await waitFor(() => client.startedTurns.length === 2, "failed turn RPC");
+    client.callbacks.onNotification?.({
+      method: "item/started",
+      params: {
+        threadId: "parent-active",
+        turnId: "turn-failed",
+        item: {
+          type: "collabAgentToolCall",
+          receiverThreadIds: ["child-failed"],
+        },
+      },
+    });
+    rejectFailedTurn(new Error("failed turn"));
+    await assertRejects(() => failedStart, Error, "failed turn");
+
+    client.callbacks.onThreadStarted?.({
+      threadId: "child-active",
+      parentThreadId: "parent-active",
+      agentNickname: "active-name",
+    });
+    client.callbacks.onThreadStarted?.({
+      threadId: "child-failed",
+      parentThreadId: "parent-active",
+      agentNickname: "stale-name",
+    });
+
+    assertEquals(
+      activities.filter((activity) => activity.tag === "SUBAGENT"),
+      [{
+        tag: "SUBAGENT",
+        body: "active-name：已启动",
+        itemId: "child-active",
+        threadId: "parent-active",
+        turnId: "turn-active",
+        delivery: "progress",
+      }],
+    );
+
+    client.callbacks.onTurnCompleted?.({
+      threadId: "parent-active",
+      turnId: "turn-active",
+      status: "completed",
+      error: null,
+    });
+    await active.completion;
+    await runtime.stop();
+  });
+
+  it("drops unactivated subagent state when a concurrent start rejects", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    const failedResponse = Promise.withResolvers<string>();
+    const pendingResponse = Promise.withResolvers<string>();
+    client.turnIds.push(
+      failedResponse.promise,
+      pendingResponse.promise,
+      "turn-concurrent-a",
+    );
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const failedStart = runtime.startTurn(
+      "parent-concurrent",
+      "first",
+      () => {},
+    );
+    await waitFor(() => client.startedTurns.length === 1, "first turn RPC");
+    const pendingActivities: ActivityEvent[] = [];
+    const pendingStart = runtime.startTurn(
+      "parent-concurrent",
+      "second",
+      (activity) => {
+        pendingActivities.push(activity);
+      },
+    );
+    await waitFor(() => client.startedTurns.length === 2, "second turn RPC");
+    client.callbacks.onNotification?.({
+      method: "item/started",
+      params: {
+        threadId: "parent-concurrent",
+        turnId: "turn-concurrent-a",
+        item: {
+          type: "collabAgentToolCall",
+          receiverThreadIds: ["child-concurrent"],
+        },
+      },
+    });
+    client.callbacks.onThreadStarted?.({
+      threadId: "child-concurrent",
+      parentThreadId: "parent-concurrent",
+      agentNickname: "stale-name",
+    });
+    client.callbacks.onNotification?.({
+      method: "item/reasoning/summaryTextDelta",
+      params: {
+        threadId: "parent-concurrent",
+        turnId: "turn-concurrent-a",
+        delta: "safe early progress",
+      },
+    });
+    failedResponse.reject(new Error("first concurrent turn failed"));
+    await assertRejects(
+      () => failedStart,
+      Error,
+      "first concurrent turn failed",
+    );
+
+    pendingResponse.resolve("turn-concurrent-a");
+    const pending = await pendingStart;
+    assertEquals(
+      pendingActivities.filter((activity) => activity.tag === "SUBAGENT"),
+      [],
+    );
+    assertEquals(pendingActivities, [
+      {
+        tag: "TOOL",
+        summary: "collaboration",
+        toolId: "collaboration:collaboration",
+        toolState: "started",
+        threadId: "parent-concurrent",
+        turnId: "turn-concurrent-a",
+        delivery: "progress",
+      },
+      {
+        tag: "CONTENT",
+        body: "safe early progress",
+        threadId: "parent-concurrent",
+        turnId: "turn-concurrent-a",
+        delivery: "progress",
+      },
+    ]);
+
+    client.callbacks.onTurnCompleted?.({
+      threadId: "parent-concurrent",
+      turnId: "turn-concurrent-a",
+      status: "completed",
+      error: null,
+    });
+    await pending.completion;
+    await runtime.stop();
+  });
+
   it("replays raw early activity events, including direct user input, in arrival order", async () => {
     const factory = new FakeFactory();
     const client = new FakeClient();
@@ -434,6 +672,787 @@ describe("CodexRuntime", () => {
       error: null,
     });
     await handle.completion;
+    await runtime.stop();
+  });
+
+  it("routes named subagent statuses through the parent turn once per state", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    client.turnIds.push("turn-1");
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const activities: ActivityEvent[] = [];
+    const handle = await runtime.startTurn(
+      "parent-1",
+      "work",
+      (activity) => {
+        activities.push(activity);
+      },
+    );
+
+    client.callbacks.onNotification?.({
+      method: "item/started",
+      params: {
+        threadId: "parent-1",
+        turnId: "turn-1",
+        item: {
+          type: "collabAgentToolCall",
+          receiverThreadIds: ["child-1"],
+        },
+      },
+    });
+    client.callbacks.onThreadStarted?.({
+      threadId: "child-1",
+      parentThreadId: "parent-1",
+      agentNickname: "amber-otter",
+      agentRole: "reviewer",
+    });
+    client.callbacks.onNotification?.({
+      method: "item/completed",
+      params: {
+        threadId: "parent-1",
+        turnId: "turn-1",
+        item: {
+          type: "subAgentActivity",
+          agentThreadId: "child-1",
+          kind: "started",
+        },
+      },
+    });
+    client.callbacks.onNotification?.({
+      method: "item/completed",
+      params: {
+        threadId: "parent-1",
+        turnId: "turn-1",
+        item: {
+          type: "subAgentActivity",
+          agentThreadId: "child-1",
+          kind: "started",
+        },
+      },
+    });
+
+    assertEquals(
+      activities.filter((activity) => activity.tag === "SUBAGENT"),
+      [
+        {
+          tag: "SUBAGENT",
+          body: "amber-otter (reviewer)：已启动",
+          itemId: "child-1",
+          threadId: "parent-1",
+          turnId: "turn-1",
+          delivery: "progress",
+        },
+        {
+          tag: "SUBAGENT",
+          body: "amber-otter (reviewer)：正在工作",
+          itemId: "child-1",
+          threadId: "parent-1",
+          turnId: "turn-1",
+          delivery: "progress",
+        },
+      ],
+    );
+
+    client.callbacks.onNotification?.({
+      method: "item/updated",
+      params: {
+        threadId: "parent-1",
+        turnId: "turn-1",
+        item: {
+          type: "collabAgentToolCall",
+          agentsStates: { "child-1": { status: "completed" } },
+        },
+      },
+    });
+
+    assertEquals(
+      activities.filter((activity) => activity.tag === "SUBAGENT"),
+      [
+        {
+          tag: "SUBAGENT",
+          body: "amber-otter (reviewer)：已启动",
+          itemId: "child-1",
+          threadId: "parent-1",
+          turnId: "turn-1",
+          delivery: "progress",
+        },
+        {
+          tag: "SUBAGENT",
+          body: "amber-otter (reviewer)：正在工作",
+          itemId: "child-1",
+          threadId: "parent-1",
+          turnId: "turn-1",
+          delivery: "progress",
+        },
+        {
+          tag: "SUBAGENT",
+          body: "amber-otter (reviewer)：已完成",
+          itemId: "child-1",
+          threadId: "parent-1",
+          turnId: "turn-1",
+          delivery: "progress",
+        },
+      ],
+    );
+
+    client.callbacks.onTurnCompleted?.({
+      threadId: "parent-1",
+      turnId: "turn-1",
+      status: "completed",
+      error: null,
+    });
+    await handle.completion;
+    await runtime.stop();
+  });
+
+  it("replays distinct pending subagent statuses when metadata arrives", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    client.turnIds.push("turn-pending");
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const activities: ActivityEvent[] = [];
+    const handle = await runtime.startTurn(
+      "parent-pending",
+      "work",
+      (activity) => {
+        activities.push(activity);
+      },
+    );
+
+    client.callbacks.onNotification?.({
+      method: "item/started",
+      params: {
+        threadId: "parent-pending",
+        turnId: "turn-pending",
+        item: {
+          type: "collabAgentToolCall",
+          receiverThreadIds: ["child-pending"],
+        },
+      },
+    });
+    client.callbacks.onThreadStarted?.({
+      threadId: "child-pending",
+      parentThreadId: "parent-pending",
+    });
+    for (const method of ["item/completed", "item/updated"] as const) {
+      client.callbacks.onNotification?.({
+        method,
+        params: {
+          threadId: "parent-pending",
+          turnId: "turn-pending",
+          item: {
+            type: "subAgentActivity",
+            agentThreadId: "child-pending",
+            kind: "started",
+          },
+        },
+      });
+    }
+    client.callbacks.onThreadStarted?.({
+      threadId: "child-pending",
+      parentThreadId: "parent-pending",
+      agentNickname: "queue-name",
+    });
+
+    assertEquals(
+      activities.filter((activity) => activity.tag === "SUBAGENT"),
+      [
+        {
+          tag: "SUBAGENT",
+          body: "queue-name：已启动",
+          itemId: "child-pending",
+          threadId: "parent-pending",
+          turnId: "turn-pending",
+          delivery: "progress",
+        },
+        {
+          tag: "SUBAGENT",
+          body: "queue-name：正在工作",
+          itemId: "child-pending",
+          threadId: "parent-pending",
+          turnId: "turn-pending",
+          delivery: "progress",
+        },
+      ],
+    );
+
+    client.callbacks.onTurnCompleted?.({
+      threadId: "parent-pending",
+      turnId: "turn-pending",
+      status: "completed",
+      error: null,
+    });
+    await handle.completion;
+    await runtime.stop();
+  });
+
+  it("does not replay pending statuses after an anonymous terminal fallback", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    client.turnIds.push("turn-terminal-pending");
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const activities: ActivityEvent[] = [];
+    const handle = await runtime.startTurn(
+      "parent-terminal-pending",
+      "work",
+      (activity) => {
+        activities.push(activity);
+      },
+    );
+
+    client.callbacks.onNotification?.({
+      method: "item/started",
+      params: {
+        threadId: "parent-terminal-pending",
+        turnId: "turn-terminal-pending",
+        item: {
+          type: "collabAgentToolCall",
+          receiverThreadIds: ["child-terminal-pending"],
+        },
+      },
+    });
+    client.callbacks.onNotification?.({
+      method: "item/completed",
+      params: {
+        threadId: "parent-terminal-pending",
+        turnId: "turn-terminal-pending",
+        item: {
+          type: "subAgentActivity",
+          agentThreadId: "child-terminal-pending",
+          kind: "started",
+        },
+      },
+    });
+    client.callbacks.onNotification?.({
+      method: "item/updated",
+      params: {
+        threadId: "parent-terminal-pending",
+        turnId: "turn-terminal-pending",
+        item: {
+          type: "collabAgentToolCall",
+          agentsStates: {
+            "child-terminal-pending": { status: "completed" },
+          },
+        },
+      },
+    });
+    client.callbacks.onThreadStarted?.({
+      threadId: "child-terminal-pending",
+      parentThreadId: "parent-terminal-pending",
+      agentNickname: "queue-name",
+    });
+
+    assertEquals(
+      activities.filter((activity) => activity.tag === "SUBAGENT"),
+      [{
+        tag: "SUBAGENT",
+        body: "child-te：已完成",
+        itemId: "child-terminal-pending",
+        threadId: "parent-terminal-pending",
+        turnId: "turn-terminal-pending",
+        delivery: "progress",
+      }],
+    );
+
+    client.callbacks.onTurnCompleted?.({
+      threadId: "parent-terminal-pending",
+      turnId: "turn-terminal-pending",
+      status: "completed",
+      error: null,
+    });
+    await handle.completion;
+    await runtime.stop();
+  });
+
+  it("uses a child thread prefix for terminal subagent status without metadata", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    client.turnIds.push("turn-no");
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const activities: ActivityEvent[] = [];
+    const handle = await runtime.startTurn(
+      "parent-no",
+      "work",
+      (activity) => {
+        activities.push(activity);
+      },
+    );
+
+    client.callbacks.onNotification?.({
+      method: "item/updated",
+      params: {
+        threadId: "parent-no",
+        turnId: "turn-no",
+        item: {
+          type: "collabAgentToolCall",
+          agentsStates: { "child-no-name": { status: "completed" } },
+        },
+      },
+    });
+
+    assertEquals(
+      activities.filter((activity) => activity.tag === "SUBAGENT"),
+      [{
+        tag: "SUBAGENT",
+        body: "child-no：已完成",
+        itemId: "child-no-name",
+        threadId: "parent-no",
+        turnId: "turn-no",
+        delivery: "progress",
+      }],
+    );
+
+    client.callbacks.onTurnCompleted?.({
+      threadId: "parent-no",
+      turnId: "turn-no",
+      status: "completed",
+      error: null,
+    });
+    await handle.completion;
+    await runtime.stop();
+  });
+
+  it("uses a child role when it is the only available display metadata", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    client.turnIds.push("turn-role");
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const activities: ActivityEvent[] = [];
+    const handle = await runtime.startTurn(
+      "parent-role",
+      "work",
+      (activity) => {
+        activities.push(activity);
+      },
+    );
+
+    client.callbacks.onNotification?.({
+      method: "item/started",
+      params: {
+        threadId: "parent-role",
+        turnId: "turn-role",
+        item: {
+          type: "collabAgentToolCall",
+          receiverThreadIds: ["child-role"],
+        },
+      },
+    });
+    client.callbacks.onThreadStarted?.({
+      threadId: "child-role",
+      parentThreadId: "parent-role",
+      agentRole: "reviewer",
+    });
+
+    assertEquals(
+      activities.filter((activity) => activity.tag === "SUBAGENT"),
+      [{
+        tag: "SUBAGENT",
+        body: "reviewer：已启动",
+        itemId: "child-role",
+        threadId: "parent-role",
+        turnId: "turn-role",
+        delivery: "progress",
+      }],
+    );
+
+    client.callbacks.onTurnCompleted?.({
+      threadId: "parent-role",
+      turnId: "turn-role",
+      status: "completed",
+      error: null,
+    });
+    await handle.completion;
+    await runtime.stop();
+  });
+
+  it("uses a child name before its role when no nickname is available", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    client.turnIds.push("turn-name");
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const activities: ActivityEvent[] = [];
+    const handle = await runtime.startTurn(
+      "parent-name",
+      "work",
+      (activity) => {
+        activities.push(activity);
+      },
+    );
+
+    client.callbacks.onNotification?.({
+      method: "item/started",
+      params: {
+        threadId: "parent-name",
+        turnId: "turn-name",
+        item: {
+          type: "collabAgentToolCall",
+          receiverThreadIds: ["child-name"],
+        },
+      },
+    });
+    client.callbacks.onThreadStarted?.({
+      threadId: "child-name",
+      parentThreadId: "parent-name",
+      name: "literary-albatross",
+      agentRole: "reviewer",
+    });
+
+    assertEquals(
+      activities.filter((activity) => activity.tag === "SUBAGENT"),
+      [{
+        tag: "SUBAGENT",
+        body: "literary-albatross (reviewer)：已启动",
+        itemId: "child-name",
+        threadId: "parent-name",
+        turnId: "turn-name",
+        delivery: "progress",
+      }],
+    );
+
+    client.callbacks.onTurnCompleted?.({
+      threadId: "parent-name",
+      turnId: "turn-name",
+      status: "completed",
+      error: null,
+    });
+    await handle.completion;
+    await runtime.stop();
+  });
+
+  it("includes an equal-valued role when a child name is present", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    client.turnIds.push("turn-equal-name");
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const activities: ActivityEvent[] = [];
+    const handle = await runtime.startTurn(
+      "parent-equal-name",
+      "work",
+      (activity) => {
+        activities.push(activity);
+      },
+    );
+
+    client.callbacks.onNotification?.({
+      method: "item/started",
+      params: {
+        threadId: "parent-equal-name",
+        turnId: "turn-equal-name",
+        item: {
+          type: "collabAgentToolCall",
+          receiverThreadIds: ["child-equal-name"],
+        },
+      },
+    });
+    client.callbacks.onThreadStarted?.({
+      threadId: "child-equal-name",
+      parentThreadId: "parent-equal-name",
+      name: "reviewer",
+      agentRole: "reviewer",
+    });
+
+    assertEquals(
+      activities.filter((activity) => activity.tag === "SUBAGENT"),
+      [{
+        tag: "SUBAGENT",
+        body: "reviewer (reviewer)：已启动",
+        itemId: "child-equal-name",
+        threadId: "parent-equal-name",
+        turnId: "turn-equal-name",
+        delivery: "progress",
+      }],
+    );
+
+    client.callbacks.onTurnCompleted?.({
+      threadId: "parent-equal-name",
+      turnId: "turn-equal-name",
+      status: "completed",
+      error: null,
+    });
+    await handle.completion;
+    await runtime.stop();
+  });
+
+  it("clears child metadata when its parent turn completes", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    client.turnIds.push("turn-complete", "turn-next");
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const completedActivities: ActivityEvent[] = [];
+    const completed = await runtime.startTurn(
+      "parent-clean",
+      "first",
+      (activity) => {
+        completedActivities.push(activity);
+      },
+    );
+    client.callbacks.onNotification?.({
+      method: "item/started",
+      params: {
+        threadId: "parent-clean",
+        turnId: "turn-complete",
+        item: {
+          type: "collabAgentToolCall",
+          receiverThreadIds: ["child-clean"],
+        },
+      },
+    });
+    client.callbacks.onThreadStarted?.({
+      threadId: "child-clean",
+      parentThreadId: "parent-clean",
+      agentNickname: "stale-name",
+    });
+    client.callbacks.onTurnCompleted?.({
+      threadId: "parent-clean",
+      turnId: "turn-complete",
+      status: "completed",
+      error: null,
+    });
+    await completed.completion;
+
+    const nextActivities: ActivityEvent[] = [];
+    const next = await runtime.startTurn(
+      "parent-clean",
+      "second",
+      (activity) => {
+        nextActivities.push(activity);
+      },
+    );
+    client.callbacks.onNotification?.({
+      method: "item/completed",
+      params: {
+        threadId: "parent-clean",
+        turnId: "turn-next",
+        item: {
+          type: "subAgentActivity",
+          agentThreadId: "child-clean",
+          kind: "started",
+        },
+      },
+    });
+
+    assertEquals(
+      completedActivities.filter((activity) => activity.tag === "SUBAGENT"),
+      [{
+        tag: "SUBAGENT",
+        body: "stale-name：已启动",
+        itemId: "child-clean",
+        threadId: "parent-clean",
+        turnId: "turn-complete",
+        delivery: "progress",
+      }],
+    );
+    assertEquals(nextActivities, []);
+
+    client.callbacks.onTurnCompleted?.({
+      threadId: "parent-clean",
+      turnId: "turn-next",
+      status: "completed",
+      error: null,
+    });
+    await next.completion;
+    await runtime.stop();
+  });
+
+  it("clears child metadata when an App Server exit loses its parent turn", async () => {
+    const factory = new FakeFactory();
+    const crashed = new FakeClient();
+    const replacement = new FakeClient();
+    crashed.turnIds.push("turn-lost");
+    replacement.turnIds.push("turn-recovered");
+    factory.queue.push(crashed, replacement);
+    const runtime = runtimeWith(factory, { delay: async () => {} });
+    await runtime.start();
+
+    const lost = await runtime.startTurn("parent-lost", "first", () => {});
+    crashed.callbacks.onNotification?.({
+      method: "item/started",
+      params: {
+        threadId: "parent-lost",
+        turnId: "turn-lost",
+        item: {
+          type: "collabAgentToolCall",
+          receiverThreadIds: ["child-lost"],
+        },
+      },
+    });
+    crashed.callbacks.onThreadStarted?.({
+      threadId: "child-lost",
+      parentThreadId: "parent-lost",
+      agentNickname: "stale-name",
+    });
+    crashed.exit();
+    assertEquals(await lost.completion, { status: "runtime_lost" });
+    await waitFor(() => runtime.ready && runtime.generation === 2, "restart");
+
+    const recoveredActivities: ActivityEvent[] = [];
+    const recovered = await runtime.startTurn(
+      "parent-lost",
+      "second",
+      (activity) => {
+        recoveredActivities.push(activity);
+      },
+    );
+    replacement.callbacks.onNotification?.({
+      method: "item/completed",
+      params: {
+        threadId: "parent-lost",
+        turnId: "turn-recovered",
+        item: {
+          type: "subAgentActivity",
+          agentThreadId: "child-lost",
+          kind: "started",
+        },
+      },
+    });
+
+    assertEquals(recoveredActivities, []);
+    replacement.callbacks.onTurnCompleted?.({
+      threadId: "parent-lost",
+      turnId: "turn-recovered",
+      status: "completed",
+      error: null,
+    });
+    await recovered.completion;
+    await runtime.stop();
+  });
+
+  it("does not retain late child state when a parent turn id is reused", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    client.turnIds.push("turn-reused", "turn-reused");
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const first = await runtime.startTurn("parent-reused", "first", () => {});
+    client.callbacks.onTurnCompleted?.({
+      threadId: "parent-reused",
+      turnId: "turn-reused",
+      status: "completed",
+      error: null,
+    });
+    await first.completion;
+    client.callbacks.onNotification?.({
+      method: "item/started",
+      params: {
+        threadId: "parent-reused",
+        turnId: "turn-reused",
+        item: {
+          type: "collabAgentToolCall",
+          receiverThreadIds: ["child-late"],
+        },
+      },
+    });
+
+    const activities: ActivityEvent[] = [];
+    const second = await runtime.startTurn(
+      "parent-reused",
+      "second",
+      (activity) => {
+        activities.push(activity);
+      },
+    );
+    client.callbacks.onThreadStarted?.({
+      threadId: "child-late",
+      parentThreadId: "parent-reused",
+      agentNickname: "late-name",
+    });
+
+    assertEquals(activities, []);
+
+    client.callbacks.onTurnCompleted?.({
+      threadId: "parent-reused",
+      turnId: "turn-reused",
+      status: "completed",
+      error: null,
+    });
+    await second.completion;
+    await runtime.stop();
+  });
+
+  it("suppresses ambiguous child status after a parent turn id is reused", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    client.turnIds.push("turn-reused-active", "turn-reused-active");
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    const first = await runtime.startTurn(
+      "parent-reused-active",
+      "first",
+      () => {},
+    );
+    client.callbacks.onTurnCompleted?.({
+      threadId: "parent-reused-active",
+      turnId: "turn-reused-active",
+      status: "completed",
+      error: null,
+    });
+    await first.completion;
+
+    const activities: ActivityEvent[] = [];
+    const second = await runtime.startTurn(
+      "parent-reused-active",
+      "second",
+      (activity) => {
+        activities.push(activity);
+      },
+    );
+    client.callbacks.onNotification?.({
+      method: "item/started",
+      params: {
+        threadId: "parent-reused-active",
+        turnId: "turn-reused-active",
+        item: {
+          type: "collabAgentToolCall",
+          receiverThreadIds: ["child-reused-active"],
+        },
+      },
+    });
+    client.callbacks.onThreadStarted?.({
+      threadId: "child-reused-active",
+      parentThreadId: "parent-reused-active",
+      agentNickname: "old-child",
+    });
+
+    assertEquals(
+      activities.filter((activity) => activity.tag === "SUBAGENT"),
+      [],
+    );
+
+    client.callbacks.onTurnCompleted?.({
+      threadId: "parent-reused-active",
+      turnId: "turn-reused-active",
+      status: "completed",
+      error: null,
+    });
+    await second.completion;
     await runtime.stop();
   });
 

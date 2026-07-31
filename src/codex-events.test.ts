@@ -1,6 +1,9 @@
 import { assertEquals } from "@std/assert";
 import { describe, it } from "@std/testing/bdd";
-import { describeCodexNotification } from "./codex-events.ts";
+import {
+  describeCodexNotification,
+  describeSubagentStatusUpdates,
+} from "./codex-events.ts";
 
 describe("describeCodexNotification", () => {
   it("keeps safe reasoning summaries as raw content and omits private deltas", () => {
@@ -242,6 +245,173 @@ describe("describeCodexNotification", () => {
     assertEquals(
       describeCodexNotification({ method: "future/notification", params: {} }),
       null,
+    );
+  });
+});
+
+describe("describeSubagentStatusUpdates", () => {
+  it("starts every collaboration receiver in the parent turn", () => {
+    assertEquals(
+      describeSubagentStatusUpdates({
+        method: "item/started",
+        params: {
+          threadId: "parent-1",
+          turnId: "turn-1",
+          item: {
+            type: "collabAgentToolCall",
+            receiverThreadIds: ["child-1", "child-2"],
+            agentsStates: { "child-1": { status: "pendingInit" } },
+          },
+        },
+      }),
+      [
+        {
+          threadId: "parent-1",
+          turnId: "turn-1",
+          agentThreadId: "child-1",
+          status: "starting",
+        },
+        {
+          threadId: "parent-1",
+          turnId: "turn-1",
+          agentThreadId: "child-2",
+          status: "starting",
+        },
+      ],
+    );
+  });
+
+  it("omits a receiver whose collaboration state is unknown", () => {
+    assertEquals(
+      describeSubagentStatusUpdates({
+        method: "item/started",
+        params: {
+          threadId: "parent-1",
+          turnId: "turn-1",
+          item: {
+            type: "collabAgentToolCall",
+            receiverThreadIds: ["child-1"],
+            agentsStates: { "child-1": { status: "unknown" } },
+          },
+        },
+      }),
+      [],
+    );
+  });
+
+  it("maps collaboration agent states and omits unknown values", () => {
+    const cases = [
+      ["pendingInit", "starting"],
+      ["running", "working"],
+      ["completed", "completed"],
+      ["errored", "failed"],
+      ["notFound", "failed"],
+      ["shutdown", "cancelled"],
+    ] as const;
+
+    for (const [protocolStatus, status] of cases) {
+      assertEquals(
+        describeSubagentStatusUpdates({
+          method: "item/started",
+          params: {
+            threadId: "parent-1",
+            turnId: "turn-1",
+            item: {
+              type: "collabAgentToolCall",
+              agentsStates: {
+                "child-1": { status: protocolStatus },
+              },
+            },
+          },
+        }),
+        [{
+          threadId: "parent-1",
+          turnId: "turn-1",
+          agentThreadId: "child-1",
+          status,
+        }],
+      );
+    }
+
+    assertEquals(
+      describeSubagentStatusUpdates({
+        method: "item/started",
+        params: {
+          threadId: "parent-1",
+          turnId: "turn-1",
+          item: {
+            type: "collabAgentToolCall",
+            agentsStates: { "child-1": { status: "unknown" } },
+          },
+        },
+      }),
+      [],
+    );
+  });
+
+  it("maps subagent activity states in the parent turn", () => {
+    const cases = [
+      ["started", "working"],
+      ["interacted", "working"],
+      ["interrupted", "cancelled"],
+    ] as const;
+
+    for (const [kind, status] of cases) {
+      assertEquals(
+        describeSubagentStatusUpdates({
+          method: "item/completed",
+          params: {
+            threadId: "parent-1",
+            turnId: "turn-1",
+            item: {
+              type: "subAgentActivity",
+              agentThreadId: "child-1",
+              kind,
+            },
+          },
+        }),
+        [{
+          threadId: "parent-1",
+          turnId: "turn-1",
+          agentThreadId: "child-1",
+          status,
+        }],
+      );
+    }
+  });
+
+  it("ignores unknown, unsupported, and incomplete subagent items", () => {
+    assertEquals(
+      describeSubagentStatusUpdates({
+        method: "item/completed",
+        params: {
+          item: {
+            type: "subAgentActivity",
+            agentThreadId: "child-1",
+            kind: "unknown",
+          },
+        },
+      }),
+      [],
+    );
+    assertEquals(
+      describeSubagentStatusUpdates({
+        method: "item/started",
+        params: {
+          item: {
+            type: "collabAgentToolCall",
+            receiverThreadIds: [""],
+          },
+        },
+      }),
+      [],
+    );
+    assertEquals(
+      describeSubagentStatusUpdates({
+        method: "item/completed",
+        params: { item: { type: "commandExecution" } },
+      }),
+      [],
     );
   });
 });

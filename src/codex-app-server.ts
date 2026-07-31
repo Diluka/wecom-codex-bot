@@ -25,6 +25,10 @@ export type SpawnAppServer = (
 
 export interface ThreadStartedEvent {
   threadId: string;
+  parentThreadId?: string;
+  agentNickname?: string;
+  agentRole?: string;
+  name?: string;
 }
 
 export interface TurnStartedEvent {
@@ -507,7 +511,19 @@ export class CodexAppServerClient {
       case "thread/started": {
         const thread = isObject(params.thread) ? params.thread : {};
         const threadId = optionalString(thread.id);
-        if (threadId) this.#emit(this.#callbacks.onThreadStarted, { threadId });
+        const parentThreadId = optionalString(thread.parentThreadId);
+        const agentNickname = optionalString(thread.agentNickname);
+        const agentRole = optionalString(thread.agentRole);
+        const name = optionalString(thread.name);
+        if (threadId) {
+          this.#emit(this.#callbacks.onThreadStarted, {
+            threadId,
+            ...(parentThreadId ? { parentThreadId } : {}),
+            ...(agentNickname ? { agentNickname } : {}),
+            ...(agentRole ? { agentRole } : {}),
+            ...(name ? { name } : {}),
+          });
+        }
         return;
       }
       case "turn/started": {

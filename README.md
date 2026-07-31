@@ -46,20 +46,21 @@ OUTPUT_FORMAT_TOOL=individual
 | `excerpt` | 输出一个来源流的前 800 个 Unicode 码点；超出时追加一次 `...`，并抑制该来源流的后续片段。                     |
 | `full`    | 保留原始文本，不截断正文。                                                                                   |
 
-支持以下 9 个标签；标签名同时也是 `OUTPUT_LEVEL_<TAG>` 和 `OUTPUT_LABEL_<TAG>`
+支持以下 10 个标签；标签名同时也是 `OUTPUT_LEVEL_<TAG>` 和 `OUTPUT_LABEL_<TAG>`
 的后缀：
 
-| 标签          | 说明                                    |
-| ------------- | --------------------------------------- |
-| `QUEUE`       | 消息已提交给 Codex 的排队状态。         |
-| `TURN`        | turn 的开始、完成或终止状态。           |
-| `TOOL`        | 工具调用的启动与完成生命周期。          |
-| `TOOL_RESULT` | 命令、进程、文件或 MCP 等工具结果增量。 |
-| `CONTENT`     | Codex 的推理摘要或过程性内容。          |
-| `PLAN`        | Codex 生成的计划内容。                  |
-| `WARNING`     | Codex App Server 发出的警告。           |
-| `ERROR`       | Codex 或机器人运行过程中的错误。        |
-| `SHUTDOWN`    | 机器人关闭时的中断状态。                |
+| 标签          | 说明                                             |
+| ------------- | ------------------------------------------------ |
+| `QUEUE`       | 消息已提交给 Codex 的排队状态。                  |
+| `TURN`        | turn 的开始、完成或终止状态。                    |
+| `TOOL`        | 工具调用的启动与完成生命周期。                   |
+| `TOOL_RESULT` | 命令、进程、文件或 MCP 等工具结果增量。          |
+| `CONTENT`     | Codex 的推理摘要或过程性内容。                   |
+| `PLAN`        | Codex 生成的计划内容。                           |
+| `WARNING`     | Codex App Server 发出的警告。                    |
+| `ERROR`       | Codex 或机器人运行过程中的错误。                 |
+| `SHUTDOWN`    | 机器人关闭时的中断状态。                         |
+| `SUBAGENT`    | 子代理的启动、工作和终止状态；不暴露子代理内容。 |
 
 `OUTPUT_LABEL` 设置全局标签样式，`OUTPUT_LABEL_<TAG>` 可按标签覆盖；留空或未设置
 时继承全局值。`show` 会添加生成的 `[tag]` 前缀，`hide` 只移除这个前缀，不删除或

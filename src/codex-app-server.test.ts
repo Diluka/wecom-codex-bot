@@ -331,7 +331,15 @@ describe("CodexAppServerClient", () => {
       fake.send({ method: "future/unknown", params: { ignored: true } });
       fake.send({
         method: "thread/started",
-        params: { thread: { id: "thread-1" } },
+        params: {
+          thread: {
+            id: "child-1",
+            parentThreadId: "parent-1",
+            agentNickname: "amber-otter",
+            agentRole: "reviewer",
+            name: "Review API",
+          },
+        },
       });
       fake.send({
         method: "turn/started",
@@ -387,7 +395,11 @@ describe("CodexAppServerClient", () => {
       deepStrictEqual(
         observed.find((entry) => entry.name === "thread")?.value,
         {
-          threadId: "thread-1",
+          threadId: "child-1",
+          parentThreadId: "parent-1",
+          agentNickname: "amber-otter",
+          agentRole: "reviewer",
+          name: "Review API",
         },
       );
       deepStrictEqual(observed.find((entry) => entry.name === "turn")?.value, {

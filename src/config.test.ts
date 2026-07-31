@@ -13,6 +13,7 @@ import {
   OUTPUT_LEVELS,
   OUTPUT_TAGS,
   type OutputSettings,
+  parseOutputSettings,
   TOOL_OUTPUT_FORMATS,
 } from "./output-settings.ts";
 
@@ -103,6 +104,7 @@ describe("loadConfig", () => {
       "WARNING",
       "ERROR",
       "SHUTDOWN",
+      "SUBAGENT",
     ]);
     assertEquals(OUTPUT_LEVELS, ["off", "line", "excerpt", "full"]);
     assertEquals(OUTPUT_LABELS, ["show", "hide"]);
@@ -137,6 +139,16 @@ describe("loadConfig", () => {
     assertEquals(config.outputSettings.labels.CONTENT, "show");
     assertEquals(config.outputSettings.labels.TOOL, "hide");
     assertEquals(config.outputSettings.toolFormat, "merge_all");
+  });
+
+  it("accepts subagent output-level and label overrides", () => {
+    const settings = parseOutputSettings({
+      OUTPUT_LEVEL_SUBAGENT: " off ",
+      OUTPUT_LABEL_SUBAGENT: " hide ",
+    });
+
+    assertEquals(settings.levels.SUBAGENT, "off");
+    assertEquals(settings.labels.SUBAGENT, "hide");
   });
 
   it("inherits global values for absent or blank per-tag settings", async () => {

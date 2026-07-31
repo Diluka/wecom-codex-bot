@@ -5,10 +5,16 @@ import {
   CodexAppServerClient,
   type CodexAppServerOptions,
   type RequestUserInputEvent,
+  type ThreadStartedEvent,
   type TurnCompletedEvent,
 } from "./codex-app-server.ts";
 import type { ActivityEvent } from "./activity-event.ts";
-import { describeCodexNotification } from "./codex-events.ts";
+import {
+  describeCodexNotification,
+  describeSubagentStatusUpdates,
+  type SubagentStatus,
+  type SubagentStatusUpdate,
+} from "./codex-events.ts";
 import type {
   CodexPort,
   CodexTurnHandle,
@@ -46,6 +52,17 @@ interface PendingTurnStart {
   readonly generation: number;
 }
 
+interface SubagentRecord {
+  parentTurnId?: string;
+  agentNickname?: string;
+  agentRole?: string;
+  name?: string;
+  status?: SubagentStatus;
+  lastEmittedStatus?: SubagentStatus;
+  pendingStatuses?: SubagentStatus[];
+  terminalFallbackEmitted?: boolean;
+}
+
 const RESTART_DELAYS = [1_000, 2_000, 4_000, 8_000, 16_000] as const;
 const defaultClientFactory: CodexRuntimeClientFactory = (options) =>
   CodexAppServerClient.start(options);
@@ -80,9 +97,14 @@ export class CodexRuntime implements CodexPort {
   readonly #bufferedActivities = new Map<string, ActivityEvent[]>();
   readonly #bufferedOutcomes = new Map<string, TurnOutcome>();
   readonly #terminalTurnKeys = new Set<string>();
+  readonly #ambiguousSubagentTurnKeys = new Set<string>();
   readonly #startingThreads = new Map<string, Set<PendingTurnStart>>();
   readonly #connectingTokens = new Set<object>();
   readonly #earlyExits = new Map<object, AppServerProcessStatus>();
+  readonly #subagentsByParentThread = new Map<
+    string,
+    Map<string, SubagentRecord>
+  >();
 
   #client?: CodexRuntimeClient;
   #clientToken?: object;
@@ -169,6 +191,7 @@ export class CodexRuntime implements CodexPort {
     const client = this.#requireClient();
     const clientToken = this.#clientToken;
     const pendingStart = this.#startPendingTurn(threadId);
+    let activated = false;
     try {
       const turnId = await client.startTurn(threadId, prompt);
       const { promise: completion, resolve } = Promise.withResolvers<
@@ -188,8 +211,11 @@ export class CodexRuntime implements CodexPort {
         throw new Error(`Codex turn is already active: ${threadId}/${turnId}`);
       }
 
-      this.#terminalTurnKeys.delete(key);
+      if (this.#terminalTurnKeys.delete(key)) {
+        this.#ambiguousSubagentTurnKeys.add(key);
+      }
       this.#activeTurns.set(key, { onActivity, resolve });
+      activated = true;
       const activities = this.#bufferedActivities.get(key) ?? [];
       this.#bufferedActivities.delete(key);
       for (const activity of activities) {
@@ -203,7 +229,7 @@ export class CodexRuntime implements CodexPort {
       }
       return { turnId, completion };
     } finally {
-      this.#finishPendingTurn(threadId, pendingStart);
+      this.#finishPendingTurn(threadId, pendingStart, activated);
     }
   }
 
@@ -250,6 +276,7 @@ export class CodexRuntime implements CodexPort {
   #callbacks(token: object): CodexAppServerCallbacks {
     return {
       onNotification: (event) => this.#handleNotification(token, event),
+      onThreadStarted: (event) => this.#handleThreadStarted(token, event),
       onTurnCompleted: (event) => this.#handleTurnCompleted(token, event),
       onRequestUserInput: (event) => this.#handleRequestUserInput(token, event),
       onDiagnostic: (message) => this.#diagnostic(message),
@@ -261,10 +288,126 @@ export class CodexRuntime implements CodexPort {
     if (token !== this.#clientToken) return;
     const ids = notificationIds(event.params);
     if (!ids) return;
+    for (const update of describeSubagentStatusUpdates(event)) {
+      this.#recordSubagentStatus(ids.threadId, ids.turnId, update);
+    }
     const activity = describeCodexNotification(event);
     // Terminal TURN output is owned by the orchestrator and TurnOutcome.
     if (!activity || activity.tag === "TURN") return;
     this.#routeActivity(ids.threadId, ids.turnId, activity);
+  }
+
+  #handleThreadStarted(token: object, event: ThreadStartedEvent): void {
+    if (token !== this.#clientToken || !event.parentThreadId) return;
+    if (!this.#hasActiveOrPendingTurn(event.parentThreadId)) return;
+
+    const record = this.#subagentRecord(event.parentThreadId, event.threadId);
+    if (event.agentNickname) record.agentNickname = event.agentNickname;
+    if (event.agentRole) record.agentRole = event.agentRole;
+    if (event.name) record.name = event.name;
+    this.#emitSubagentStatus(event.parentThreadId, event.threadId);
+  }
+
+  #recordSubagentStatus(
+    parentThreadId: string,
+    parentTurnId: string,
+    update: SubagentStatusUpdate,
+  ): void {
+    const key = turnKey(parentThreadId, parentTurnId);
+    if (
+      this.#terminalTurnKeys.has(key) || this.#bufferedOutcomes.has(key) ||
+      this.#ambiguousSubagentTurnKeys.has(key)
+    ) {
+      return;
+    }
+    const record = this.#subagentRecord(parentThreadId, update.agentThreadId);
+    if (
+      record.parentTurnId !== undefined && record.parentTurnId !== parentTurnId
+    ) {
+      record.status = undefined;
+      record.lastEmittedStatus = undefined;
+      record.pendingStatuses = undefined;
+      record.terminalFallbackEmitted = undefined;
+    }
+    if (record.status === update.status) return;
+    record.parentTurnId = parentTurnId;
+    record.status = update.status;
+    this.#emitSubagentStatus(parentThreadId, update.agentThreadId);
+  }
+
+  #emitSubagentStatus(
+    parentThreadId: string,
+    childThreadId: string,
+  ): void {
+    const record = this.#subagentsByParentThread.get(parentThreadId)?.get(
+      childThreadId,
+    );
+    if (
+      !record?.parentTurnId || !record.status ||
+      this.#ambiguousSubagentTurnKeys.has(
+        turnKey(parentThreadId, record.parentTurnId),
+      )
+    ) {
+      return;
+    }
+
+    const displayName = subagentDisplayName(record);
+    if (!displayName) {
+      if (!isTerminalSubagentStatus(record.status)) {
+        (record.pendingStatuses ??= []).push(record.status);
+        return;
+      }
+
+      record.pendingStatuses = undefined;
+      record.terminalFallbackEmitted = true;
+      this.#routeSubagentStatus(
+        parentThreadId,
+        childThreadId,
+        record,
+        childThreadId.slice(0, 8),
+        record.status,
+      );
+      return;
+    }
+
+    if (record.terminalFallbackEmitted) return;
+    const pendingStatuses = record.pendingStatuses ?? [];
+    record.pendingStatuses = undefined;
+    for (const status of pendingStatuses) {
+      this.#routeSubagentStatus(
+        parentThreadId,
+        childThreadId,
+        record,
+        displayName,
+        status,
+      );
+    }
+    this.#routeSubagentStatus(
+      parentThreadId,
+      childThreadId,
+      record,
+      displayName,
+      record.status,
+    );
+  }
+
+  #routeSubagentStatus(
+    parentThreadId: string,
+    childThreadId: string,
+    record: SubagentRecord,
+    displayName: string,
+    status: SubagentStatus,
+  ): void {
+    if (!record.parentTurnId || record.lastEmittedStatus === status) return;
+    this.#routeActivity(parentThreadId, record.parentTurnId, {
+      tag: "SUBAGENT",
+      body: `${displayName}：${subagentStatusLabel(status)}`,
+      threadId: parentThreadId,
+      turnId: record.parentTurnId,
+      itemId: childThreadId,
+      delivery: "progress",
+    });
+    record.lastEmittedStatus = status;
   }
 
   #handleTurnCompleted(token: object, event: TurnCompletedEvent): void {
@@ -414,14 +557,18 @@ export class CodexRuntime implements CodexPort {
     if (!active) return;
     this.#activeTurns.delete(key);
     this.#terminalTurnKeys.add(key);
+    this.#ambiguousSubagentTurnKeys.delete(key);
     this.#clearBufferedTurn(key);
+    this.#clearSubagentTurn(...turnIds(key));
     active.resolve(outcome);
   }
 
   #resolveActiveTurnsAsLost(): void {
     for (const [key, active] of this.#activeTurns) {
       this.#terminalTurnKeys.add(key);
+      this.#ambiguousSubagentTurnKeys.delete(key);
       this.#clearBufferedTurn(key);
+      this.#clearSubagentTurn(...turnIds(key));
       active.resolve({ status: "runtime_lost" });
     }
     this.#activeTurns.clear();
@@ -431,7 +578,51 @@ export class CodexRuntime implements CodexPort {
     this.#bufferedActivities.clear();
     this.#bufferedOutcomes.clear();
     this.#terminalTurnKeys.clear();
+    this.#ambiguousSubagentTurnKeys.clear();
     this.#startingThreads.clear();
+    this.#subagentsByParentThread.clear();
+  }
+
+  #subagentRecord(
+    parentThreadId: string,
+    childThreadId: string,
+  ): SubagentRecord {
+    let records = this.#subagentsByParentThread.get(parentThreadId);
+    if (!records) {
+      records = new Map();
+      this.#subagentsByParentThread.set(parentThreadId, records);
+    }
+    let record = records.get(childThreadId);
+    if (!record) {
+      record = {};
+      records.set(childThreadId, record);
+    }
+    return record;
+  }
+
+  #clearSubagentTurn(parentThreadId: string, parentTurnId: string): void {
+    const records = this.#subagentsByParentThread.get(parentThreadId);
+    if (!records) return;
+
+    for (const [childThreadId, record] of records) {
+      if (
+        record.parentTurnId === parentTurnId ||
+        record.parentTurnId === undefined
+      ) {
+        records.delete(childThreadId);
+      }
+    }
+    if (records.size === 0) {
+      this.#subagentsByParentThread.delete(parentThreadId);
+    }
+  }
+
+  #hasActiveOrPendingTurn(threadId: string): boolean {
+    if (this.#isPendingTurn(threadId)) return true;
+    for (const key of this.#activeTurns.keys()) {
+      if (turnIds(key)[0] === threadId) return true;
+    }
+    return false;
   }
 
   #startPendingTurn(threadId: string): PendingTurnStart {
@@ -445,12 +636,55 @@ export class CodexRuntime implements CodexPort {
   #finishPendingTurn(
     threadId: string,
     pendingStart: PendingTurnStart,
+    activated: boolean,
   ): void {
     const pendingStarts = this.#startingThreads.get(threadId);
-    if (!pendingStarts?.delete(pendingStart) || pendingStarts.size > 0) return;
+    if (!pendingStarts?.delete(pendingStart)) return;
+    const isCurrentGeneration = pendingStart.generation === this.#generation;
+    if (isCurrentGeneration && !activated) {
+      // Early child events cannot be assigned to one concurrent pending RPC.
+      this.#clearUnactivatedSubagentThread(threadId);
+    }
+    if (pendingStarts.size > 0) return;
     this.#startingThreads.delete(threadId);
-    if (pendingStart.generation === this.#generation) {
+    if (isCurrentGeneration) {
       this.#clearBufferedThread(threadId);
+    }
+  }
+
+  #clearUnactivatedSubagentThread(parentThreadId: string): void {
+    const records = this.#subagentsByParentThread.get(parentThreadId);
+    if (!records) return;
+
+    const activeTurnIds = new Set<string>();
+    for (const key of this.#activeTurns.keys()) {
+      const [threadId, turnId] = turnIds(key);
+      if (threadId === parentThreadId) activeTurnIds.add(turnId);
+    }
+    const unactivatedTurnIds = new Set<string>();
+    for (const [childThreadId, record] of records) {
+      const belongsToActiveTurn = record.parentTurnId
+        ? activeTurnIds.has(record.parentTurnId)
+        : activeTurnIds.size > 0;
+      if (belongsToActiveTurn) continue;
+      if (record.parentTurnId) unactivatedTurnIds.add(record.parentTurnId);
+      records.delete(childThreadId);
+    }
+    if (records.size === 0) {
+      this.#subagentsByParentThread.delete(parentThreadId);
+    }
+    for (const turnId of unactivatedTurnIds) {
+      const key = turnKey(parentThreadId, turnId);
+      const buffered = this.#bufferedActivities.get(key);
+      if (!buffered) continue;
+      const retained = buffered.filter((activity) =>
+        activity.tag !== "SUBAGENT"
+      );
+      if (retained.length > 0) {
+        this.#bufferedActivities.set(key, retained);
+      } else {
+        this.#bufferedActivities.delete(key);
+      }
     }
   }
 
@@ -574,6 +808,41 @@ function optionalString(value: unknown): string | undefined {
 
 function turnKey(threadId: string, turnId: string): string {
   return `${threadId}\u0000${turnId}`;
+}
+
+function turnIds(key: string): [threadId: string, turnId: string] {
+  const delimiter = key.indexOf("\u0000");
+  return [key.slice(0, delimiter), key.slice(delimiter + 1)];
+}
+
+function subagentDisplayName(record: SubagentRecord): string | undefined {
+  const primaryName = record.agentNickname ?? record.name;
+  if (primaryName) {
+    return record.agentRole
+      ? `${primaryName} (${record.agentRole})`
+      : primaryName;
+  }
+  return record.agentRole;
+}
+
+function isTerminalSubagentStatus(status: SubagentStatus): boolean {
+  return status === "cancelled" || status === "completed" ||
+    status === "failed";
+}
+
+function subagentStatusLabel(status: SubagentStatus): string {
+  switch (status) {
+    case "starting":
+      return "已启动";
+    case "working":
+      return "正在工作";
+    case "cancelled":
+      return "已取消";
+    case "completed":
+      return "已完成";
+    case "failed":
+      return "失败";
+  }
 }
 
 function errorMessageOrNull(error: unknown): string | null {
