@@ -374,16 +374,25 @@ describe("StreamController", () => {
     await flushStarted.promise;
     queue.beginShutdown();
     const finishing = controller.finish();
-    const finishedWithinDeadline = await Promise.race([
-      finishing.then(() => true),
-      new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
-    ]);
-
-    // Keep the old implementation from leaving this test with a live stream.
-    if (!finishedWithinDeadline) flushGate.resolve();
+    let finishedWithinMicrotasks: boolean | undefined;
+    void finishing.then((finished) => {
+      finishedWithinMicrotasks = finished;
+    });
+    try {
+      for (
+        let index = 0;
+        index < 100 && finishedWithinMicrotasks === undefined;
+        index++
+      ) {
+        await Promise.resolve();
+      }
+      assertEquals(finishedWithinMicrotasks, true);
+    } finally {
+      flushGate.resolve();
+      await Promise.allSettled([flushing, finishing]);
+    }
     const [flushed, finished] = await Promise.all([flushing, finishing]);
 
-    assertEquals(finishedWithinDeadline, true);
     assertEquals(flushed, false);
     assertEquals(finished, true);
     assertEquals(calls, [false, true]);
@@ -446,7 +455,6 @@ describe("StreamController", () => {
     assertEquals(calls[2].streamId, "stream-2");
     assertEquals(calls[2].finish, false);
     assertMatch(calls[2].content, /continues/i);
-    assertEquals(controller.currentStreamId, "stream-2");
   });
 
   it("uses reserved sends for both rotation frames at the regular limit", async () => {
@@ -615,8 +623,8 @@ describe("StreamController", () => {
     controller.append("working");
     await timers.advance(9 * 60_000);
 
-    assertEquals(controller.currentStreamId, "stream-1");
     assertEquals(calls.length, 2);
+    assertEquals(calls[1].streamId, "stream-1");
     assertEquals(calls[1].finish, true);
 
     controller.append(" newer");
@@ -630,7 +638,6 @@ describe("StreamController", () => {
     assertEquals(calls[3].streamId, "stream-2");
     assertEquals(calls[3].finish, false);
     assertMatch(calls[3].content, /continues/i);
-    assertEquals(controller.currentStreamId, "stream-2");
   });
 
   it("stops automatic rotation after three consecutive failures", async () => {
@@ -666,7 +673,10 @@ describe("StreamController", () => {
 
     await timers.advance(2_500);
     assertEquals(calls.filter(({ finish }) => finish).length, 3);
-    assertEquals(controller.currentStreamId, "stream-1");
+    assertEquals(
+      calls.filter(({ finish }) => finish).map(({ streamId }) => streamId),
+      ["stream-1", "stream-1", "stream-1"],
+    );
   });
 
   it("cancels timers and finishes the current stream explicitly", async () => {

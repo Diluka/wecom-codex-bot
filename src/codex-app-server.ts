@@ -36,24 +36,10 @@ export interface TurnStartedEvent {
   turnId: string;
 }
 
-export interface AgentMessageDeltaEvent extends TurnStartedEvent {
-  itemId: string;
-  delta: string;
-}
-
-export interface ItemCompletedEvent extends TurnStartedEvent {
-  item: JsonObject;
-}
-
 export interface TurnCompletedEvent extends TurnStartedEvent {
   status: string;
   error: unknown;
   finalMessage?: string;
-}
-
-export interface AppServerErrorEvent extends TurnStartedEvent {
-  error: unknown;
-  willRetry: boolean;
 }
 
 export interface RequestUserInputEvent extends TurnStartedEvent {
@@ -69,11 +55,7 @@ export interface AppServerNotification {
 export interface CodexAppServerCallbacks {
   onNotification?: EventCallback<AppServerNotification>;
   onThreadStarted?: EventCallback<ThreadStartedEvent>;
-  onTurnStarted?: EventCallback<TurnStartedEvent>;
-  onAgentMessageDelta?: EventCallback<AgentMessageDeltaEvent>;
-  onItemCompleted?: EventCallback<ItemCompletedEvent>;
   onTurnCompleted?: EventCallback<TurnCompletedEvent>;
-  onError?: EventCallback<AppServerErrorEvent>;
   onRequestUserInput?: EventCallback<RequestUserInputEvent>;
   onDiagnostic?: EventCallback<string>;
   onExit?: EventCallback<AppServerProcessStatus>;
@@ -526,49 +508,12 @@ export class CodexAppServerClient {
         }
         return;
       }
-      case "turn/started": {
-        const threadId = optionalString(params.threadId);
-        const turn = isObject(params.turn) ? params.turn : {};
-        const turnId = optionalString(turn.id);
-        if (threadId && turnId) {
-          this.#emit(this.#callbacks.onTurnStarted, { threadId, turnId });
-        }
-        return;
-      }
-      case "item/agentMessage/delta": {
-        const threadId = optionalString(params.threadId);
-        const turnId = optionalString(params.turnId);
-        const itemId = optionalString(params.itemId);
-        const delta = optionalString(params.delta);
-        if (threadId && turnId && itemId && delta !== undefined) {
-          this.#emit(this.#callbacks.onAgentMessageDelta, {
-            threadId,
-            turnId,
-            itemId,
-            delta,
-          });
-        }
-        return;
-      }
       case "item/completed":
         this.#handleItemCompleted(params);
         return;
       case "turn/completed":
         this.#handleTurnCompleted(params);
         return;
-      case "error": {
-        const threadId = optionalString(params.threadId);
-        const turnId = optionalString(params.turnId);
-        if (threadId && turnId) {
-          this.#emit(this.#callbacks.onError, {
-            threadId,
-            turnId,
-            error: params.error,
-            willRetry: params.willRetry === true,
-          });
-        }
-        return;
-      }
       default:
         return;
     }
@@ -591,7 +536,6 @@ export class CodexAppServerClient {
       });
       this.#completedMessages.set(key, messages);
     }
-    this.#emit(this.#callbacks.onItemCompleted, { threadId, turnId, item });
   }
 
   #handleTurnCompleted(params: JsonObject): void {

@@ -44,6 +44,18 @@ export function createSafeSdkLogger(
   };
 }
 
+export function createWeComClient(
+  botId: string,
+  secret: string,
+  onSdkLog?: (level: SdkLogLevel, message: string) => void,
+): WeComClientLike {
+  return new WSClient({
+    botId,
+    secret,
+    logger: createSafeSdkLogger(secret, onSdkLog),
+  }) as unknown as WeComClientLike;
+}
+
 export interface WeComClientLike {
   on(event: string, listener: Listener): unknown;
   connect(): unknown;
@@ -171,33 +183,26 @@ function redactReplyValue(value: unknown, secret: string): unknown {
 
 /** Adapts the WeCom WebSocket SDK to normalized bot messages and replies. */
 export class WeComGateway {
-  readonly client: WeComClientLike;
-  #ready = false;
+  readonly #client: WeComClientLike;
   readonly #options: WeComGatewayOptions;
 
   constructor(options: WeComGatewayOptions) {
     this.#options = options;
-    this.client = options.client ?? (new WSClient({
-      botId: options.botId,
-      secret: options.secret,
-      logger: createSafeSdkLogger(options.secret, options.onSdkLog),
-    }) as unknown as WeComClientLike);
+    this.#client = options.client ?? createWeComClient(
+      options.botId,
+      options.secret,
+      options.onSdkLog,
+    );
     this.#registerListeners();
   }
 
-  get ready(): boolean {
-    return this.#ready;
-  }
-
   connect(): this {
-    this.#ready = false;
-    this.client.connect();
+    this.#client.connect();
     return this;
   }
 
   disconnect(): void {
-    this.#ready = false;
-    this.client.disconnect();
+    this.#client.disconnect();
   }
 
   async reply(
@@ -206,7 +211,7 @@ export class WeComGateway {
     cmd?: string,
   ): Promise<boolean> {
     try {
-      await this.client.reply(
+      await this.#client.reply(
         frame,
         redactReplyValue(body, this.#options.secret),
         cmd,
@@ -227,7 +232,7 @@ export class WeComGateway {
     try {
       // Deliberately omit msg_item and template-card arguments: the official
       // long-connection protocol only supports the plain stream body here.
-      await this.client.replyStream(
+      await this.#client.replyStream(
         frame,
         streamId,
         redactSecrets(content, [this.#options.secret]),
@@ -241,16 +246,11 @@ export class WeComGateway {
   }
 
   #registerListeners(): void {
-    this.client.on("authenticated", () => {
-      this.#ready = true;
+    this.#client.on("authenticated", () => {
       this.#dispatch(this.#options.onReady);
     });
-    this.client.on("disconnected", () => {
-      this.#ready = false;
-    });
-    this.client.on("message", (frame) => this.#handleMessage(frame));
-    this.client.on("event.disconnected_event", () => {
-      this.#ready = false;
+    this.#client.on("message", (frame) => this.#handleMessage(frame));
+    this.#client.on("event.disconnected_event", () => {
       this.#dispatch(
         this.#options.onFatal,
         new Error(
@@ -258,14 +258,13 @@ export class WeComGateway {
         ),
       );
     });
-    this.client.on("error", (value) => {
+    this.#client.on("error", (value) => {
       const error = toError(value);
       const code = errorCode(error);
       if (
         code === "WS_AUTH_FAILURE_EXHAUSTED" ||
         code === "WS_RECONNECT_EXHAUSTED"
       ) {
-        this.#ready = false;
         this.#dispatch(this.#options.onFatal, error);
       } else {
         this.#report(error);

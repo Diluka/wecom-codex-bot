@@ -146,7 +146,7 @@ describe("StateStore", () => {
       await Deno.remove(tempDirectory, { recursive: true });
     });
 
-    it("migrates and preserves state across reopen", () => {
+    it("preserves state across reopen", () => {
       const databasePath = join(tempDirectory, "state.sqlite");
       store = new StateStore(databasePath);
       const original = store.bindConversation(

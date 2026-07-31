@@ -8,6 +8,8 @@ import { describe, it } from "@std/testing/bdd";
 import { WSClient } from "@wecom/aibot-node-sdk";
 import {
   conversationKey,
+  createSafeSdkLogger,
+  createWeComClient,
   normalizeTextFrame,
   type WeComClientLike,
   WeComGateway,
@@ -181,8 +183,9 @@ describe("WeCom message normalization", () => {
 });
 
 describe("WeComGateway", () => {
-  it("becomes ready only after authenticated", () => {
+  it("calls onReady only after authenticated", () => {
     const client = new FakeClient();
+    let readyCount = 0;
     const gateway = new WeComGateway({
       botId: "bot",
       secret: "secret",
@@ -190,16 +193,19 @@ describe("WeComGateway", () => {
       onText: () => {},
       onUnsupported: () => {},
       onFatal: () => {},
+      onReady: () => {
+        readyCount++;
+      },
     });
 
     gateway.connect();
-    assertEquals(gateway.ready, false);
+    assertEquals(readyCount, 0);
     client.emit("connected");
-    assertEquals(gateway.ready, false);
+    assertEquals(readyCount, 0);
     client.emit("authenticated");
-    assertEquals(gateway.ready, true);
+    assertEquals(readyCount, 1);
     client.emit("disconnected", "network lost");
-    assertEquals(gateway.ready, false);
+    assertEquals(readyCount, 1);
     gateway.disconnect();
     assertEquals(client.connectCount, 1);
     assertEquals(client.disconnectCount, 1);
@@ -358,38 +364,16 @@ describe("WeComGateway", () => {
     assertEquals(fatals[1], exhausted);
   });
 
-  it("constructs the SDK WSClient in the production adapter", () => {
-    const gateway = new WeComGateway({
-      botId: "bot",
-      secret: "secret",
-      onText: () => {},
-      onUnsupported: () => {},
-      onFatal: () => {},
-    });
-
-    assertInstanceOf(gateway.client, WSClient);
+  it("constructs the SDK client through the production factory", () => {
+    assertInstanceOf(createWeComClient("bot", "secret"), WSClient);
   });
 
   it("uses an SDK logger that drops message bodies and redacts retained logs", () => {
     const entries: Array<{ level: string; message: string }> = [];
-    const gateway = new WeComGateway({
-      botId: "bot",
-      secret: "actual-$ecret",
-      onText: () => {},
-      onUnsupported: () => {},
-      onFatal: () => {},
-      onSdkLog: (level, message) => entries.push({ level, message }),
-    });
-    const logger = (
-      gateway.client as unknown as {
-        options: {
-          logger: {
-            debug(message: string, ...args: unknown[]): void;
-            warn(message: string, ...args: unknown[]): void;
-          };
-        };
-      }
-    ).options.logger;
+    const logger = createSafeSdkLogger(
+      "actual-$ecret",
+      (level, message) => entries.push({ level, message }),
+    );
     logger.debug(
       'body={"text":{"content":"private chat actual-$ecret"}}',
       { body: { text: { content: "private chat actual-$ecret" } } },

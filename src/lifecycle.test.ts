@@ -152,8 +152,14 @@ describe("BotLifecycle", () => {
 
     await lifecycle.stop();
 
-    assertEquals(events.at(-2), "runtime:stop");
-    assertEquals(events.at(-1), "state:close");
+    assertEquals(events, [
+      "orchestrator:interrupt",
+      "output:begin-shutdown",
+      "output:finish",
+      "gateway:disconnect",
+      "runtime:stop",
+      "state:close",
+    ]);
     assertEquals(errors.map((error) => error.message), ["finish failed"]);
   });
 

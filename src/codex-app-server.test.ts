@@ -1,4 +1,4 @@
-import { deepStrictEqual, equal, match, ok, rejects } from "node:assert/strict";
+import { deepStrictEqual, equal, match, rejects } from "node:assert/strict";
 import { assertEquals, assertRejects } from "@std/assert";
 import { describe, it } from "@std/testing/bdd";
 
@@ -308,7 +308,7 @@ describe("CodexAppServerClient", () => {
     }
   });
 
-  it("exposes scoped notification ids and selects the authoritative final message", async () => {
+  it("exposes consumed scoped notifications and selects the authoritative final message", async () => {
     const fake = new FakeAppServerProcess();
     const observed: Array<{ name: string; value: unknown }> = [];
     const client = await CodexAppServerClient.start({
@@ -317,11 +317,6 @@ describe("CodexAppServerClient", () => {
       callbacks: {
         onThreadStarted: (event) =>
           observed.push({ name: "thread", value: event }),
-        onTurnStarted: (event) => observed.push({ name: "turn", value: event }),
-        onAgentMessageDelta: (event) =>
-          observed.push({ name: "delta", value: event }),
-        onItemCompleted: (event) =>
-          observed.push({ name: "item", value: event }),
         onTurnCompleted: (event) =>
           observed.push({ name: "completed", value: event }),
       },
@@ -339,19 +334,6 @@ describe("CodexAppServerClient", () => {
             agentRole: "reviewer",
             name: "Review API",
           },
-        },
-      });
-      fake.send({
-        method: "turn/started",
-        params: { threadId: "thread-1", turn: { id: "turn-1" } },
-      });
-      fake.send({
-        method: "item/agentMessage/delta",
-        params: {
-          threadId: "thread-1",
-          turnId: "turn-1",
-          itemId: "item-1",
-          delta: "partial",
         },
       });
       fake.send({
@@ -402,16 +384,6 @@ describe("CodexAppServerClient", () => {
           name: "Review API",
         },
       );
-      deepStrictEqual(observed.find((entry) => entry.name === "turn")?.value, {
-        threadId: "thread-1",
-        turnId: "turn-1",
-      });
-      deepStrictEqual(observed.find((entry) => entry.name === "delta")?.value, {
-        threadId: "thread-1",
-        turnId: "turn-1",
-        itemId: "item-1",
-        delta: "partial",
-      });
       deepStrictEqual(
         observed.find((entry) => entry.name === "completed")?.value,
         {
@@ -459,6 +431,19 @@ describe("CodexAppServerClient", () => {
 
     try {
       fake.send({
+        method: "turn/started",
+        params: { threadId: "thread-1", turn: { id: "turn-1" } },
+      });
+      fake.send({
+        method: "item/agentMessage/delta",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          itemId: "message-1",
+          delta: "partial",
+        },
+      });
+      fake.send({
         method: "item/reasoning/summaryTextDelta",
         params: {
           threadId: "thread-1",
@@ -482,12 +467,14 @@ describe("CodexAppServerClient", () => {
       });
 
       await waitFor(
-        () => notifications.length === 3,
+        () => notifications.length === 5,
         "generic notification callbacks",
       );
       deepStrictEqual(
         notifications.map((notification) => notification.method),
         [
+          "turn/started",
+          "item/agentMessage/delta",
           "item/reasoning/summaryTextDelta",
           "item/commandExecution/outputDelta",
           "future/notification",
@@ -495,11 +482,21 @@ describe("CodexAppServerClient", () => {
       );
       deepStrictEqual(notifications[0].params, {
         threadId: "thread-1",
+        turn: { id: "turn-1" },
+      });
+      deepStrictEqual(notifications[1].params, {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "message-1",
+        delta: "partial",
+      });
+      deepStrictEqual(notifications[2].params, {
+        threadId: "thread-1",
         turnId: "turn-1",
         itemId: "reasoning-1",
         delta: "summary",
       });
-      deepStrictEqual(notifications[1].params, {
+      deepStrictEqual(notifications[3].params, {
         threadId: "thread-1",
         turnId: "turn-1",
         itemId: "command-1",
@@ -646,7 +643,6 @@ describe("CodexAppServerClient", () => {
     await waitFor(() => exits.length === 1, "exit callback");
     match(diagnostics.join(""), /not-a-protocol-message/);
     deepStrictEqual(exits, [{ success: false, code: 7, signal: null }]);
-    ok(true);
   });
 
   it("times out an unresponsive RPC and terminates the process", async () => {

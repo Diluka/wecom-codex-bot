@@ -150,14 +150,6 @@ export class ProgressBuffer {
   snapshot(): string {
     return this.#content;
   }
-
-  clear(): void {
-    this.#content = "";
-  }
-
-  toString(): string {
-    return this.snapshot();
-  }
 }
 
 export type WeComStreamSender = (
@@ -595,14 +587,6 @@ export class StreamController {
     this.#maxRotationAttempts = options.maxRotationAttempts ??
       DEFAULT_MAX_ROTATION_ATTEMPTS;
     this.#streamId = this.#streamIdFactory();
-  }
-
-  get currentStreamId(): string {
-    return this.#streamId;
-  }
-
-  get finished(): boolean {
-    return this.#finished;
   }
 
   append(content: string): this {
