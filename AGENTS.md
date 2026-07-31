@@ -25,8 +25,8 @@ Codex notifications
   -> WeCom reply/stream
 ```
 
-- 程序入口是 `main.ts`，这里只组装依赖、安装信号处理并统一配置 Pino 日志脱敏、
-  终端输出和 `logs/` 文件 transport。
+- 程序入口是 `main.ts`，这里只组装依赖、安装信号处理并统一配置 Pino 终端输出和
+  `logs/` 文件 transport。
 - `CODEX_WORKSPACE` 是 Codex 实际工作的目录；它相对进程工作目录解析，标准
   `deno task start` 从仓库根启动时才等同于相对项目根解析。
 - `.data/bot.sqlite` 只保存聊天/thread 绑定、消息去重和 turn
@@ -48,12 +48,12 @@ Codex notifications
 | `src/codex-events.ts`        | 将允许公开的 Codex 通知转换为原始 `ActivityEvent`                 |
 | `src/output-settings.ts`     | 定义并解析输出级别、标签和工具格式配置                            |
 | `src/output-pipeline.ts`     | 按来源流过滤、截断、加标签并格式化工具输出                        |
-| `src/output.ts`              | UTF-8 安全切分、脱敏、限流、发送串行化和流轮换                    |
+| `src/output.ts`              | UTF-8 安全切分、限流、发送串行化和流轮换                          |
 | `src/chat-output.ts`         | 把通用输出能力接到企业微信回复与流式消息                          |
 | `src/lifecycle.ts`           | 固定启动、恢复和优雅关闭顺序                                      |
 | `src/prompt.ts`              | 把不可伪造的聊天/发送者元数据加入 Codex prompt                    |
 | `src/process-log.ts`         | 每次启动前轮换旧的 Pino 活跃日志文件                              |
-| `src/jsonl.ts`、`src/log.ts` | JSONL 读取、Pino transport、脱敏和日志字符串截断等边界工具        |
+| `src/jsonl.ts`、`src/log.ts` | JSONL 读取、Pino transport 和日志字符串截断等边界工具             |
 
 测试与实现共置为 `src/*.test.ts`。修改某个模块时，先读同名测试；这里大量行为
 依赖并发时序，测试往往比类型签名更完整地描述契约。
@@ -77,6 +77,10 @@ Codex notifications
   pending，并请求中断活动 turn；它保留 thread 绑定。停止后的新普通文本可以重新
   开始防抖窗口，且停止范围不能影响其他 conversation。
 - 所有普通文本、命令和不支持的消息都必须先通过 `msgid` 去重。
+- 项目不识别、扫描、替换或脱敏聊天内容、Codex 输出、工具结果、错误消息、企业微信
+  SDK 日志或 Pino 字段中的敏感值。企业微信输出只做格式化、长度控制、限流和分段；
+  是否避免模型输出敏感信息完全依赖模型自觉。日志单行化、截断和元数据最小化不是
+  敏感值保护。
 - `WECOM_OWNER_USER_ID` 缺失、空白或无效时，所有 turn 都必须按 `restricted`
   处理。必须先检查原始值；任意位置含控制符（包括 CR/LF）或 Unicode 行/段分隔符
   即无效，不能先 trim 后绕过。其余值 trim 普通首尾空格后，与每条消息的 sender
@@ -147,7 +151,7 @@ Codex notifications
   `.env.example`，还要更新 README 配置表和测试。旧变量
   `CODEX_INTERMEDIATE_OUTPUT`、`CODEX_STATUS_DETAIL`
   已被静默忽略，不要重新接回运行时。
-- 消息切分、限流、脱敏或流式发送：优先改 `src/output.ts` 的通用能力，再通过
+- 消息切分、限流或流式发送：优先改 `src/output.ts` 的通用能力，再通过
   `src/chat-output.ts` 接入；所有长度边界都要按 UTF-8 验证，不能按 JavaScript
   字符串下标想当然处理。
 - SQLite 结构：在 `src/state.ts` 中迁移并提高
@@ -216,15 +220,17 @@ git ls-files -co --exclude-standard -z -- '*.ts' '*.json' '*.md' | xargs -0 deno
   不得提交。不要回显真实 `BOT_ID`、`BOT_SECRET`、Codex 登录信息、聊天标识或
   SQLite 内容。
 - Codex 生命周期日志只记录方法、标识、类型、状态、耗时、长度和路由结果，不得写入
-  聊天正文、reasoning summary、命令、参数或工具输出。所有 Pino
-  字符串先脱敏并限制为最多 100 个 Unicode 字素簇。高频 delta 按
-  method/thread/turn/item 聚合，在 item、turn 完成或进程退出时记录累计 chunk
-  数和长度；不得逐块重复打印生命周期、路由或工具结果决策日志。App Server 原始
+  聊天正文、reasoning summary、命令、参数或工具输出。经过 Pino log method 的
+  消息和顶层字符串字段只会单行化，并限制为最多 100 个 Unicode 字素簇。普通嵌套
+  结构由 Pino 原生处理；这些处理不会检测或脱敏敏感值。高频 delta 按
+  method/thread/turn/item 聚合。它只在 item、turn 完成或进程退出时记录累计 chunk
+  数和长度。不得逐块重复打印生命周期、路由或工具结果决策日志。App Server 原始
   stderr 只记录 chunk 长度，不记录原文。
 - App Server 子进程环境会显式移除 `BOT_ID`、`BOT_SECRET` 和
   `WECOM_OWNER_USER_ID`，但 owner ID 仍通过 developer instructions 对模型可见，
   也可能出现在 argv 或 session metadata；如果 `.env` 位于 `CODEX_WORKSPACE` 内，
-  Codex 仍可直接读取该文件。输出脱敏不是 Secret 隔离边界。
+  Codex 仍可直接读取该文件。环境变量移除只是进程隔离；项目不提供输出或日志级敏感
+  值过滤，相关风险完全依赖模型自觉以及使用者不要把凭据放进模型可读的聊天和工作区。
 - `~/.codex` 和 `~/.agents` 包含高敏配置与凭据。Compose 会把它们挂进容器；不要在
   测试、日志或提交中复制其内容。
 - 同一个 Bot ID 同时只能运行一个实例。不要并行启动 `deno task start` 与

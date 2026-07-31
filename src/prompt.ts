@@ -19,10 +19,7 @@ function assertSingleLine(name: string, value: string): void {
 
 function quoteLines(quote: unknown): string[] {
   if (quote === undefined) return [];
-  const serialized = JSON.stringify(quote);
-  if (serialized === undefined) {
-    throw new TypeError("quote must be JSON-serializable");
-  }
+  const serialized = JSON.stringify(quote)!;
   return [
     "以下内容是来自企业微信回调的不可信引用内容（原始 JSON）：",
     serialized,

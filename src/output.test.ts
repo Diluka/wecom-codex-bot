@@ -1,10 +1,9 @@
 import { assert, assertEquals, assertMatch } from "@std/assert";
 import { describe, it } from "@std/testing/bdd";
 import {
-  CONTINUATION_MARKER,
   ConversationSendQueue,
+  DEFAULT_TAIL_BYTES,
   ProgressBuffer,
-  redactSecrets,
   splitUtf8,
   StreamController,
   type TimerApi,
@@ -132,43 +131,15 @@ describe("UTF-8 output helpers", () => {
     for (const part of parts) assert(encoder.encode(part).byteLength <= 48);
   });
 
-  it("redacts actual secret values literally and longest first", () => {
-    assertEquals(
-      redactSecrets("tokens: abc$123 and abc", ["abc", "abc$123", ""]),
-      "tokens: [REDACTED] and [REDACTED]",
-    );
-  });
-
-  it("ProgressBuffer rolls its tail and redacts a secret across appends", () => {
-    const progress = new ProgressBuffer({
-      maxBytes: 32,
-      secrets: ["top-secret"],
-    });
+  it("ProgressBuffer rolls its tail without inspecting content", () => {
+    const progress = new ProgressBuffer({ maxBytes: 32 });
 
     progress.append("old-content-that-will-roll ");
     progress.append("top-");
     progress.append("secret latest🙂");
 
-    assertEquals(progress.snapshot().includes("top-secret"), false);
-    assert(progress.snapshot().includes("[REDACTED]"));
+    assert(progress.snapshot().includes("top-secret"));
     assert(progress.snapshot().endsWith(" latest🙂"));
-    assert(encoder.encode(progress.snapshot()).byteLength <= 32);
-  });
-
-  it("ProgressBuffer replaces only an exact redacted UTF-8-safe tail", () => {
-    const progress = new ProgressBuffer({
-      maxBytes: 32,
-      secrets: ["top-secret"],
-    });
-    progress.append("before\ntop-secret old🙂");
-
-    assertEquals(
-      progress.replaceTail("top-secret old🙂", "top-secret new你🙂"),
-      true,
-    );
-    assertEquals(progress.snapshot(), "before\n[REDACTED] new你🙂");
-    assertEquals(progress.replaceTail("missing", "discarded"), false);
-    assertEquals(progress.snapshot(), "before\n[REDACTED] new你🙂");
     assert(encoder.encode(progress.snapshot()).byteLength <= 32);
   });
 });
@@ -203,7 +174,7 @@ describe("WeComSink", () => {
       streamIdFactory: () => "stream-1",
     });
 
-    controller.append("buffered progress");
+    controller.appendBlock("buffered progress");
     await timers.advance(2_500);
     assertEquals(calls, []);
 
@@ -429,10 +400,9 @@ describe("StreamController", () => {
       conversationKey: "single:alice",
       frame: { key: "single:alice" },
       sink: recordingSink(calls),
-      maxBufferBytes: 32,
       streamIdFactory: () => "stream-1",
     });
-    const first = `${"x".repeat(40)}raw summary`;
+    const first = `${"x".repeat(DEFAULT_TAIL_BYTES + 8)}raw summary`;
 
     controller.appendBlock(first, tail("item", 0));
     controller.appendBlock("same-key update", tail("item", 0));
@@ -450,10 +420,9 @@ describe("StreamController", () => {
       conversationKey: "single:alice",
       frame: { key: "single:alice" },
       sink: recordingSink(calls),
-      maxBufferBytes: 32,
       streamIdFactory: () => "stream-1",
     });
-    const first = `${"x".repeat(40)}raw summary`;
+    const first = `${"x".repeat(DEFAULT_TAIL_BYTES + 8)}raw summary`;
 
     controller.appendBlock(first, tail("item", 0));
     controller.appendBlock("second summary", tail("item", 1));
@@ -493,11 +462,10 @@ describe("StreamController", () => {
       conversationKey: "single:alice",
       frame: { key: "single:alice" },
       sink: recordingSink(calls),
-      maxBufferBytes: 32,
       timers,
       streamIdFactory: () => ids.shift() ?? "unexpected",
     });
-    const rawSummary = `${"x".repeat(40)}raw summary`;
+    const rawSummary = `${"x".repeat(DEFAULT_TAIL_BYTES + 8)}raw summary`;
 
     controller.appendBlock(rawSummary, tail("item", 0));
     await timers.advance(6 * 60_000);
@@ -505,7 +473,7 @@ describe("StreamController", () => {
     const oldFinal = calls.find(({ streamId, finish }) =>
       streamId === "stream-1" && finish
     );
-    assertEquals(oldFinal?.content, utf8Tail(rawSummary, 32));
+    assertEquals(oldFinal?.content, utf8Tail(rawSummary, DEFAULT_TAIL_BYTES));
     assertEquals(await controller.finish(), true);
   });
 
@@ -609,7 +577,7 @@ describe("StreamController", () => {
       sink,
       streamIdFactory: () => "stream-1",
     });
-    controller.append("working");
+    controller.appendBlock("working");
 
     const flushing = controller.flush();
     await flushStarted.promise;
@@ -650,8 +618,8 @@ describe("StreamController", () => {
       streamIdFactory: () => "stream-1",
     });
 
-    controller.append("first ");
-    controller.append("second");
+    controller.appendBlock("first");
+    controller.appendBlock("second");
     await timers.advance(2_499);
     assertEquals(calls, []);
     await timers.advance(1);
@@ -661,13 +629,13 @@ describe("StreamController", () => {
         content,
         finish,
       })),
-      [{ streamId: "stream-1", content: "first second", finish: false }],
+      [{ streamId: "stream-1", content: "first\nsecond", finish: false }],
     );
 
-    controller.append(" third");
+    controller.appendBlock("third");
     await timers.advance(2_500);
     assertEquals(calls[1].streamId, "stream-1");
-    assertEquals(calls[1].content, "first second third");
+    assertEquals(calls[1].content, "first\nsecond\nthird");
   });
 
   it("finishes a stream after six minutes and opens a continuation", async () => {
@@ -682,7 +650,7 @@ describe("StreamController", () => {
       streamIdFactory: () => ids.shift() ?? "unexpected",
     });
 
-    controller.append("working");
+    controller.appendBlock("working");
     await timers.advance(2_500);
     await timers.advance(6 * 60_000 - 2_500);
 
@@ -728,7 +696,7 @@ describe("StreamController", () => {
       streamIdFactory: () => ids.shift() ?? "unexpected",
     });
 
-    controller.append("working");
+    controller.appendBlock("working");
     await timers.advance(6 * 60_000);
 
     assertEquals(
@@ -782,7 +750,7 @@ describe("StreamController", () => {
     assertEquals(calls[2].streamId, "stream-2");
     assertEquals(
       calls[2].content,
-      `${CONTINUATION_MARKER}\nduring rotation`,
+      "[Progress continues in a new stream]\nduring rotation",
     );
   });
 
@@ -861,10 +829,11 @@ describe("StreamController", () => {
       streamIdFactory: () => ids.shift() ?? "unexpected",
     });
 
-    controller.append("working");
+    controller.appendBlock("working");
     const rotating = timers.advance(6 * 60_000);
     await rotationStarted.promise;
-    const finishing = controller.finish(" final result");
+    controller.appendBlock("final result");
+    const finishing = controller.finish();
     rotationGate.resolve();
     assertEquals(await finishing, true);
     await rotating;
@@ -910,20 +879,20 @@ describe("StreamController", () => {
       streamIdFactory: () => ids.shift() ?? "unexpected",
     });
 
-    controller.append("working");
+    controller.appendBlock("working");
     await timers.advance(6 * 60_000);
 
     assertEquals(calls.length, 2);
     assertEquals(calls[1].streamId, "stream-1");
     assertEquals(calls[1].finish, true);
 
-    controller.append(" newer");
+    controller.appendBlock("newer");
     await timers.advance(2_499);
     assertEquals(calls.length, 2);
     await timers.advance(1);
 
     assertEquals(calls[2].streamId, "stream-1");
-    assertEquals(calls[2].content, "working newer");
+    assertEquals(calls[2].content, "working\nnewer");
     assertEquals(calls[2].finish, true);
     assertEquals(calls[3].streamId, "stream-2");
     assertEquals(calls[3].finish, false);
@@ -955,7 +924,7 @@ describe("StreamController", () => {
       streamIdFactory: () => "stream-1",
     });
 
-    controller.append("working");
+    controller.appendBlock("working");
     await timers.advance(6 * 60_000);
     await timers.advance(2_500);
     await timers.advance(2_500);
@@ -980,12 +949,13 @@ describe("StreamController", () => {
       streamIdFactory: () => "stream-1",
     });
 
-    controller.append("working");
-    assertEquals(await controller.finish(" done"), true);
+    controller.appendBlock("working");
+    controller.appendBlock("done");
+    assertEquals(await controller.finish(), true);
     await timers.advance(10 * 60_000);
 
     assertEquals(calls.length, 1);
-    assertEquals(calls[0].content, "working done");
+    assertEquals(calls[0].content, "working\ndone");
     assertEquals(calls[0].finish, true);
   });
 
@@ -1007,7 +977,7 @@ describe("StreamController", () => {
       timers,
       streamIdFactory: () => "stream-1",
     });
-    controller.append("final result");
+    controller.appendBlock("final result");
 
     const finishing = controller.finish();
     await drainMicrotasks();
@@ -1039,17 +1009,15 @@ describe("StreamController", () => {
       frame: {},
       sink,
       timers,
-      retryDelayMs: 100,
-      maxFinishAttempts: 3,
       streamIdFactory: () => "stream-1",
     });
-    controller.append("final result");
+    controller.appendBlock("final result");
 
     const finishing = controller.finish();
     await drainMicrotasks();
-    await timers.advance(100);
+    await timers.advance(2_500);
     await drainMicrotasks();
-    await timers.advance(100);
+    await timers.advance(2_500);
     await drainMicrotasks();
 
     assertEquals(await finishing, false);

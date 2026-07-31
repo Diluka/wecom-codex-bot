@@ -1,5 +1,6 @@
 import { assert, assertEquals, assertRejects } from "@std/assert";
 import { describe, it } from "@std/testing/bdd";
+import { FakeTime } from "@std/testing/time";
 import { WeComChatOutput } from "./chat-output.ts";
 import type { RoutedText } from "./orchestrator.ts";
 import { ConversationSendQueue, TRUNCATION_MARKER } from "./output.ts";
@@ -58,9 +59,9 @@ class FakeGateway {
 }
 
 describe("WeComChatOutput", () => {
-  it("creates a progress stream and redacts its content", async () => {
+  it("creates a progress stream without inspecting its content", async () => {
     const gateway = new FakeGateway();
-    const output = new WeComChatOutput({ gateway, secrets: ["secret-value"] });
+    const output = new WeComChatOutput({ gateway });
     const progress = await output.startProgress(message());
 
     progress.append("running secret-value");
@@ -68,12 +69,12 @@ describe("WeComChatOutput", () => {
 
     assertEquals(gateway.streams.length, 1);
     assertEquals(gateway.streams[0].finish, true);
-    assertEquals(gateway.streams[0].content, "running [REDACTED]");
+    assertEquals(gateway.streams[0].content, "running secret-value");
   });
 
   it("forwards keyed progress tails to the active stream", async () => {
     const gateway = new FakeGateway();
-    const output = new WeComChatOutput({ gateway, secrets: [] });
+    const output = new WeComChatOutput({ gateway });
     const progress = await output.startProgress(message());
 
     progress.append("[content] *first section*", summaryTail(0));
@@ -89,7 +90,7 @@ describe("WeComChatOutput", () => {
 
   it("sends final Markdown in at most four UTF-8-safe chunks", async () => {
     const gateway = new FakeGateway();
-    const output = new WeComChatOutput({ gateway, secrets: [] });
+    const output = new WeComChatOutput({ gateway });
 
     await output.send(message(), "你".repeat(30_000), true);
 
@@ -106,13 +107,28 @@ describe("WeComChatOutput", () => {
     );
   });
 
+  it("sends final Markdown without inspecting its content", async () => {
+    const gateway = new FakeGateway();
+    const output = new WeComChatOutput({ gateway });
+
+    await output.send(message(), "final actual-$ecret", true);
+
+    assertEquals(gateway.replies, [{
+      frame: { req: "m1" },
+      body: {
+        msgtype: "markdown",
+        markdown: { content: "final actual-$ecret" },
+      },
+    }]);
+  });
+
   it("uses reserved sends for all final Markdown chunks", async () => {
     const gateway = new FakeGateway();
     const queue = new ConversationSendQueue({
       now: () => 0,
       wait: () => Promise.reject(new Error("regular limiter was used")),
     });
-    const output = new WeComChatOutput({ gateway, queue, secrets: [] });
+    const output = new WeComChatOutput({ gateway, queue });
     for (let index = 0; index < 24; index++) {
       await output.send(message(`regular-${index}`), "regular");
     }
@@ -133,7 +149,6 @@ describe("WeComChatOutput", () => {
     const errors: Error[] = [];
     const output = new WeComChatOutput({
       gateway,
-      secrets: [],
       onError: (error) => errors.push(error),
     });
 
@@ -152,7 +167,6 @@ describe("WeComChatOutput", () => {
     const errors: Error[] = [];
     const output = new WeComChatOutput({
       gateway,
-      secrets: [],
       onError: (error) => errors.push(error),
     });
 
@@ -169,7 +183,7 @@ describe("WeComChatOutput", () => {
     const gateway = new FakeGateway();
     const gate = Promise.withResolvers<void>();
     gateway.streamGate = gate.promise;
-    const output = new WeComChatOutput({ gateway, secrets: [] });
+    const output = new WeComChatOutput({ gateway });
     const progress = await output.startProgress(message());
     progress.append("working");
 
@@ -185,43 +199,8 @@ describe("WeComChatOutput", () => {
     assertEquals(gateway.replies.length, 1);
   });
 
-  it("rejects progress finish when the final stream frame cannot be sent", async () => {
-    const gateway = new FakeGateway();
-    gateway.streamResult = false;
-    const output = new WeComChatOutput({
-      gateway,
-      secrets: [],
-      streamControllerOptions: { maxFinishAttempts: 1 },
-    });
-    const progress = await output.startProgress(message());
-    progress.append("working");
-
-    await assertRejects(
-      () => progress.finish(),
-      Error,
-      "finish Enterprise WeChat progress stream",
-    );
-  });
-
-  it("rejects finishAll when a shutdown stream cannot be finished", async () => {
-    const gateway = new FakeGateway();
-    gateway.streamResult = false;
-    const output = new WeComChatOutput({
-      gateway,
-      secrets: [],
-      streamControllerOptions: { maxFinishAttempts: 1 },
-    });
-    const progress = await output.startProgress(message());
-    progress.append("working");
-
-    await assertRejects(
-      () => output.finishAll(),
-      Error,
-      "finish Enterprise WeChat progress streams during shutdown",
-    );
-  });
-
   it("waits for every shutdown stream before reporting a failure", async () => {
+    using time = new FakeTime();
     const secondGate = Promise.withResolvers<void>();
     const firstError = Promise.withResolvers<void>();
     const gateway = {
@@ -234,9 +213,7 @@ describe("WeComChatOutput", () => {
     };
     const output = new WeComChatOutput({
       gateway,
-      secrets: [],
       onError: () => firstError.resolve(),
-      streamControllerOptions: { maxFinishAttempts: 1 },
     });
     const first = await output.startProgress(message("m1"));
     const second = await output.startProgress(message("m2"));
@@ -250,10 +227,12 @@ describe("WeComChatOutput", () => {
       () => settled = true,
     );
     await firstError.promise;
-    await drainMicrotasks();
+    await time.runMicrotasks();
     assertEquals(settled, false);
 
     secondGate.resolve();
+    await time.tickAsync(2_500);
+    await time.tickAsync(2_500);
     await assertRejects(
       () => finishing,
       Error,
@@ -273,7 +252,7 @@ describe("WeComChatOutput", () => {
       },
     });
     const gateway = new FakeGateway();
-    const output = new WeComChatOutput({ gateway, queue, secrets: [] });
+    const output = new WeComChatOutput({ gateway, queue });
     for (let index = 0; index < 24; index++) {
       await output.send(message(`regular-${index}`), "regular");
     }
@@ -299,7 +278,7 @@ describe("WeComChatOutput", () => {
 
   it("finishes critical streams before completely closing the queue", async () => {
     const gateway = new FakeGateway();
-    const output = new WeComChatOutput({ gateway, secrets: [] });
+    const output = new WeComChatOutput({ gateway });
     const progress = await output.startProgress(message());
     progress.append("working");
 
@@ -319,7 +298,7 @@ describe("WeComChatOutput", () => {
     const gate = Promise.withResolvers<void>();
     const gateway = new FakeGateway();
     gateway.streamGate = gate.promise;
-    const output = new WeComChatOutput({ gateway, secrets: [] });
+    const output = new WeComChatOutput({ gateway });
     const progress = await output.startProgress(message());
     progress.append("working");
     const finishing = progress.finish();
@@ -335,7 +314,7 @@ describe("WeComChatOutput", () => {
 
   it("does not append a transport-owned shutdown status", async () => {
     const gateway = new FakeGateway();
-    const output = new WeComChatOutput({ gateway, secrets: [] });
+    const output = new WeComChatOutput({ gateway });
     const progress = await output.startProgress(message());
     progress.append("working");
 

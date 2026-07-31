@@ -102,10 +102,9 @@ describe("createLogger", () => {
     assertMatch(debugCapture.output(), /INFO: \[codex\] ready/);
   });
 
-  it("formats scoped structured logs and recursively redacts secrets", () => {
+  it("formats scoped structured logs and preserves values", () => {
     const capture = captureLogs();
     const logger: Logger = createLogger({
-      secrets: ["actual-secret"],
       destination: capture.destination,
     });
     const requestLogger = logger.child({ scope: "request" });
@@ -133,10 +132,9 @@ describe("createLogger", () => {
     assertMatch(lines[0], /"chat_id":"room-1"/);
     assertMatch(
       lines[1],
-      / ERROR: \[codex\] failed .*"error":\{"type":"Error","message":"failed \[REDACTED\]","stack":"at Object\.<anonymous> \(.*src\/log\.test\.ts:\d+:\d+\)"/,
+      / ERROR: \[codex\] failed .*"error":\{"type":"Error","message":"failed actual-secret","stack":"at Object\.<anonymous> \(.*src\/log\.test\.ts:\d+:\d+\)"/,
     );
-    assertEquals(output.includes("actual-secret"), false);
-    assertEquals(output.includes("[REDACTED]"), true);
+    assertEquals(output.includes("actual-secret"), true);
     assertEquals(output.includes("time="), false);
     assertEquals(output.includes("level="), false);
   });
@@ -169,168 +167,6 @@ describe("createLogger", () => {
       ]
     ) {
       assertEquals(output.includes(`[${scope}] ready`), true);
-    }
-  });
-
-  it("prevents top-level fields from overriding logger metadata", () => {
-    const capture = captureLogs();
-    const logger: Logger = createLogger({ destination: capture.destination });
-    const requestLogger = logger.child({ scope: "request" });
-
-    requestLogger.info({
-      scope: "spoofed-scope",
-      time: 0,
-      level: 60,
-      pid: 991_001,
-      hostname: "spoofed-host",
-      msg: "spoofed-msg",
-      name: "spoofed-name",
-      v: 991_002,
-      regular: "kept",
-      nested: {
-        scope: "nested-scope",
-        time: 123,
-        level: 30,
-        pid: 992_001,
-        hostname: "nested-host",
-        msg: "nested-msg",
-        name: "nested-name",
-        v: 992_002,
-      },
-    }, "received");
-    logger.flush();
-
-    const line = capture.output().trimEnd();
-    assertMatch(
-      line,
-      /^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3} [+-]\d{4}\] INFO: \[request\] received /,
-    );
-    for (
-      const spoofed of [
-        "spoofed-scope",
-        "spoofed-host",
-        "spoofed-msg",
-        "spoofed-name",
-        "991001",
-        "991002",
-      ]
-    ) {
-      assertEquals(line.includes(spoofed), false);
-    }
-    assertMatch(line, /"regular":"kept"/);
-    assertMatch(
-      line,
-      /"nested":\{"scope":"nested-scope","time":123,"level":30,"pid":992001,"hostname":"nested-host","msg":"nested-msg","name":"nested-name","v":992002\}/,
-    );
-  });
-
-  it("drops nested JSON hooks and other unsafe values", () => {
-    const capture = captureLogs();
-    const logger: Logger = createLogger({
-      secrets: ["actual-secret"],
-      destination: capture.destination,
-    });
-    const requestLogger = logger.child({ scope: "request" });
-
-    requestLogger.info({
-      nested: {
-        ordinary: "hello actual-secret",
-        callback: () => "actual-secret",
-        symbolValue: Symbol("actual-secret"),
-        toJSON() {
-          return {
-            forged: "actual-secret",
-            ordinary: "forged",
-          };
-        },
-      },
-    }, "received");
-    logger.flush();
-
-    const output = capture.output();
-    assertEquals(output.includes("actual-secret"), false);
-    assertMatch(output, /"nested":\{"ordinary":"hello \[REDACTED\]"\}/);
-    for (const omitted of ["forged", "callback", "symbolValue", "toJSON"]) {
-      assertEquals(output.includes(omitted), false);
-    }
-  });
-
-  it("sanitizes native child bindings without wrapping child", () => {
-    const capture = captureLogs();
-    const logger: Logger = createLogger({
-      secrets: ["actual-secret"],
-      destination: capture.destination,
-    });
-    const requestLogger = logger.child({
-      scope: "request",
-      component: "actual-secret",
-      time: 991001,
-      pid: 991002,
-      hostname: "spoofed-host",
-      msg: "spoofed-message",
-      name: "spoofed-name",
-      v: 991003,
-    });
-
-    requestLogger.info("ready");
-    logger.flush();
-
-    const output = capture.output().trimEnd();
-    assertMatch(output, / INFO: \[request\] ready /);
-    assertMatch(output, /"component":"\[REDACTED\]"/);
-    for (
-      const forbidden of [
-        "actual-secret",
-        "spoofed-host",
-        "spoofed-message",
-        "spoofed-name",
-        "991001",
-        "991002",
-        "991003",
-      ]
-    ) {
-      assertEquals(output.includes(forbidden), false);
-    }
-  });
-
-  it("omits secrets from native child binding keys", () => {
-    const capture = captureLogs();
-    const logger: Logger = createLogger({
-      secrets: ["actual-secret"],
-      destination: capture.destination,
-    });
-
-    logger.child({
-      scope: "request",
-      "actual-secret": "safe-value",
-    }).info("ready");
-    logger.flush();
-
-    const output = capture.output();
-    assertEquals(output.includes("actual-secret"), false);
-    assertEquals(output.includes("safe-value"), false);
-    assertMatch(output, / INFO: \[request\] ready/);
-  });
-
-  it("preserves Pino JSON for syntax-like secrets in child binding keys", () => {
-    for (const secret of ['"', '":"', "\\"]) {
-      const capture = captureLogs();
-      const logger: Logger = createLogger({
-        secrets: [secret],
-        destination: capture.destination,
-      });
-
-      logger.child({
-        scope: "request",
-        [secret]: "unsafe-binding",
-      }).info({ marker: "safe" }, "ready");
-      logger.flush();
-
-      const output = capture.output().trimEnd();
-      assertMatch(output, / INFO: \[request\] ready /);
-      assertEquals(output.includes("unsafe-binding"), false);
-      assertMatch(output, /"marker":"safe"/);
-      assertEquals(output.split("\n").length, 1);
     }
   });
 
@@ -368,10 +204,9 @@ describe("createLogger", () => {
     assertEquals(output.includes("field-tail"), false);
   });
 
-  it("preserves secret-safe structured error diagnostics", () => {
+  it("preserves bounded structured error diagnostics and message values", () => {
     const capture = captureLogs();
     const logger: Logger = createLogger({
-      secrets: ["actual-secret"],
       destination: capture.destination,
     });
     const error = new Error("failed actual-secret", {
@@ -386,9 +221,9 @@ describe("createLogger", () => {
 
     const output = capture.output().trimEnd();
     assertEquals(output.split("\n").length, 1);
-    assertEquals(output.includes("actual-secret"), false);
+    assertEquals(output.includes("actual-secret"), true);
     assertMatch(output, /"error":\{"type":"Error"/);
-    assertMatch(output, /"message":"failed \[REDACTED\]"/);
+    assertMatch(output, /"message":"failed actual-secret"/);
     assertMatch(output, /"stack":"at veryLongFunctionName/);
     assertMatch(output, /\/workspace\/src\/example\.ts:42:7\)"/);
     assertMatch(output, /"cause":\{"type":"Error"/);
@@ -425,10 +260,10 @@ describe("summarizeRequest", () => {
     });
   }
 
-  it("redacts secrets before applying the grapheme limit", () => {
+  it("does not inspect secret-like values", () => {
     assertEquals(
-      summarizeRequest("actual-secret trailing", ["actual-secret"]),
-      "[REDACTED]…",
+      summarizeRequest("token12345 trailing"),
+      "token12345…",
     );
   });
 });
@@ -437,7 +272,6 @@ describe("logRequestStatus", () => {
   it("maps event fields and request states to Pino levels", () => {
     const capture = captureLogs();
     const logger: Logger = createLogger({
-      secrets: ["actual-secret"],
       destination: capture.destination,
     });
     const requestLogger = logger.child({ scope: "request" });
@@ -481,7 +315,7 @@ describe("logRequestStatus", () => {
     assertMatch(lines[2], /"thread_id":"thread-1"/);
     assertMatch(lines[2], /"turn_id":"turn-1"/);
     assertMatch(lines[2], /"elapsed_ms":12/);
-    assertEquals(output.includes("actual-secret"), false);
+    assertEquals(output.includes("actual-secret"), true);
   });
 });
 

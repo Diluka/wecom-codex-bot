@@ -3,17 +3,17 @@ import type { ProgressTail } from "./progress-tail.ts";
 export const DEFAULT_TAIL_BYTES = 16 * 1024;
 export const DEFAULT_SPLIT_BYTES = 18 * 1024;
 export const DEFAULT_MAX_PARTS = 4;
-export const DEFAULT_FLUSH_INTERVAL_MS = 2_500;
-export const DEFAULT_ROTATE_AFTER_MS = 6 * 60_000;
-export const DEFAULT_RETRY_DELAY_MS = 2_500;
-export const DEFAULT_MAX_FINISH_ATTEMPTS = 3;
-export const DEFAULT_MAX_ROTATION_ATTEMPTS = 3;
+const DEFAULT_FLUSH_INTERVAL_MS = 2_500;
+const DEFAULT_ROTATE_AFTER_MS = 6 * 60_000;
+const DEFAULT_RETRY_DELAY_MS = 2_500;
+const DEFAULT_MAX_FINISH_ATTEMPTS = 3;
+const DEFAULT_MAX_ROTATION_ATTEMPTS = 3;
 export const WECOM_MINUTE_LIMIT = 30;
 export const WECOM_HOUR_LIMIT = 1_000;
 export const WECOM_REGULAR_MINUTE_LIMIT = 24;
 export const WECOM_REGULAR_HOUR_LIMIT = 900;
 export const TRUNCATION_MARKER = "\n\n[内容过长，已截断]";
-export const CONTINUATION_MARKER = "[Progress continues in a new stream]";
+const CONTINUATION_MARKER = "[Progress continues in a new stream]";
 
 const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
@@ -110,50 +110,23 @@ export function splitUtf8(
   return result;
 }
 
-export function redactSecrets(
-  value: string,
-  secrets: Iterable<string>,
-): string {
-  const uniqueSecrets = [...new Set(secrets)]
-    .filter((secret) => secret.length > 0)
-    .sort((left, right) => right.length - left.length);
-  let redacted = value;
-  for (const secret of uniqueSecrets) {
-    redacted = redacted.split(secret).join("[REDACTED]");
-  }
-  return redacted;
-}
-
 export interface ProgressBufferOptions {
   maxBytes?: number;
-  secrets?: Iterable<string>;
 }
 
-/** Retains a redacted, UTF-8-safe tail of streamed progress. */
+/** Retains a UTF-8-safe tail of streamed progress. */
 export class ProgressBuffer {
   readonly #maxBytes: number;
-  readonly #secrets: string[];
   #content = "";
 
   constructor(options: ProgressBufferOptions = {}) {
     this.#maxBytes = options.maxBytes ?? DEFAULT_TAIL_BYTES;
     validateByteLimit(this.#maxBytes);
-    this.#secrets = [...(options.secrets ?? [])];
   }
 
   append(content: string): this {
-    this.#content = utf8Tail(
-      redactSecrets(this.#content + content, this.#secrets),
-      this.#maxBytes,
-    );
+    this.#content = utf8Tail(this.#content + content, this.#maxBytes);
     return this;
-  }
-
-  replaceTail(expected: string, replacement: string): boolean {
-    const prefix = this.#prefixBeforeTail(expected);
-    if (prefix === null) return false;
-    this.#replaceFromPrefix(prefix, replacement);
-    return true;
   }
 
   replaceTailBlock(expected: string, replacement: string): string | null {
@@ -165,18 +138,14 @@ export class ProgressBuffer {
   }
 
   #prefixBeforeTail(expected: string): string | null {
-    const redactedExpected = redactSecrets(expected, this.#secrets);
-    if (!redactedExpected || !this.#content.endsWith(redactedExpected)) {
+    if (!expected || !this.#content.endsWith(expected)) {
       return null;
     }
-    return this.#content.slice(0, -redactedExpected.length);
+    return this.#content.slice(0, -expected.length);
   }
 
   #replaceFromPrefix(prefix: string, replacement: string): void {
-    this.#content = utf8Tail(
-      redactSecrets(prefix + replacement, this.#secrets),
-      this.#maxBytes,
-    );
+    this.#content = utf8Tail(prefix + replacement, this.#maxBytes);
   }
 
   snapshot(): string {
@@ -578,16 +547,8 @@ export interface StreamControllerOptions {
   conversationKey: string;
   frame: unknown;
   sink: WeComSink;
-  secrets?: Iterable<string>;
-  maxBufferBytes?: number;
-  flushIntervalMs?: number;
-  rotateAfterMs?: number;
   streamIdFactory?: () => string;
-  continuationMarker?: string;
   timers?: TimerApi;
-  retryDelayMs?: number;
-  maxFinishAttempts?: number;
-  maxRotationAttempts?: number;
 }
 
 /** Coalesces, rotates, and finalizes a single WeCom progress stream. */
@@ -595,16 +556,9 @@ export class StreamController {
   readonly #conversationKey: string;
   readonly #frame: unknown;
   readonly #sink: WeComSink;
-  readonly #bufferOptions: ProgressBufferOptions;
   #buffer: ProgressBuffer;
-  readonly #flushIntervalMs: number;
-  readonly #rotateAfterMs: number;
   readonly #streamIdFactory: () => string;
-  readonly #continuationMarker: string;
   readonly #timers: TimerApi;
-  readonly #retryDelayMs: number;
-  readonly #maxFinishAttempts: number;
-  readonly #maxRotationAttempts: number;
   #streamId: string;
   #flushTimer: unknown;
   #rotationTimer: unknown;
@@ -619,33 +573,11 @@ export class StreamController {
     this.#conversationKey = options.conversationKey;
     this.#frame = options.frame;
     this.#sink = options.sink;
-    this.#bufferOptions = {
-      maxBytes: options.maxBufferBytes,
-      secrets: [...(options.secrets ?? [])],
-    };
-    this.#buffer = new ProgressBuffer(this.#bufferOptions);
-    this.#flushIntervalMs = options.flushIntervalMs ??
-      DEFAULT_FLUSH_INTERVAL_MS;
-    this.#rotateAfterMs = options.rotateAfterMs ?? DEFAULT_ROTATE_AFTER_MS;
+    this.#buffer = new ProgressBuffer();
     this.#streamIdFactory = options.streamIdFactory ??
       (() => `stream-${crypto.randomUUID()}`);
-    this.#continuationMarker = options.continuationMarker ??
-      CONTINUATION_MARKER;
     this.#timers = options.timers ?? systemTimers;
-    this.#retryDelayMs = options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS;
-    this.#maxFinishAttempts = options.maxFinishAttempts ??
-      DEFAULT_MAX_FINISH_ATTEMPTS;
-    this.#maxRotationAttempts = options.maxRotationAttempts ??
-      DEFAULT_MAX_ROTATION_ATTEMPTS;
     this.#streamId = this.#streamIdFactory();
-  }
-
-  append(content: string): this {
-    if (this.#finished) throw new Error("stream is already finished");
-    this.#replaceableTail = undefined;
-    this.#buffer.append(content);
-    this.#afterWrite();
-    return this;
   }
 
   appendBlock(
@@ -706,16 +638,19 @@ export class StreamController {
     });
   }
 
-  finish(finalContent = ""): Promise<boolean> {
+  finish(): Promise<boolean> {
     if (this.#finishPromise) return this.#finishPromise;
-    if (finalContent.length > 0) this.#buffer.append(finalContent);
     this.#finished = true;
     this.#clearFlushTimer();
     this.#clearRotationTimer();
     this.#finishPromise = this.#enqueue(async () => {
       const content = this.#buffer.snapshot();
       if (content.length === 0) return true;
-      for (let attempt = 1; attempt <= this.#maxFinishAttempts; attempt++) {
+      for (
+        let attempt = 1;
+        attempt <= DEFAULT_MAX_FINISH_ATTEMPTS;
+        attempt++
+      ) {
         const sent = await this.#sink.send(
           this.#conversationKey,
           this.#frame,
@@ -724,7 +659,7 @@ export class StreamController {
           true,
         );
         if (sent) return true;
-        if (attempt < this.#maxFinishAttempts) await this.#retryDelay();
+        if (attempt < DEFAULT_MAX_FINISH_ATTEMPTS) await this.#retryDelay();
       }
       return false;
     });
@@ -733,7 +668,7 @@ export class StreamController {
 
   #retryDelay(): Promise<void> {
     return new Promise((resolve) => {
-      this.#timers.setTimeout(resolve, this.#retryDelayMs);
+      this.#timers.setTimeout(resolve, DEFAULT_RETRY_DELAY_MS);
     });
   }
 
@@ -742,10 +677,10 @@ export class StreamController {
     this.#flushTimer = this.#timers.setTimeout(async () => {
       this.#flushTimer = undefined;
       await this.flush();
-    }, this.#flushIntervalMs);
+    }, DEFAULT_FLUSH_INTERVAL_MS);
   }
 
-  #armRotation(delayMs = this.#rotateAfterMs): void {
+  #armRotation(delayMs = DEFAULT_ROTATE_AFTER_MS): void {
     if (
       this.#finished || this.#rotationDisabled ||
       this.#rotationTimer !== undefined
@@ -769,7 +704,7 @@ export class StreamController {
         previousTail.completedText,
       );
     }
-    const nextBuffer = new ProgressBuffer(this.#bufferOptions);
+    const nextBuffer = new ProgressBuffer();
     this.#buffer = nextBuffer;
     this.#replaceableTail = undefined;
     const content = previousBuffer.snapshot();
@@ -782,13 +717,13 @@ export class StreamController {
         true,
       );
       if (!finished) {
-        const restoredBuffer = new ProgressBuffer(this.#bufferOptions);
+        const restoredBuffer = new ProgressBuffer();
         appendProgressSnapshot(restoredBuffer, previousBuffer.snapshot());
         appendProgressSnapshot(restoredBuffer, nextBuffer.snapshot());
         this.#buffer = restoredBuffer;
         this.#rotationAttempts++;
-        if (this.#rotationAttempts < this.#maxRotationAttempts) {
-          this.#armRotation(this.#retryDelayMs);
+        if (this.#rotationAttempts < DEFAULT_MAX_ROTATION_ATTEMPTS) {
+          this.#armRotation(DEFAULT_RETRY_DELAY_MS);
         } else {
           this.#rotationDisabled = true;
         }
@@ -798,8 +733,8 @@ export class StreamController {
     this.#rotationAttempts = 0;
     if (this.#finished) {
       if (nextBuffer.snapshot().length > 0) {
-        const continuationBuffer = new ProgressBuffer(this.#bufferOptions);
-        appendProgressSnapshot(continuationBuffer, this.#continuationMarker);
+        const continuationBuffer = new ProgressBuffer();
+        appendProgressSnapshot(continuationBuffer, CONTINUATION_MARKER);
         appendProgressSnapshot(continuationBuffer, nextBuffer.snapshot());
         this.#buffer = continuationBuffer;
         this.#streamId = this.#streamIdFactory();
@@ -807,8 +742,8 @@ export class StreamController {
       return;
     }
 
-    const continuationBuffer = new ProgressBuffer(this.#bufferOptions);
-    appendProgressSnapshot(continuationBuffer, this.#continuationMarker);
+    const continuationBuffer = new ProgressBuffer();
+    appendProgressSnapshot(continuationBuffer, CONTINUATION_MARKER);
     appendProgressSnapshot(continuationBuffer, nextBuffer.snapshot());
     this.#buffer = continuationBuffer;
     this.#streamId = this.#streamIdFactory();

@@ -11,7 +11,6 @@ import {
   logAppServerStderr,
   logRequestStatus,
   type LogTransport,
-  summarizeRequest,
   waitForLogTransport,
 } from "./src/log.ts";
 import { buildOwnerDeveloperInstructions } from "./src/owner-policy.ts";
@@ -42,7 +41,6 @@ try {
   processLogError = error;
 }
 const logger = createLogger({
-  secrets: [config.botSecret],
   level: config.logLevel,
   stream: logTransport?.stream,
 });
@@ -174,7 +172,6 @@ const gateway = new WeComGateway({
 
 const output = new WeComChatOutput({
   gateway,
-  secrets: [config.botSecret],
   onError: (error) => outputLogger.error({ error }, "error"),
 });
 
@@ -199,7 +196,6 @@ const orchestrator = new ConversationOrchestrator({
       turn_id: event.turnId,
     }, "activity_decision");
   },
-  summarizeRequest: (text) => summarizeRequest(text, [config.botSecret]),
 });
 context.orchestrator = orchestrator;
 

@@ -529,10 +529,18 @@ async function waitFor(check: () => boolean): Promise<void> {
   throw new Error("condition was not reached");
 }
 
-function setup(extraOptions: Record<string, unknown> = {}) {
+type SetupOptions = Partial<
+  Omit<
+    ConversationOrchestratorOptions,
+    "state" | "codex" | "workspace" | "messageDebounceTimers"
+  >
+>;
+
+function setup(extraOptions: SetupOptions = {}) {
   const state = new FakeState();
   const codex = new FakeCodex();
   const output = new FakeOutput();
+  const timers = new FakeTimers();
   const requestEvents: RequestStatusEvent[] = [];
   let currentTime = 1_000;
   const orchestrator = new ConversationOrchestrator({
@@ -542,15 +550,15 @@ function setup(extraOptions: Record<string, unknown> = {}) {
     workspace: "/workspace",
     onRequestStatus: (event) => requestEvents.push(event),
     now: () => currentTime,
-    summarizeRequest: (text) => `summary:${text}`,
-    messageDebounceMs: 0,
+    messageDebounceTimers: timers,
     ...extraOptions,
-  } as ConversationOrchestratorOptions);
+  });
   return {
     state,
     codex,
     output,
     orchestrator,
+    timers,
     requestEvents,
     advanceTime: (milliseconds: number) => currentTime += milliseconds,
   };
@@ -560,11 +568,8 @@ async function runAuthorityBatch(
   ownerUserId: string | undefined,
   messages: RoutedText[],
 ): Promise<RequestAuthority> {
-  const timers = new FakeTimers();
-  const { codex, orchestrator } = setup({
+  const { codex, orchestrator, timers } = setup({
     ownerUserId,
-    messageDebounceMs: 3_000,
-    messageDebounceTimers: timers,
   });
   const running = messages.map((item) => orchestrator.handleText(item));
   const flushing = timers.advance(3_000);
@@ -577,15 +582,16 @@ async function runAuthorityBatch(
 
 describe("ConversationOrchestrator", () => {
   it("emits request status events through a completed request", async () => {
-    const { advanceTime, codex, orchestrator, requestEvents } = setup();
+    const { advanceTime, codex, orchestrator, requestEvents, timers } = setup();
     const running = orchestrator.handleText(
       message("group:engineering", "m1", "check tests", "bob"),
     );
+    const flushing = timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
 
     advanceTime(25);
     codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
-    await running;
+    await Promise.all([running, flushing]);
 
     assertEquals(requestEvents.map(({ state }) => state), [
       "received",
@@ -617,7 +623,7 @@ describe("ConversationOrchestrator", () => {
       );
       assertEquals(
         event.summary,
-        event.state === "received" ? "summary:check tests" : undefined,
+        event.state === "received" ? "check test…" : undefined,
       );
     }
     for (
@@ -649,10 +655,11 @@ describe("ConversationOrchestrator", () => {
     assertEquals(requestEvents.at(-1)?.elapsedMs, 25);
   });
   it("emits received and duplicate_ignored for duplicate ordinary text", async () => {
-    const { codex, orchestrator, requestEvents } = setup();
+    const { codex, orchestrator, requestEvents, timers } = setup();
     const first = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    const flushing = timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     const duplicateStart = requestEvents.length;
 
@@ -664,7 +671,7 @@ describe("ConversationOrchestrator", () => {
     );
     assertEquals(requestEvents.at(-1)?.elapsedMs, 0);
     codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
-    await first;
+    await Promise.all([first, flushing]);
   });
   it("terminalizes a runtime-unavailable reply after sending it", async () => {
     const times = [1_000, 975];
@@ -690,7 +697,7 @@ describe("ConversationOrchestrator", () => {
     );
   });
   it("excludes commands and unsupported messages but treats unknown commands as requests", async () => {
-    const { codex, orchestrator, requestEvents } = setup();
+    const { codex, orchestrator, requestEvents, timers } = setup();
 
     await orchestrator.handleText(message("single:alice", "help", "/help"));
     await orchestrator.handleText(
@@ -712,23 +719,26 @@ describe("ConversationOrchestrator", () => {
     const unknown = orchestrator.handleText(
       message("single:alice", "m1", "/unknown"),
     );
+    const flushing = timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     assertEquals(requestEvents[0].state, "received");
     codex.starts[0].resolve({ status: "completed" });
-    await unknown;
+    await Promise.all([unknown, flushing]);
   });
   it("treats lookalike model and effort commands as ordinary text", async () => {
-    const { codex, orchestrator, requestEvents } = setup();
+    const { codex, orchestrator, requestEvents, timers } = setup();
 
     const modelLookalike = orchestrator.handleText(
       message("single:alice", "model-lookalike", "/models"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     codex.starts[0].resolve({ status: "completed" });
     await modelLookalike;
     const effortLookalike = orchestrator.handleText(
       message("single:alice", "effort-lookalike", "/effortful high"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 2);
     codex.starts[1].resolve({ status: "completed" });
     await effortLookalike;
@@ -916,12 +926,13 @@ describe("ConversationOrchestrator settings authorization", () => {
     );
   });
   it("sends one direct denial without leaking owner ID or affecting the active turn", async () => {
-    const { codex, orchestrator, output } = setup({
+    const { codex, orchestrator, output, timers } = setup({
       ownerUserId: "owner.team",
     });
     const running = orchestrator.handleText(
       message("single:mallory", "work", "work", "mallory"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     const startTurnAttempts = codex.startTurnAttempts;
 
@@ -1013,10 +1024,13 @@ describe("ConversationOrchestrator", () => {
     assertEquals(codex.starts.length, 0);
   });
   it("keeps an active turn on its old settings while switching the next task", async () => {
-    const { codex, orchestrator, output } = setup({ ownerUserId: "alice" });
+    const { codex, orchestrator, output, timers } = setup({
+      ownerUserId: "alice",
+    });
     const running = orchestrator.handleText(
       message("single:alice", "work", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     codex.nextSettingsResult = {
       status: "updated",
@@ -1230,7 +1244,7 @@ describe("ConversationOrchestrator", () => {
   });
   it("isolates request status callback failures from errors and draining", async () => {
     const reported: Error[] = [];
-    const { codex, orchestrator, output } = setup({
+    const { codex, orchestrator, output, timers } = setup({
       onError: (error: Error) => reported.push(error),
       onRequestStatus: () => {
         throw new Error("request observer failed");
@@ -1239,6 +1253,7 @@ describe("ConversationOrchestrator", () => {
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
 
     codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
@@ -1247,34 +1262,12 @@ describe("ConversationOrchestrator", () => {
     assertEquals(output.sent.at(-1)?.text, "done");
     assertEquals(reported, []);
   });
-  it("isolates request summarizer failures from errors and draining", async () => {
-    const reported: Error[] = [];
-    const { codex, orchestrator, output, requestEvents } = setup({
-      onError: (error: Error) => reported.push(error),
-      summarizeRequest: () => {
-        throw new Error("summary failed");
-      },
-    });
-    const running = orchestrator.handleText(
-      message("single:alice", "m1", "work"),
-    );
-    await waitFor(() => codex.starts.length === 1);
-
-    codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
-    await running;
-
-    assertEquals("summary" in requestEvents[0], false);
-    assertEquals(requestEvents.at(-1)?.state, "completed");
-    assertEquals(output.sent.at(-1)?.text, "done");
-    assertEquals(reported, []);
-  });
-  it("uses the default grapheme-safe request summary only for received", async () => {
-    const { codex, orchestrator, requestEvents } = setup({
-      summarizeRequest: undefined,
-    });
+  it("uses the grapheme-safe request summary only for received", async () => {
+    const { codex, orchestrator, requestEvents, timers } = setup();
     const running = orchestrator.handleText(
       message("single:alice", "m1", "👩🏽‍💻e\u0301abcdefghij"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     codex.starts[0].resolve({ status: "completed" });
     await running;
@@ -1288,17 +1281,19 @@ describe("ConversationOrchestrator", () => {
   });
   it("terminalizes pre-turn work superseded by the latest pending request", async () => {
     const startGate = Promise.withResolvers<void>();
-    const { advanceTime, codex, orchestrator, requestEvents } = setup();
+    const { advanceTime, codex, orchestrator, requestEvents, timers } = setup();
     codex.startThreadGates.push(startGate.promise);
     const first = orchestrator.handleText(
       message("single:alice", "m1", "first"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.startThreadAttempts === 1);
 
     advanceTime(10);
     const second = orchestrator.handleText(
       message("single:alice", "m2", "second"),
     );
+    await timers.advance(3_000);
     startGate.resolve();
     await waitFor(() => codex.starts.length === 1);
     codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
@@ -1327,14 +1322,16 @@ describe("ConversationOrchestrator", () => {
     );
   });
   it("records one active interruption trigger and the real terminal outcome", async () => {
-    const { codex, orchestrator, requestEvents } = setup();
+    const { codex, orchestrator, requestEvents, timers } = setup();
     const first = orchestrator.handleText(
       message("single:alice", "m1", "first"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     const second = orchestrator.handleText(
       message("single:alice", "m2", "second"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.interrupts.length === 1);
 
     codex.starts[0].resolve({ status: "interrupted" });
@@ -1359,11 +1356,12 @@ describe("ConversationOrchestrator", () => {
   });
   it("terminalizes pre-turn work reset by /new without command identifiers", async () => {
     const startGate = Promise.withResolvers<void>();
-    const { codex, orchestrator, requestEvents } = setup();
+    const { codex, orchestrator, requestEvents, timers } = setup();
     codex.startThreadGates.push(startGate.promise);
     const first = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.startThreadAttempts === 1);
     const resetting = orchestrator.handleText(
       message("single:alice", "reset-command", "/new"),
@@ -1383,14 +1381,16 @@ describe("ConversationOrchestrator", () => {
     assertEquals(terminal?.triggerMsgId, undefined);
   });
   it("terminalizes pending work discarded during shutdown", async () => {
-    const { codex, orchestrator, requestEvents } = setup();
+    const { codex, orchestrator, requestEvents, timers } = setup();
     const first = orchestrator.handleText(
       message("single:alice", "m1", "first"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     const second = orchestrator.handleText(
       message("single:alice", "m2", "second"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.interrupts.length === 1);
 
     const stopping = orchestrator.interruptAll();
@@ -1414,17 +1414,19 @@ describe("ConversationOrchestrator", () => {
     );
   });
   it("reports active and pending counts across all conversation slots", async () => {
-    const { codex, orchestrator, requestEvents } = setup();
+    const { codex, orchestrator, requestEvents, timers } = setup();
     const first = orchestrator.handleText(
       message("single:alice", "m1", "one"),
     );
     const second = orchestrator.handleText(
       message("group:room", "m2", "two", "bob"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 2);
     const pending = orchestrator.handleText(
       message("single:alice", "m3", "three"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.interrupts.length === 1);
 
     codex.starts[0].resolve({ status: "interrupted" });
@@ -1447,16 +1449,18 @@ describe("ConversationOrchestrator", () => {
   it("counts non-terminal pre-turn work as active across conversations", async () => {
     const firstGate = Promise.withResolvers<void>();
     const secondGate = Promise.withResolvers<void>();
-    const { codex, orchestrator, requestEvents } = setup();
+    const { codex, orchestrator, requestEvents, timers } = setup();
     codex.startThreadGates.push(firstGate.promise, secondGate.promise);
 
     const first = orchestrator.handleText(
       message("single:alice", "m1", "one"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.startThreadAttempts === 1);
     const second = orchestrator.handleText(
       message("group:room", "m2", "two", "bob"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.startThreadAttempts === 2);
 
     const firstStarting = requestEvents.find(({ msgId, state }) =>
@@ -1490,11 +1494,12 @@ describe("ConversationOrchestrator", () => {
     await Promise.all([first, second]);
   });
   it("emits resume boundaries for a persisted thread", async () => {
-    const { codex, orchestrator, requestEvents, state } = setup();
+    const { codex, orchestrator, requestEvents, state, timers } = setup();
     state.bindConversation("single:alice", "single", "thread-existing");
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
     await running;
@@ -1512,10 +1517,14 @@ describe("ConversationOrchestrator", () => {
     }
   });
   it("emits a reply boundary then failed when startThread fails", async () => {
-    const { codex, orchestrator, requestEvents } = setup();
+    const { codex, orchestrator, requestEvents, timers } = setup();
     codex.startThreadErrors.push(new Error("startThread failed"));
 
-    await orchestrator.handleText(message("single:alice", "m1", "work"));
+    const handling = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await timers.advance(3_000);
+    await handling;
 
     assertEquals(requestEvents.map(({ state }) => state), [
       "received",
@@ -1531,11 +1540,15 @@ describe("ConversationOrchestrator", () => {
     assertEquals(requestEvents.at(-1)?.activeCount, 0);
   });
   it("emits a reply boundary then failed when resumeThread fails", async () => {
-    const { codex, orchestrator, requestEvents, state } = setup();
+    const { codex, orchestrator, requestEvents, state, timers } = setup();
     state.bindConversation("single:alice", "single", "thread-existing");
     codex.resumeThreadErrors.push(new Error("resumeThread failed"));
 
-    await orchestrator.handleText(message("single:alice", "m1", "work"));
+    const handling = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await timers.advance(3_000);
+    await handling;
 
     assertEquals(requestEvents.map(({ state }) => state), [
       "received",
@@ -1550,10 +1563,14 @@ describe("ConversationOrchestrator", () => {
     assertEquals(requestEvents.at(-1)?.turnId, undefined);
   });
   it("emits a reply boundary then failed when startTurn fails", async () => {
-    const { codex, orchestrator, requestEvents } = setup();
+    const { codex, orchestrator, requestEvents, timers } = setup();
     codex.startTurnErrors.push(new Error("startTurn failed"));
 
-    await orchestrator.handleText(message("single:alice", "m1", "work"));
+    const handling = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await timers.advance(3_000);
+    await handling;
 
     assertEquals(requestEvents.slice(-4).map(({ state }) => state), [
       "turn_starting",
@@ -1566,10 +1583,11 @@ describe("ConversationOrchestrator", () => {
     assertEquals(requestEvents.at(-1)?.turnId, undefined);
   });
   it("skips a missing completed answer before the terminal state", async () => {
-    const { codex, orchestrator, requestEvents } = setup();
+    const { codex, orchestrator, requestEvents, timers } = setup();
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     codex.starts[0].resolve({ status: "completed" });
     await running;
@@ -1582,10 +1600,11 @@ describe("ConversationOrchestrator", () => {
     assertEquals(requestEvents.at(-2)?.reason, "no_final_answer");
   });
   it("terminalizes runtime_lost after the skipped reply boundary", async () => {
-    const { codex, orchestrator, requestEvents } = setup();
+    const { codex, orchestrator, requestEvents, timers } = setup();
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     codex.starts[0].resolve({
       status: "runtime_lost",
@@ -1601,10 +1620,11 @@ describe("ConversationOrchestrator", () => {
     assertEquals(requestEvents.at(-1)?.error, "runtime exited");
   });
   it("does not convert Codex activity into request states", async () => {
-    const { codex, orchestrator, requestEvents } = setup();
+    const { codex, orchestrator, requestEvents, timers } = setup();
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     const statesBeforeActivity = requestEvents.map(({ state }) => state);
 
@@ -1619,20 +1639,24 @@ describe("ConversationOrchestrator", () => {
     await running;
   });
   it("emits one logical interruption across retries and preserves the first trigger", async () => {
-    const { codex, orchestrator, requestEvents } = setup({
+    const { codex, orchestrator, requestEvents, timers } = setup({
       interruptRetryDelaysMs: [0],
     });
     codex.interruptErrors.push(new Error("temporary interrupt failure"));
     const first = orchestrator.handleText(
       message("single:alice", "m1", "first"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     const second = orchestrator.handleText(
       message("single:alice", "m2", "second"),
     );
+    await timers.advance(3_000);
+    await waitFor(() => codex.interrupts.length >= 1);
     const third = orchestrator.handleText(
       message("single:alice", "m3", "third"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.interrupts.length === 2);
 
     codex.starts[0].resolve({ status: "interrupted" });
@@ -1649,7 +1673,7 @@ describe("ConversationOrchestrator", () => {
   it("does not retry an interrupt after the turn enters reply phase", async () => {
     const interruptGate = Promise.withResolvers<void>();
     const output = new PendingProgressFinishOutput();
-    const { codex, orchestrator, requestEvents } = setup({
+    const { codex, orchestrator, requestEvents, timers } = setup({
       output,
       interruptRetryDelaysMs: [0],
     });
@@ -1657,10 +1681,12 @@ describe("ConversationOrchestrator", () => {
     const first = orchestrator.handleText(
       message("single:alice", "m1", "first"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     const second = orchestrator.handleText(
       message("single:alice", "m2", "second"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.interrupts.length === 1);
 
     codex.starts[0].resolve({ status: "completed", finalAnswer: "first done" });
@@ -1710,7 +1736,7 @@ describe("ConversationOrchestrator", () => {
   it("does not run a scheduled interrupt retry after entering reply phase", async () => {
     const interruptGate = Promise.withResolvers<void>();
     const output = new PendingProgressFinishOutput();
-    const { codex, orchestrator, requestEvents } = setup({
+    const { codex, orchestrator, requestEvents, timers } = setup({
       output,
       interruptRetryDelaysMs: [0],
     });
@@ -1718,10 +1744,12 @@ describe("ConversationOrchestrator", () => {
     const first = orchestrator.handleText(
       message("single:alice", "m1", "first"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     const second = orchestrator.handleText(
       message("single:alice", "m2", "second"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.interrupts.length === 1);
 
     const retryScheduled = Promise.withResolvers<() => void>();
@@ -1787,10 +1815,11 @@ describe("ConversationOrchestrator", () => {
     assertEquals(requestEvents.at(-1)?.error, "reply failed");
   });
   it("terminalizes a final reply send failure without a fallback reply", async () => {
-    const { codex, orchestrator, output, requestEvents } = setup();
+    const { codex, orchestrator, output, requestEvents, timers } = setup();
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     output.sendErrors.push(new Error("final reply failed"));
     codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
@@ -1806,10 +1835,11 @@ describe("ConversationOrchestrator", () => {
   });
   it("keeps an in-flight final reply terminally accurate when newer work arrives", async () => {
     const output = new PendingFinalOutput();
-    const { codex, orchestrator, requestEvents } = setup({ output });
+    const { codex, orchestrator, requestEvents, timers } = setup({ output });
     const first = orchestrator.handleText(
       message("single:alice", "m1", "first"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     codex.starts[0].resolve({ status: "completed", finalAnswer: "first done" });
     await output.finalStarted.promise;
@@ -1817,6 +1847,7 @@ describe("ConversationOrchestrator", () => {
     const second = orchestrator.handleText(
       message("single:alice", "m2", "second"),
     );
+    await timers.advance(3_000);
     output.finalGate.resolve();
     await waitFor(() => codex.starts.length === 2);
     codex.starts[1].resolve({ status: "completed" });
@@ -1833,13 +1864,14 @@ describe("ConversationOrchestrator", () => {
   });
   it("records a sent reply when send settles before shutdown force", async () => {
     const output = new FinalSendThenHookOutput();
-    const { codex, orchestrator, requestEvents } = setup({
+    const { codex, orchestrator, requestEvents, timers } = setup({
       output,
       shutdownGraceMs: 0,
     });
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
 
     let stopping: Promise<void> | undefined;
@@ -1870,10 +1902,11 @@ describe("ConversationOrchestrator", () => {
   });
   it("finishes the completed reply before starting work queued during progress finish", async () => {
     const output = new PendingProgressFinishOutput();
-    const { codex, orchestrator, requestEvents } = setup({ output });
+    const { codex, orchestrator, requestEvents, timers } = setup({ output });
     const first = orchestrator.handleText(
       message("single:alice", "m1", "first"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     codex.starts[0].resolve({ status: "completed", finalAnswer: "first done" });
     await output.finishStarted.promise;
@@ -1881,6 +1914,7 @@ describe("ConversationOrchestrator", () => {
     const second = orchestrator.handleText(
       message("single:alice", "m2", "second"),
     );
+    await timers.advance(3_000);
     output.finishGate.resolve();
     await waitFor(() => codex.starts.length === 2);
     codex.starts[1].resolve({ status: "completed" });
@@ -1897,16 +1931,18 @@ describe("ConversationOrchestrator", () => {
   });
   it("queues new work while a start failure reply is pending", async () => {
     const output = new PendingFinalOutput();
-    const { codex, orchestrator, requestEvents } = setup({ output });
+    const { codex, orchestrator, requestEvents, timers } = setup({ output });
     codex.startThreadErrors.push(new Error("startThread failed"));
     const first = orchestrator.handleText(
       message("single:alice", "m1", "first"),
     );
+    await timers.advance(3_000);
     await output.finalStarted.promise;
 
     const second = orchestrator.handleText(
       message("single:alice", "m2", "second"),
     );
+    await timers.advance(3_000);
     output.finalGate.resolve();
     await waitFor(() => codex.starts.length === 1);
     codex.starts[0].resolve({ status: "completed" });
@@ -1922,11 +1958,12 @@ describe("ConversationOrchestrator", () => {
   });
   it("keeps a stopped start failure reply interrupted", async () => {
     const output = new PendingFinalOutput();
-    const { codex, orchestrator, requestEvents } = setup({ output });
+    const { codex, orchestrator, requestEvents, timers } = setup({ output });
     codex.startThreadErrors.push(new Error("startThread failed"));
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await output.finalStarted.promise;
 
     await orchestrator.handleText(
@@ -1951,16 +1988,18 @@ describe("ConversationOrchestrator", () => {
   });
   it("does not interrupt a failed startTurn while its progress is finishing", async () => {
     const output = new PendingProgressFinishOutput();
-    const { codex, orchestrator, requestEvents } = setup({ output });
+    const { codex, orchestrator, requestEvents, timers } = setup({ output });
     codex.startTurnErrors.push(new Error("startTurn failed"));
     const first = orchestrator.handleText(
       message("single:alice", "m1", "first"),
     );
+    await timers.advance(3_000);
     await output.finishStarted.promise;
 
     const second = orchestrator.handleText(
       message("single:alice", "m2", "second"),
     );
+    await timers.advance(3_000);
     output.finishGate.resolve();
     await waitFor(() => codex.starts.length === 1);
     codex.starts[0].resolve({ status: "completed" });
@@ -1980,13 +2019,14 @@ describe("ConversationOrchestrator", () => {
   });
   it("keeps a forced final reply terminal and ignores its late rejection", async () => {
     const output = new PendingFinalOutput();
-    const { codex, orchestrator, requestEvents } = setup({
+    const { codex, orchestrator, requestEvents, timers } = setup({
       output,
       shutdownGraceMs: 1,
     });
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
     await output.finalStarted.promise;
@@ -2019,13 +2059,14 @@ describe("ConversationOrchestrator", () => {
   });
   it("discards pre-turn work on shutdown without logging a late thread ID", async () => {
     const startGate = Promise.withResolvers<void>();
-    const { codex, orchestrator, requestEvents } = setup({
+    const { codex, orchestrator, requestEvents, timers } = setup({
       shutdownGraceMs: 1,
     });
     codex.startThreadGates.push(startGate.promise);
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.startThreadAttempts === 1);
 
     await orchestrator.interruptAll();
@@ -2045,13 +2086,14 @@ describe("ConversationOrchestrator", () => {
   });
   it("terminalizes a forced turn start without backfilling its late turn ID", async () => {
     const startGate = Promise.withResolvers<void>();
-    const { codex, orchestrator, requestEvents } = setup({
+    const { codex, orchestrator, requestEvents, timers } = setup({
       shutdownGraceMs: 1,
     });
     codex.startTurnGates.push(startGate.promise);
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.startTurnAttempts === 1);
 
     await orchestrator.interruptAll();
@@ -2073,11 +2115,12 @@ describe("ConversationOrchestrator", () => {
     assertEquals(requestEvents, eventsAtTerminal);
   });
   it("records turn completion before reporting beginTurn persistence failure", async () => {
-    const { codex, orchestrator, requestEvents, state } = setup();
+    const { codex, orchestrator, requestEvents, state, timers } = setup();
     state.failNextBegin = true;
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     await waitFor(() => codex.interrupts.length === 1);
     codex.starts[0].resolve({ status: "interrupted" });
@@ -2094,15 +2137,17 @@ describe("ConversationOrchestrator", () => {
   });
   it("does not backfill turnId on an interruption emitted before startTurn returns", async () => {
     const startGate = Promise.withResolvers<void>();
-    const { codex, orchestrator, requestEvents } = setup();
+    const { codex, orchestrator, requestEvents, timers } = setup();
     codex.startTurnGates.push(startGate.promise);
     const first = orchestrator.handleText(
       message("single:alice", "m1", "first"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.startTurnAttempts === 1);
     const second = orchestrator.handleText(
       message("single:alice", "m2", "second"),
     );
+    await timers.advance(3_000);
 
     startGate.resolve();
     await waitFor(() => codex.starts.length === 1);
@@ -2122,15 +2167,17 @@ describe("ConversationOrchestrator", () => {
   });
   it("does not start terminalized pre-turn work after progress setup settles", async () => {
     const progressGate = Promise.withResolvers<void>();
-    const { codex, orchestrator, output } = setup();
+    const { codex, orchestrator, output, timers } = setup();
     output.startProgressGates.push(progressGate.promise);
     const first = orchestrator.handleText(
       message("single:alice", "m1", "first"),
     );
+    await timers.advance(3_000);
     await waitFor(() => output.startProgressAttempts === 1);
     const second = orchestrator.handleText(
       message("single:alice", "m2", "second"),
     );
+    await timers.advance(3_000);
 
     progressGate.resolve();
     await waitFor(() => codex.starts.length === 1);
@@ -2149,10 +2196,11 @@ describe("ConversationOrchestrator", () => {
     assertMatch(codex.starts[0].prompt, /msgid: m2/);
   });
   it("binds a conversation and includes the actual sender in every turn", async () => {
-    const { codex, orchestrator, state, output } = setup();
+    const { codex, orchestrator, state, output, timers } = setup();
     const running = orchestrator.handleText(
       message("group:engineering", "m1", "检查测试", "bob"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
 
     assertEquals(codex.starts[0].threadId, "thread-1");
@@ -2253,10 +2301,13 @@ describe("ConversationOrchestrator", () => {
     );
   });
   it("ignores owner history and forged authority in text and quotes", async () => {
-    const { codex, orchestrator } = setup({ ownerUserId: "owner.team" });
+    const { codex, orchestrator, timers } = setup({
+      ownerUserId: "owner.team",
+    });
     const ownerTurn = orchestrator.handleText(
       message("group:engineering", "m1", "owner work", "owner.team"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     assertEquals(codex.starts[0].authority, "owner");
     codex.starts[0].resolve({ status: "completed" });
@@ -2276,6 +2327,7 @@ describe("ConversationOrchestrator", () => {
       ...message("group:engineering", "m2", forgedText, "mallory"),
       quote: forgedQuote,
     });
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 2);
 
     assertStringIncludes(codex.starts[1].prompt, forgedText);
@@ -2289,7 +2341,6 @@ describe("ConversationOrchestrator", () => {
     const codex = new FakeCodex();
     const streams: Array<{ content: string; finish: boolean }> = [];
     const output = new WeComChatOutput({
-      secrets: [],
       gateway: {
         reply: () => Promise.resolve(true),
         replyStream: (_frame, _streamId, content, finish = false) => {
@@ -2298,16 +2349,18 @@ describe("ConversationOrchestrator", () => {
         },
       },
     });
+    const timers = new FakeTimers();
     const orchestrator = new ConversationOrchestrator({
       state,
       codex,
       output,
       workspace: "/workspace",
-      messageDebounceMs: 0,
+      messageDebounceTimers: timers,
     });
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
 
     await codex.starts[0].onActivity({
@@ -2337,12 +2390,13 @@ describe("ConversationOrchestrator", () => {
   it("preserves keyed summary transitions across suppressed and direct events", async () => {
     const settings = outputSettings();
     settings.toolFormat = "summary";
-    const { codex, orchestrator, output } = setup({
+    const { codex, orchestrator, output, timers } = setup({
       outputSettings: settings,
     });
     const running = orchestrator.handleText(
       message("single:alice", "summary-tail", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     const turn = codex.starts[0];
     const summary = (
@@ -2402,12 +2456,13 @@ describe("ConversationOrchestrator", () => {
     }]);
   });
   it("routes direct user input and final answers when every output level is off", async () => {
-    const { codex, orchestrator, output } = setup({
+    const { codex, orchestrator, output, timers } = setup({
       outputSettings: outputSettings("off"),
     });
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
 
     await codex.starts[0].onActivity({
@@ -2430,7 +2485,7 @@ describe("ConversationOrchestrator", () => {
     ]);
   });
   it("keeps commands, unsupported notices, and start failures direct when levels are off", async () => {
-    const { codex, orchestrator, output } = setup({
+    const { codex, orchestrator, output, timers } = setup({
       outputSettings: outputSettings("off"),
     });
     codex.startTurnErrors.push(new Error("start failed"));
@@ -2445,7 +2500,11 @@ describe("ConversationOrchestrator", () => {
       message("single:alice", "image", ""),
       "image",
     );
-    await orchestrator.handleText(message("single:alice", "work", "work"));
+    const work = orchestrator.handleText(
+      message("single:alice", "work", "work"),
+    );
+    await timers.advance(3_000);
+    await work;
 
     assertEquals(output.progress[0].chunks, []);
     assertMatch(
@@ -2482,18 +2541,21 @@ describe("ConversationOrchestrator", () => {
     );
   });
   it("interrupts an active turn and only runs the latest pending message", async () => {
-    const { codex, orchestrator } = setup();
+    const { codex, orchestrator, timers } = setup();
     const first = orchestrator.handleText(
       message("single:alice", "m1", "first"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
 
     const second = orchestrator.handleText(
       message("single:alice", "m2", "second"),
     );
+    await timers.advance(3_000);
     const third = orchestrator.handleText(
       message("single:alice", "m3", "third"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.interrupts.length === 1);
     assertEquals(codex.interrupts, [{
       threadId: "thread-1",
@@ -2509,18 +2571,20 @@ describe("ConversationOrchestrator", () => {
     await Promise.all([first, second, third]);
   });
   it("retries a failed interrupt while a newer message is pending", async () => {
-    const { codex, orchestrator } = setup({
+    const { codex, orchestrator, timers } = setup({
       interruptRetryDelaysMs: [0],
     });
     codex.interruptErrors.push(new Error("temporary interrupt failure"));
     const first = orchestrator.handleText(
       message("single:alice", "m1", "first"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
 
     const second = orchestrator.handleText(
       message("single:alice", "m2", "second"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.interrupts.length === 2);
     assertEquals(codex.interrupts, [
       { threadId: "thread-1", turnId: "turn-1" },
@@ -2533,13 +2597,14 @@ describe("ConversationOrchestrator", () => {
     await Promise.all([first, second]);
   });
   it("runs different conversations concurrently", async () => {
-    const { codex, orchestrator } = setup();
+    const { codex, orchestrator, timers } = setup();
     const single = orchestrator.handleText(
       message("single:alice", "m1", "one"),
     );
     const group = orchestrator.handleText(
       message("group:g1", "m2", "two", "bob"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 2);
 
     assertEquals(new Set(codex.starts.map((turn) => turn.threadId)).size, 2);
@@ -2549,10 +2614,11 @@ describe("ConversationOrchestrator", () => {
     await Promise.all([single, group]);
   });
   it("resumes a persisted thread again after the App Server generation changes", async () => {
-    const { codex, orchestrator, state } = setup();
+    const { codex, orchestrator, state, timers } = setup();
     state.bindConversation("single:alice", "single", "thread-existing");
 
     const first = orchestrator.handleText(message("single:alice", "m1", "one"));
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
     await first;
@@ -2562,6 +2628,7 @@ describe("ConversationOrchestrator", () => {
     const second = orchestrator.handleText(
       message("single:alice", "m2", "two"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 2);
     codex.starts[1].resolve({ status: "completed", finalAnswer: "done" });
     await second;
@@ -2569,10 +2636,11 @@ describe("ConversationOrchestrator", () => {
     assertEquals(codex.resumed, ["thread-existing", "thread-existing"]);
   });
   it("deduplicates msgid before invoking Codex", async () => {
-    const { codex, orchestrator } = setup();
+    const { codex, orchestrator, timers } = setup();
     const first = orchestrator.handleText(
       message("single:alice", "same", "one"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     await orchestrator.handleText(message("single:alice", "same", "one"));
     assertEquals(codex.starts.length, 1);
@@ -2591,10 +2659,11 @@ describe("ConversationOrchestrator", () => {
     assertMatch(output.sent[0].text, /暂不支持.*image/);
   });
   it("handles inspection commands without interrupting the active turn", async () => {
-    const { codex, orchestrator, output } = setup();
+    const { codex, orchestrator, output, timers } = setup();
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
 
     await orchestrator.handleText(message("single:alice", "m2", "/help"));
@@ -2623,10 +2692,11 @@ describe("ConversationOrchestrator", () => {
     await running;
   });
   it("queues /new behind an interrupted turn and replaces its thread binding", async () => {
-    const { codex, orchestrator, state } = setup();
+    const { codex, orchestrator, state, timers } = setup();
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
 
     const resetting = orchestrator.handleText(
@@ -2640,7 +2710,7 @@ describe("ConversationOrchestrator", () => {
     assertEquals(codex.starts.length, 1);
   });
   it("continues draining pending work when /new replies cannot be sent", async () => {
-    const { codex, orchestrator, output } = setup();
+    const { codex, orchestrator, output, timers } = setup();
     output.sendErrors.push(
       new Error("reset acknowledgement failed"),
       new Error("reset failure notification failed"),
@@ -2652,6 +2722,7 @@ describe("ConversationOrchestrator", () => {
     const pendingResult = orchestrator.handleText(
       message("single:alice", "m2", "work"),
     ).then(() => null, (error) => error);
+    await timers.advance(3_000);
 
     await waitFor(() => codex.starts.length === 1);
     assertMatch(codex.starts[0].prompt, /msgid: m2/);
@@ -2671,10 +2742,11 @@ describe("ConversationOrchestrator", () => {
     assertMatch(output.sent[0].text, /已新建 Codex 会话/);
   });
   it("waits for interrupted turns to reach terminal state during shutdown", async () => {
-    const { codex, orchestrator } = setup();
+    const { codex, orchestrator, timers } = setup();
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
 
     let stopped = false;
@@ -2691,11 +2763,14 @@ describe("ConversationOrchestrator", () => {
   });
   it("bounds shutdown while an initial startThread RPC never settles", async () => {
     const startGate = Promise.withResolvers<void>();
-    const { codex, orchestrator, state } = setup({ shutdownGraceMs: 1 });
+    const { codex, orchestrator, state, timers } = setup({
+      shutdownGraceMs: 1,
+    });
     codex.startThreadGates.push(startGate.promise);
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.startThreadAttempts === 1);
 
     const stopping = orchestrator.interruptAll();
@@ -2715,11 +2790,14 @@ describe("ConversationOrchestrator", () => {
   });
   it("does not bind a startThread result that arrives after shutdown begins", async () => {
     const startGate = Promise.withResolvers<void>();
-    const { codex, orchestrator, state } = setup({ shutdownGraceMs: 50 });
+    const { codex, orchestrator, state, timers } = setup({
+      shutdownGraceMs: 50,
+    });
     codex.startThreadGates.push(startGate.promise);
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.startThreadAttempts === 1);
 
     const stopping = orchestrator.interruptAll();
@@ -2731,12 +2809,15 @@ describe("ConversationOrchestrator", () => {
   });
   it("bounds shutdown while a resumeThread RPC never settles", async () => {
     const resumeGate = Promise.withResolvers<void>();
-    const { codex, orchestrator, state } = setup({ shutdownGraceMs: 1 });
+    const { codex, orchestrator, state, timers } = setup({
+      shutdownGraceMs: 1,
+    });
     state.bindConversation("single:alice", "single", "thread-existing");
     codex.resumeThreadGates.push(resumeGate.promise);
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.resumed.length === 1);
 
     const stopping = orchestrator.interruptAll();
@@ -2789,9 +2870,7 @@ describe("ConversationOrchestrator", () => {
     const state = new FakeState();
     const codex = new FakeCodex();
     const output = new WeComChatOutput({
-      secrets: [],
       onError: (error) => outputErrors.push(error),
-      streamControllerOptions: { maxFinishAttempts: 1 },
       gateway: {
         reply: () => Promise.resolve(true),
         replyStream: async () => {
@@ -2801,17 +2880,19 @@ describe("ConversationOrchestrator", () => {
         },
       },
     });
+    const timers = new FakeTimers();
     const orchestrator = new ConversationOrchestrator({
       state,
       codex,
       output,
       workspace: "/workspace",
-      messageDebounceMs: 0,
+      messageDebounceTimers: timers,
       shutdownGraceMs: 1,
     });
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     codex.starts[0].resolve({ status: "completed" });
     await finishStarted.promise;
@@ -2845,17 +2926,19 @@ describe("ConversationOrchestrator", () => {
     const state = new FakeState();
     const codex = new FakeCodex();
     const output = new PendingFinalOutput();
+    const timers = new FakeTimers();
     const orchestrator = new ConversationOrchestrator({
       state,
       codex,
       output,
       workspace: "/workspace",
-      messageDebounceMs: 0,
+      messageDebounceTimers: timers,
       shutdownGraceMs: 1,
     });
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
     await output.finalStarted.promise;
@@ -2881,18 +2964,20 @@ describe("ConversationOrchestrator", () => {
     const state = new FakeState();
     const codex = new FakeCodex();
     const output = new PendingFinalOutput();
+    const timers = new FakeTimers();
     const orchestrator = new ConversationOrchestrator({
       state,
       codex,
       output,
       workspace: "/workspace",
-      messageDebounceMs: 0,
+      messageDebounceTimers: timers,
       shutdownGraceMs: 1,
     });
     codex.startTurnErrors.push(new Error("start failed"));
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await output.finalStarted.promise;
 
     const stopping = orchestrator.interruptAll();
@@ -2910,10 +2995,11 @@ describe("ConversationOrchestrator", () => {
     assertMatch(output.sent[0].text, /任务启动失败：start failed/);
   });
   it("propagates a direct activity send error before shutdown", async () => {
-    const { codex, orchestrator, output } = setup();
+    const { codex, orchestrator, output, timers } = setup();
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     output.sendErrors.push(new Error("direct send failed"));
 
@@ -2934,17 +3020,19 @@ describe("ConversationOrchestrator", () => {
     const state = new FakeState();
     const codex = new FakeCodex();
     const output = new QueueBlockedOutput();
+    const timers = new FakeTimers();
     const orchestrator = new ConversationOrchestrator({
       state,
       codex,
       output,
       workspace: "/workspace",
-      messageDebounceMs: 0,
+      messageDebounceTimers: timers,
       shutdownGraceMs: 1,
     });
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
 
     const direct = codex.starts[0].onActivity({
@@ -2990,11 +3078,14 @@ describe("ConversationOrchestrator", () => {
   });
   it("finishes shutdown when start RPC never settles and only interrupts a late handle once", async () => {
     const startGate = Promise.withResolvers<void>();
-    const { codex, orchestrator, output } = setup({ shutdownGraceMs: 1 });
+    const { codex, orchestrator, output, timers } = setup({
+      shutdownGraceMs: 1,
+    });
     codex.startTurnGates.push(startGate.promise);
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.startTurnAttempts === 1);
 
     const stopping = orchestrator.interruptAll();
@@ -3045,10 +3136,11 @@ describe("ConversationOrchestrator", () => {
     assertEquals(output.progress[0].chunks, terminalChunks);
   });
   it("renders shutdown through the active pipeline and rejects late activity after finish", async () => {
-    const { codex, orchestrator, output } = setup();
+    const { codex, orchestrator, output, timers } = setup();
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
 
     const stopping = orchestrator.interruptAll();
@@ -3075,10 +3167,13 @@ describe("ConversationOrchestrator", () => {
   it("filters shutdown only through its output level", async () => {
     const settings = outputSettings();
     settings.levels.SHUTDOWN = "off";
-    const { codex, orchestrator, output } = setup({ outputSettings: settings });
+    const { codex, orchestrator, output, timers } = setup({
+      outputSettings: settings,
+    });
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
 
     const stopping = orchestrator.interruptAll();
@@ -3094,10 +3189,13 @@ describe("ConversationOrchestrator", () => {
   it("respects the shutdown label setting without changing its visibility", async () => {
     const settings = outputSettings();
     settings.labels.SHUTDOWN = "hide";
-    const { codex, orchestrator, output } = setup({ outputSettings: settings });
+    const { codex, orchestrator, output, timers } = setup({
+      outputSettings: settings,
+    });
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
 
     const stopping = orchestrator.interruptAll();
@@ -3112,12 +3210,13 @@ describe("ConversationOrchestrator", () => {
     );
   });
   it("bounds shutdown when an interrupted turn never reaches terminal state", async () => {
-    const { codex, orchestrator, output, state } = setup({
+    const { codex, orchestrator, output, state, timers } = setup({
       shutdownGraceMs: 1,
     });
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
 
     const stopping = orchestrator.interruptAll();
@@ -3146,12 +3245,13 @@ describe("ConversationOrchestrator", () => {
     assertMatch(output.sent[0].text, /暂不可用/);
   });
   it("interrupts and clears a started turn when beginTurn persistence fails", async () => {
-    const { codex, orchestrator, output, state } = setup();
+    const { codex, orchestrator, output, state, timers } = setup();
     state.failNextBegin = true;
 
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     await waitFor(() => codex.interrupts.length === 1);
     codex.starts[0].resolve({ status: "interrupted" });
@@ -3170,7 +3270,7 @@ describe("ConversationOrchestrator", () => {
   });
   it("waits for a turn with failed begin persistence before starting pending work", async () => {
     const interruptGate = Promise.withResolvers<void>();
-    const { codex, orchestrator, output, state } = setup({
+    const { codex, orchestrator, output, state, timers } = setup({
       interruptRetryDelaysMs: [0],
     });
     state.failNextBegin = true;
@@ -3180,12 +3280,14 @@ describe("ConversationOrchestrator", () => {
     const firstResult = orchestrator.handleText(
       message("single:alice", "m1", "first"),
     ).then(() => null, (error) => error);
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     await waitFor(() => codex.interrupts.length === 1);
 
     const secondResult = orchestrator.handleText(
       message("single:alice", "m2", "second"),
     ).then(() => null, (error) => error);
+    await timers.advance(3_000);
     await new Promise((resolve) => setTimeout(resolve, 0));
     const startsBeforeCompletion = codex.starts.length;
     const progressFinishedBeforeCompletion = output.progress[0].finished;
@@ -3210,7 +3312,7 @@ describe("ConversationOrchestrator", () => {
   });
   it("reports finishTurn failures but still sends the final answer and clears active", async () => {
     const reported: Error[] = [];
-    const { codex, orchestrator, output, state } = setup({
+    const { codex, orchestrator, output, state, timers } = setup({
       onError: (error: Error) => {
         reported.push(error);
         throw new Error("error reporter failed");
@@ -3220,6 +3322,7 @@ describe("ConversationOrchestrator", () => {
     const first = orchestrator.handleText(
       message("single:alice", "m1", "first"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
     await first;
@@ -3227,6 +3330,7 @@ describe("ConversationOrchestrator", () => {
     const second = orchestrator.handleText(
       message("single:alice", "m2", "second"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 2);
 
     assertEquals(codex.interrupts, []);
@@ -3241,17 +3345,19 @@ describe("ConversationOrchestrator", () => {
   });
   it("continues draining pending work when a failure notification cannot be sent", async () => {
     const startGate = Promise.withResolvers<void>();
-    const { codex, orchestrator, output } = setup();
+    const { codex, orchestrator, output, timers } = setup();
     codex.startTurnGates.push(startGate.promise);
     codex.startTurnErrors.push(new Error("startTurn failed"));
     const firstResult = orchestrator.handleText(
       message("single:alice", "m1", "first"),
     ).then(() => null, (error) => error);
+    await timers.advance(3_000);
     await waitFor(() => codex.startTurnAttempts === 1);
 
     const secondResult = orchestrator.handleText(
       message("single:alice", "m2", "second"),
     ).then(() => null, (error) => error);
+    await timers.advance(3_000);
     output.sendErrors.push(new Error("failure notification failed"));
     startGate.resolve();
 
@@ -3261,11 +3367,12 @@ describe("ConversationOrchestrator", () => {
     assertEquals(await Promise.all([firstResult, secondResult]), [null, null]);
   });
   it("persists terminal state and sends the final answer when progress finish fails", async () => {
-    const { codex, orchestrator, output, state } = setup();
+    const { codex, orchestrator, output, state, timers } = setup();
     output.failNextProgressFinish = true;
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
 
     codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
@@ -3279,11 +3386,7 @@ describe("ConversationOrchestrator", () => {
     assertEquals(output.sent, [{ msgId: "m1", text: "done", final: true }]);
   });
   it("starts one request only after three seconds of silence", async () => {
-    const timers = new FakeTimers();
-    const { codex, orchestrator } = setup({
-      messageDebounceMs: 3_000,
-      messageDebounceTimers: timers,
-    });
+    const { codex, orchestrator, timers } = setup();
 
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
@@ -3298,11 +3401,7 @@ describe("ConversationOrchestrator", () => {
     await running;
   });
   it("resets the window and preserves ordered senders, quotes, and the last frame", async () => {
-    const timers = new FakeTimers();
-    const { codex, orchestrator, output } = setup({
-      messageDebounceMs: 3_000,
-      messageDebounceTimers: timers,
-    });
+    const { codex, orchestrator, output, timers } = setup();
     const firstQuote = { msgtype: "text", content: "first quote" };
     const secondQuote = { msgtype: "file", file: { name: "second.pdf" } };
 
@@ -3337,11 +3436,7 @@ describe("ConversationOrchestrator", () => {
     assertEquals(output.sent.at(-1)?.msgId, "m2");
   });
   it("does not extend the window for duplicate messages or bypass traffic", async () => {
-    const timers = new FakeTimers();
-    const { codex, orchestrator } = setup({
-      messageDebounceMs: 3_000,
-      messageDebounceTimers: timers,
-    });
+    const { codex, orchestrator, timers } = setup();
     const firstMessage = message("single:alice", "m1", "work");
     const running = orchestrator.handleText(firstMessage);
 
@@ -3371,11 +3466,7 @@ describe("ConversationOrchestrator", () => {
     await running;
   });
   it("maintains independent windows for different conversations", async () => {
-    const timers = new FakeTimers();
-    const { codex, orchestrator } = setup({
-      messageDebounceMs: 3_000,
-      messageDebounceTimers: timers,
-    });
+    const { codex, orchestrator, timers } = setup();
     const first = orchestrator.handleText(
       message("single:alice", "m1", "first"),
     );
@@ -3399,11 +3490,7 @@ describe("ConversationOrchestrator", () => {
     await Promise.all([first, second]);
   });
   it("waits for the window before interrupting an active turn", async () => {
-    const timers = new FakeTimers();
-    const { codex, orchestrator } = setup({
-      messageDebounceMs: 3_000,
-      messageDebounceTimers: timers,
-    });
+    const { codex, orchestrator, timers } = setup();
     const first = orchestrator.handleText(
       message("single:alice", "m1", "first"),
     );
@@ -3424,11 +3511,7 @@ describe("ConversationOrchestrator", () => {
     await Promise.all([first, second]);
   });
   it("reports a waiting batch as queued", async () => {
-    const timers = new FakeTimers();
-    const { codex, orchestrator, output } = setup({
-      messageDebounceMs: 3_000,
-      messageDebounceTimers: timers,
-    });
+    const { codex, orchestrator, output, timers } = setup();
     const waiting = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
@@ -3447,11 +3530,7 @@ describe("ConversationOrchestrator", () => {
     await waiting;
   });
   it("cancels a waiting batch when /new resets the conversation", async () => {
-    const timers = new FakeTimers();
-    const { codex, orchestrator, state } = setup({
-      messageDebounceMs: 3_000,
-      messageDebounceTimers: timers,
-    });
+    const { codex, orchestrator, state, timers } = setup();
     const waiting = orchestrator.handleText(
       message("single:alice", "m1", "old work"),
     );
@@ -3466,11 +3545,7 @@ describe("ConversationOrchestrator", () => {
     assertEquals(state.getConversation("single:alice")?.threadId, "thread-1");
   });
   it("cancels a waiting batch before an unavailable /new reply", async () => {
-    const timers = new FakeTimers();
-    const { codex, orchestrator, output } = setup({
-      messageDebounceMs: 3_000,
-      messageDebounceTimers: timers,
-    });
+    const { codex, orchestrator, output, timers } = setup();
     const waiting = orchestrator.handleText(
       message("single:alice", "m1", "old work"),
     );
@@ -3487,11 +3562,7 @@ describe("ConversationOrchestrator", () => {
     assertEquals(output.sent[0].msgId, "reset");
   });
   it("discards a waiting batch during shutdown and ignores a late timer", async () => {
-    const timers = new FakeTimers();
-    const { codex, orchestrator } = setup({
-      messageDebounceMs: 3_000,
-      messageDebounceTimers: timers,
-    });
+    const { codex, orchestrator, timers } = setup();
     const waiting = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
@@ -3505,11 +3576,7 @@ describe("ConversationOrchestrator", () => {
     assertEquals(codex.startThreadAttempts, 0);
   });
   it("rejects a batch when the runtime becomes unavailable while waiting", async () => {
-    const timers = new FakeTimers();
-    const { codex, orchestrator, output } = setup({
-      messageDebounceMs: 3_000,
-      messageDebounceTimers: timers,
-    });
+    const { codex, orchestrator, output, timers } = setup();
     const waiting = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
@@ -3537,11 +3604,7 @@ describe("ConversationOrchestrator", () => {
     }]);
   });
   it("stops a waiting batch, ignores its stale timer, and accepts new work", async () => {
-    const timers = new FakeTimers();
-    const { codex, orchestrator, output } = setup({
-      messageDebounceMs: 3_000,
-      messageDebounceTimers: timers,
-    });
+    const { codex, orchestrator, output, timers } = setup();
     const cancelled = orchestrator.handleText(
       message("single:alice", "m1", "cancelled"),
     );
@@ -3568,11 +3631,7 @@ describe("ConversationOrchestrator", () => {
     await next;
   });
   it("stops only the targeted conversation", async () => {
-    const timers = new FakeTimers();
-    const { codex, orchestrator } = setup({
-      messageDebounceMs: 3_000,
-      messageDebounceTimers: timers,
-    });
+    const { codex, orchestrator, timers } = setup();
     const cancelled = orchestrator.handleText(
       message("single:alice", "m1", "cancelled"),
     );
@@ -3591,10 +3650,11 @@ describe("ConversationOrchestrator", () => {
     await Promise.all([cancelled, unaffected]);
   });
   it("interrupts an active turn and persists stop over a racing answer", async () => {
-    const { codex, orchestrator, output, state } = setup();
+    const { codex, orchestrator, output, state, timers } = setup();
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
 
     await orchestrator.handleText(
@@ -3616,13 +3676,14 @@ describe("ConversationOrchestrator", () => {
     assertEquals(state.getConversation("single:alice")?.lastError, null);
   });
   it("retries a failed interrupt requested by /stop", async () => {
-    const { codex, orchestrator } = setup({
+    const { codex, orchestrator, timers } = setup({
       interruptRetryDelaysMs: [0],
     });
     codex.interruptErrors.push(new Error("temporary interrupt failure"));
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
 
     await orchestrator.handleText(
@@ -3634,13 +3695,14 @@ describe("ConversationOrchestrator", () => {
     await running;
   });
   it("does not let a stale /stop retry interrupt the next turn", async () => {
-    const { codex, orchestrator } = setup({
+    const { codex, orchestrator, timers } = setup({
       interruptRetryDelaysMs: [0],
     });
     codex.interruptErrors.push(new Error("temporary interrupt failure"));
     const first = orchestrator.handleText(
       message("single:alice", "m1", "first"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
 
     await orchestrator.handleText(
@@ -3650,6 +3712,7 @@ describe("ConversationOrchestrator", () => {
     const next = orchestrator.handleText(
       message("single:alice", "m2", "next"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 2);
     await new Promise((resolve) => setTimeout(resolve, 0));
     const interruptsBeforeCompletion = [...codex.interrupts];
@@ -3662,14 +3725,16 @@ describe("ConversationOrchestrator", () => {
     );
   });
   it("drops ordinary and /new work queued behind an active turn", async () => {
-    const { codex, orchestrator, state } = setup();
+    const { codex, orchestrator, state, timers } = setup();
     const first = orchestrator.handleText(
       message("single:alice", "m1", "first"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     const pending = orchestrator.handleText(
       message("single:alice", "m2", "second"),
     );
+    await timers.advance(3_000);
     const resetting = orchestrator.handleText(
       message("single:alice", "reset", "/new"),
     );
@@ -3686,11 +3751,12 @@ describe("ConversationOrchestrator", () => {
   });
   it("stops an initial thread RPC without binding its late result", async () => {
     const gate = Promise.withResolvers<void>();
-    const { codex, orchestrator, state } = setup();
+    const { codex, orchestrator, state, timers } = setup();
     codex.startThreadGates.push(gate.promise);
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.startThreadAttempts === 1);
 
     await orchestrator.handleText(
@@ -3709,12 +3775,13 @@ describe("ConversationOrchestrator", () => {
   });
   it("does not cache a resume result that arrives after /stop", async () => {
     const resumeGate = Promise.withResolvers<void>();
-    const { codex, orchestrator, state } = setup();
+    const { codex, orchestrator, state, timers } = setup();
     state.bindConversation("single:alice", "single", "thread-existing");
     codex.resumeThreadGates.push(resumeGate.promise);
     const cancelled = orchestrator.handleText(
       message("single:alice", "m1", "cancelled"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.resumed.length === 1);
 
     await orchestrator.handleText(
@@ -3726,6 +3793,7 @@ describe("ConversationOrchestrator", () => {
     const next = orchestrator.handleText(
       message("single:alice", "m2", "next"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.resumed.length === 2);
     await waitFor(() => codex.starts.length === 1);
 
@@ -3756,11 +3824,12 @@ describe("ConversationOrchestrator", () => {
   });
   it("finishes a progress handle that arrives after /stop", async () => {
     const progressGate = Promise.withResolvers<void>();
-    const { codex, orchestrator, output } = setup();
+    const { codex, orchestrator, output, timers } = setup();
     output.startProgressGates.push(progressGate.promise);
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => output.startProgressAttempts === 1);
 
     await orchestrator.handleText(
@@ -3780,11 +3849,12 @@ describe("ConversationOrchestrator", () => {
   });
   it("interrupts a late turn handle without releasing the serial slot", async () => {
     const startGate = Promise.withResolvers<void>();
-    const { codex, orchestrator } = setup();
+    const { codex, orchestrator, timers } = setup();
     codex.startTurnGates.push(startGate.promise);
     const first = orchestrator.handleText(
       message("single:alice", "m1", "first"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.startTurnAttempts === 1);
 
     await orchestrator.handleText(
@@ -3793,6 +3863,7 @@ describe("ConversationOrchestrator", () => {
     const second = orchestrator.handleText(
       message("single:alice", "m2", "second"),
     );
+    await timers.advance(3_000);
     startGate.resolve();
     await waitFor(() => codex.starts.length === 1);
     await waitFor(() => codex.interrupts.length === 1);
@@ -3810,12 +3881,13 @@ describe("ConversationOrchestrator", () => {
   });
   it("treats a late startTurn failure as stopped work", async () => {
     const startGate = Promise.withResolvers<void>();
-    const { codex, orchestrator, output } = setup();
+    const { codex, orchestrator, output, timers } = setup();
     codex.startTurnGates.push(startGate.promise);
     codex.startTurnErrors.push(new Error("late start failure"));
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.startTurnAttempts === 1);
 
     await orchestrator.handleText(
@@ -3830,11 +3902,12 @@ describe("ConversationOrchestrator", () => {
     );
   });
   it("suppresses beginTurn failure fallback when /stop wins the race", async () => {
-    const { codex, orchestrator, output, state } = setup();
+    const { codex, orchestrator, output, state, timers } = setup();
     state.failNextBegin = true;
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     await waitFor(() => codex.interrupts.length === 1);
 
@@ -3853,16 +3926,18 @@ describe("ConversationOrchestrator", () => {
     const state = new FakeState();
     const codex = new FakeCodex();
     const output = new PendingFinalOutput();
+    const timers = new FakeTimers();
     const orchestrator = new ConversationOrchestrator({
       state,
       codex,
       output,
       workspace: "/workspace",
-      messageDebounceMs: 0,
+      messageDebounceTimers: timers,
     });
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
     await output.finalStarted.promise;
@@ -3880,7 +3955,7 @@ describe("ConversationOrchestrator", () => {
     );
   });
   it("forwards quoted content to the Codex turn prompt", async () => {
-    const { codex, orchestrator } = setup();
+    const { codex, orchestrator, timers } = setup();
     const quote = {
       msgtype: "image",
       image: {
@@ -3894,32 +3969,15 @@ describe("ConversationOrchestrator", () => {
     };
 
     const running = orchestrator.handleText(request);
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
 
     assertStringIncludes(codex.starts[0].prompt, JSON.stringify(quote));
     codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
     await running;
   });
-  it("does not open progress when quoted content cannot be serialized", async () => {
-    const { codex, orchestrator, output } = setup();
-    const request = {
-      ...message("group:engineering", "m-invalid-quote", "处理这个", "bob"),
-      quote: () => undefined,
-    };
-
-    await orchestrator.handleText(request);
-
-    assertEquals(codex.starts.length, 0);
-    assertEquals(output.progress, []);
-    assertEquals(output.sent.length, 1);
-    assertMatch(
-      output.sent[0].text,
-      /任务启动失败：quote must be JSON-serializable/,
-    );
-    assertEquals(output.sent[0].final, true);
-  });
   it("shows less progress in groups without hiding direct or final replies", async () => {
-    const { codex, orchestrator, output } = setup({
+    const { codex, orchestrator, output, timers } = setup({
       outputSettings: outputSettings("full"),
       groupOutputSettings: outputSettings("off"),
     });
@@ -3929,6 +3987,7 @@ describe("ConversationOrchestrator", () => {
     const group = orchestrator.handleText(
       message("group:room", "group-less", "group work", "bob"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 2);
     const singleTurn = codex.starts.find((turn) =>
       turn.prompt.includes("msgid: single-less")
@@ -3988,7 +4047,7 @@ describe("ConversationOrchestrator", () => {
     );
   });
   it("shows more progress in groups without changing single-chat output", async () => {
-    const { codex, orchestrator, output } = setup({
+    const { codex, orchestrator, output, timers } = setup({
       outputSettings: outputSettings("off"),
       groupOutputSettings: outputSettings("full"),
     });
@@ -3998,6 +4057,7 @@ describe("ConversationOrchestrator", () => {
     const group = orchestrator.handleText(
       message("group:room", "group-more", "group work", "bob"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 2);
     const singleTurn = codex.starts.find((turn) =>
       turn.prompt.includes("msgid: single-more")
@@ -4041,7 +4101,7 @@ describe("ConversationOrchestrator", () => {
     const singleSettings = outputSettings();
     const groupSettings = outputSettings();
     groupSettings.toolFormat = "summary";
-    const { codex, orchestrator, output } = setup({
+    const { codex, orchestrator, output, timers } = setup({
       outputSettings: singleSettings,
       groupOutputSettings: groupSettings,
     });
@@ -4051,6 +4111,7 @@ describe("ConversationOrchestrator", () => {
     const group = orchestrator.handleText(
       message("group:room", "group-tools", "group work", "bob"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 2);
     const singleTurn = codex.starts.find((turn) =>
       turn.prompt.includes("msgid: single-tools")
@@ -4112,7 +4173,7 @@ describe("ConversationOrchestrator", () => {
     const singleSettings = outputSettings();
     const groupSettings = outputSettings();
     groupSettings.toolFormat = "summary";
-    const { codex, orchestrator } = setup({
+    const { codex, orchestrator, timers } = setup({
       outputSettings: singleSettings,
       groupOutputSettings: groupSettings,
     });
@@ -4122,6 +4183,7 @@ describe("ConversationOrchestrator", () => {
     const group = orchestrator.handleText(
       message("group:room", "group-summary-option", "group work", "bob"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 2);
     const singleTurn = codex.starts.find((turn) =>
       turn.prompt.includes("msgid: single-summary-option")
@@ -4138,11 +4200,7 @@ describe("ConversationOrchestrator", () => {
   });
 
   it("traces every message in one debounced Codex request", async () => {
-    const timers = new FakeTimers();
-    const { codex, orchestrator, output, requestEvents } = setup({
-      messageDebounceMs: 3_000,
-      messageDebounceTimers: timers,
-    });
+    const { codex, orchestrator, output, requestEvents, timers } = setup();
     const firstMessage = {
       ...message("group:room", "m1", "first", "alice"),
       quote: { msgtype: "text", text: { content: "quoted" } },
@@ -4194,11 +4252,7 @@ describe("ConversationOrchestrator", () => {
   });
 
   it("waits for a new debounce batch before logging its active interruption", async () => {
-    const timers = new FakeTimers();
-    const { codex, orchestrator, requestEvents } = setup({
-      messageDebounceMs: 3_000,
-      messageDebounceTimers: timers,
-    });
+    const { codex, orchestrator, requestEvents, timers } = setup();
     const first = orchestrator.handleText(
       message("single:alice", "m1", "first"),
     );
@@ -4232,11 +4286,7 @@ describe("ConversationOrchestrator", () => {
   });
 
   it("terminalizes a stopped debounce batch without logging the command", async () => {
-    const timers = new FakeTimers();
-    const { codex, orchestrator, requestEvents } = setup({
-      messageDebounceMs: 3_000,
-      messageDebounceTimers: timers,
-    });
+    const { codex, orchestrator, requestEvents, timers } = setup();
     const first = orchestrator.handleText(
       message("single:alice", "m1", "first"),
     );
@@ -4263,11 +4313,7 @@ describe("ConversationOrchestrator", () => {
   });
 
   it("discards every waiting debounce trace during shutdown", async () => {
-    const timers = new FakeTimers();
-    const { codex, orchestrator, requestEvents } = setup({
-      messageDebounceMs: 3_000,
-      messageDebounceTimers: timers,
-    });
+    const { codex, orchestrator, requestEvents, timers } = setup();
     const first = orchestrator.handleText(
       message("single:alice", "m1", "first"),
     );
@@ -4295,17 +4341,19 @@ describe("ConversationOrchestrator", () => {
     const codex = new FakeCodex();
     const output = new PendingFinalOutput();
     const requestEvents: RequestStatusEvent[] = [];
+    const timers = new FakeTimers();
     const orchestrator = new ConversationOrchestrator({
       state,
       codex,
       output,
       workspace: "/workspace",
-      messageDebounceMs: 0,
+      messageDebounceTimers: timers,
       onRequestStatus: (event) => requestEvents.push(event),
     });
     const running = orchestrator.handleText(
       message("single:alice", "m1", "work"),
     );
+    await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
     await output.finalStarted.promise;
@@ -4326,12 +4374,9 @@ describe("ConversationOrchestrator", () => {
 
 describe("ConversationOrchestrator settings barriers", () => {
   it("waits for an earlier model mutation before a later debounced turn", async () => {
-    const timers = new FakeTimers();
     const modelGate = Promise.withResolvers<void>();
-    const { codex, orchestrator } = setup({
+    const { codex, orchestrator, timers } = setup({
       ownerUserId: "alice",
-      messageDebounceMs: 3_000,
-      messageDebounceTimers: timers,
     });
     codex.modelChangeGates.push(modelGate.promise);
     const switching = orchestrator.handleText(
@@ -4359,12 +4404,9 @@ describe("ConversationOrchestrator settings barriers", () => {
   });
 
   it("does not let a later mutation block an earlier debounced request", async () => {
-    const timers = new FakeTimers();
     const modelGate = Promise.withResolvers<void>();
-    const { codex, orchestrator } = setup({
+    const { codex, orchestrator, timers } = setup({
       ownerUserId: "alice",
-      messageDebounceMs: 3_000,
-      messageDebounceTimers: timers,
     });
     const running = orchestrator.handleText(
       message("single:alice", "work", "work"),

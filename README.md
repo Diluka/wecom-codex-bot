@@ -28,6 +28,17 @@ OUTPUT_FORMAT_TOOL=individual
 `CODEX_WORKSPACE` 支持相对路径，按机器人项目目录解析。机器人只将解析后的 `cwd`
 传给 Codex；审批、沙盒、网络、模型等行为全部使用现有 Codex config。
 
+### 敏感信息边界
+
+> [!WARNING]
+> 本项目不会识别、扫描、替换或脱敏聊天内容、Codex 输出、工具结果、错误消息、
+> 企业微信 SDK 日志或 Pino 字段中的敏感值。是否避免从模型输出泄露敏感信息完全
+> 依赖模型自行遵守指令，这不是可靠的安全边界。
+
+不要在聊天或 `CODEX_WORKSPACE` 中放置不应由模型读取的凭据或敏感数据。发送到企业
+微信的内容只经过现有的格式化、长度控制、限流和分段，不进行敏感值过滤。SDK 诊断、
+错误消息和其他进入日志的字符串同样不会脱敏。
+
 ### Owner 权限与隔离
 
 `WECOM_OWNER_USER_ID` 是可选的企业微信 sender user ID。未设置、空值或无效值都
@@ -224,8 +235,9 @@ OUTPUT_GROUP_FORMAT_TOOL=summary
 
 同一普通文本请求的每个状态都会重复携带消息中的真实 `chat_id`、`user_id` 和
 `msg_id`；获得 Codex 标识后，后续状态还会重复真实 `thread_id` 和 `turn_id`，不会
-另外生成替代标识。只有 `received` 状态包含 `summary`：正文先脱敏、折叠空白，再按
-Unicode 字素簇截取前 10 个，超长时追加 `…`，不会把完整聊天正文写到终端。
+另外生成替代标识。只有 `received` 状态包含 `summary`：正文会折叠空白，再按
+Unicode 字素簇截取前 10 个，超长时追加省略号。摘要不会把完整聊天正文写到终端，
+也不会检测或脱敏其中的敏感值。
 
 启动时的 `owner_configuration` lifecycle 日志会把规范化后的 owner ID 作为
 `owner_user_id`；该字段与其他 Pino 字符串一样，超过 100 个 Unicode 字素簇时会被
@@ -255,9 +267,12 @@ turn、非预期进程退出和无法恢复的 fatal。App Server 原始 stderr 
 
 机器人新增的 Codex 生命周期、决策和 App Server stderr 日志不会记录聊天正文、
 reasoning summary 文本、命令、参数或工具输出；它们只记录功能性元数据。企业微信
-SDK 属于上游原始诊断流，仍可能包含文本片段。所有经过 Pino 的消息和字符串字段都会
-先单行化、递归脱敏，再按 Unicode 字素簇截断到最多 100 个字符。因此可用下面的
-配置判断 App Server 是否发出了 reasoning summary，以及它是否在输出管线中被过滤：
+SDK 属于上游原始诊断流，仍可能包含文本片段。经过 Pino log method 的消息和顶层
+字符串字段只会单行化并按 Unicode 字素簇截断到最多 100 个字符；普通嵌套结构由
+Pino 原生处理。上述过程不会检测或脱敏敏感值。
+
+因此可用下面的配置判断 App Server 是否发出了 reasoning summary。该配置也能判断
+输出管线是否将其过滤：
 
 ```dotenv
 LOG_LEVEL=debug
@@ -273,10 +288,9 @@ OUTPUT_FORMAT_TOOL=summary
 `OUTPUT_*` 不影响运行日志。`logs/` 是本地运行状态并已被 Git 忽略；文件中仍包含
 排障所需的 chat/thread/turn 标识，不应提交或公开。
 
-所有结构化字段和消息都会在 Pino 边界递归脱敏并限制字符串长度。
-
-当前实验配置把 `.env` 放在 Codex 工作区内，因此 Codex 可以读取机器人
-Secret。发送到企业微信的内容会脱敏，但这不构成可靠的 Secret 隔离。
+当前实验配置把 `.env` 放在 Codex 工作区内，因此 Codex 可以读取机器人 Secret。
+项目不提供输出或日志级敏感值保护；避免泄露依赖模型自觉以及使用者不把凭据放进模型
+可读的聊天和工作区。
 
 ## 本地运行
 
