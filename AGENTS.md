@@ -115,9 +115,10 @@ Codex notifications
 - owner ID 被写入启动期 developer instructions，属于有意对模型可见的数据，并且
   可能出现在 App Server argv 或 Codex session metadata；不得把它当作 Secret。
 - 每次启动都要记录 `owner_configuration` lifecycle
-  日志；配置有效时输出规范化后的 owner ID 和
-  `configured: true`，未配置、空值或无效时输出 `null` 和
-  `configured: false`。既有 request 日志仍按真实消息记录 sender `user_id`；owner
+  日志；配置有效时输出规范化后的 owner ID 和 `configured: true`，owner ID
+  仍服从所有 Pino 字符串统一的 100 个 Unicode
+  字素簇上限；未配置、空值或无效时输出 `null` 和 `configured: false`。既有
+  request 日志仍按真实消息记录 sender `user_id`；owner
   配置不会替换、匿名化或隐藏该字段。
 - restricted turn 可在 main checkout 中执行无副作用的读取、搜索和状态检查，但
   写操作、测试、构建、格式化、依赖安装及其他潜在写操作必须进入隔离 worktree。
