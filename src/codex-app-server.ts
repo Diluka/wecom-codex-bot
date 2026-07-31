@@ -1,4 +1,8 @@
 import { readJsonLines } from "./jsonl.ts";
+import {
+  buildTurnAuthorityContext,
+  type RequestAuthority,
+} from "./owner-policy.ts";
 
 type JsonObject = Record<string, unknown>;
 type RequestId = string | number;
@@ -66,6 +70,11 @@ export interface AppServerNotification {
   params: JsonObject;
 }
 
+export interface AdditionalContextEntry {
+  value: string;
+  kind: "untrusted" | "application";
+}
+
 export interface CodexAppServerCallbacks {
   onNotification?: EventCallback<AppServerNotification>;
   onThreadStarted?: EventCallback<ThreadStartedEvent>;
@@ -81,6 +90,7 @@ export interface CodexAppServerCallbacks {
 
 export interface CodexAppServerOptions {
   cwd: string;
+  developerInstructions?: string;
   callbacks?: CodexAppServerCallbacks;
   spawn?: SpawnAppServer;
   rpcTimeoutMs?: number;
@@ -212,11 +222,21 @@ export class CodexAppServerClient {
     options: CodexAppServerOptions,
   ): Promise<CodexAppServerClient> {
     const environment = Deno.env.toObject();
+    delete environment.WECOM_OWNER_USER_ID;
     delete environment.BOT_ID;
     delete environment.BOT_SECRET;
 
     const process = (options.spawn ?? defaultSpawn)("codex", {
-      args: ["app-server", "--stdio"],
+      args: options.developerInstructions === undefined
+        ? ["app-server", "--stdio"]
+        : [
+          "-c",
+          `developer_instructions=${
+            JSON.stringify(options.developerInstructions)
+          }`,
+          "app-server",
+          "--stdio",
+        ],
       cwd: options.cwd,
       clearEnv: true,
       env: environment,
@@ -269,11 +289,22 @@ export class CodexAppServerClient {
     return requiredNestedString(result, "thread", "id");
   }
 
-  async startTurn(threadId: string, text: string): Promise<string> {
+  async startTurn(
+    threadId: string,
+    text: string,
+    authority: RequestAuthority,
+  ): Promise<string> {
+    const additionalContext: Record<string, AdditionalContextEntry> = {
+      wecom_owner_policy: {
+        kind: "application",
+        value: buildTurnAuthorityContext(authority),
+      },
+    };
     const result = await this.#request("turn/start", {
       threadId,
       input: [{ type: "text", text, text_elements: [] }],
       cwd: this.#cwd,
+      additionalContext,
     });
     return requiredNestedString(result, "turn", "id");
   }

@@ -13,6 +13,7 @@ import {
   type TurnOutcome,
 } from "./orchestrator.ts";
 import type { ActivityEvent } from "./activity-event.ts";
+import type { RequestAuthority } from "./owner-policy.ts";
 import { WeComChatOutput } from "./chat-output.ts";
 import { OUTPUT_TAGS, type OutputSettings } from "./output-settings.ts";
 import { ConversationSendQueue } from "./output.ts";
@@ -167,6 +168,7 @@ class FakeCodex implements CodexPort {
   async startTurn(
     threadId: string,
     prompt: string,
+    _authority: RequestAuthority,
     onActivity: (event: ActivityEvent) => void | Promise<void>,
   ): Promise<CodexTurnHandle> {
     this.startTurnAttempts++;

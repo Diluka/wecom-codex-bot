@@ -9,6 +9,7 @@ import {
   type TurnCompletedEvent,
 } from "./codex-app-server.ts";
 import type { ActivityEvent } from "./activity-event.ts";
+import type { RequestAuthority } from "./owner-policy.ts";
 import {
   describeCodexNotification,
   describeSubagentStatusUpdates,
@@ -24,7 +25,11 @@ import type {
 export interface CodexRuntimeClient {
   startThread(): Promise<string>;
   resumeThread(threadId: string): Promise<string>;
-  startTurn(threadId: string, prompt: string): Promise<string>;
+  startTurn(
+    threadId: string,
+    prompt: string,
+    authority: RequestAuthority,
+  ): Promise<string>;
   interrupt(threadId: string, turnId: string): Promise<void>;
   close(): Promise<unknown>;
 }
@@ -37,6 +42,7 @@ type MaybePromise<T> = T | Promise<T>;
 
 export interface CodexRuntimeOptions {
   workspace: string;
+  developerInstructions?: string;
   clientFactory?: CodexRuntimeClientFactory;
   delay?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   onFatal?: (error: Error) => MaybePromise<void>;
@@ -86,6 +92,7 @@ const defaultDelay = (
 /** Adapts Codex App Server sessions into the orchestrator's resilient Codex port. */
 export class CodexRuntime implements CodexPort {
   readonly #workspace: string;
+  readonly #developerInstructions?: string;
   readonly #clientFactory: CodexRuntimeClientFactory;
   readonly #delay: (
     milliseconds: number,
@@ -119,6 +126,7 @@ export class CodexRuntime implements CodexPort {
 
   constructor(options: CodexRuntimeOptions) {
     this.#workspace = options.workspace;
+    this.#developerInstructions = options.developerInstructions;
     this.#clientFactory = options.clientFactory ?? defaultClientFactory;
     this.#delay = options.delay ?? defaultDelay;
     this.#onFatal = options.onFatal;
@@ -186,6 +194,7 @@ export class CodexRuntime implements CodexPort {
   async startTurn(
     threadId: string,
     prompt: string,
+    authority: RequestAuthority,
     onActivity: (event: ActivityEvent) => void | Promise<void>,
   ): Promise<CodexTurnHandle> {
     const client = this.#requireClient();
@@ -193,7 +202,7 @@ export class CodexRuntime implements CodexPort {
     const pendingStart = this.#startPendingTurn(threadId);
     let activated = false;
     try {
-      const turnId = await client.startTurn(threadId, prompt);
+      const turnId = await client.startTurn(threadId, prompt, authority);
       const { promise: completion, resolve } = Promise.withResolvers<
         TurnOutcome
       >();
@@ -243,6 +252,7 @@ export class CodexRuntime implements CodexPort {
     try {
       const client = await this.#clientFactory({
         cwd: this.#workspace,
+        developerInstructions: this.#developerInstructions,
         callbacks: this.#callbacks(token),
       });
       const earlyExit = this.#earlyExits.get(token);

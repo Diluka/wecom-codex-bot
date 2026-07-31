@@ -1,4 +1,5 @@
 import type { ActivityEvent } from "./activity-event.ts";
+import type { RequestAuthority } from "./owner-policy.ts";
 import { summarizeRequest } from "./log.ts";
 import { TurnOutputPipeline } from "./output-pipeline.ts";
 import { buildCodexPrompt } from "./prompt.ts";
@@ -69,6 +70,7 @@ export interface CodexPort {
   startTurn(
     threadId: string,
     prompt: string,
+    authority: RequestAuthority,
     onActivity: (event: ActivityEvent) => void | Promise<void>,
   ): Promise<CodexTurnHandle>;
   interruptTurn(threadId: string, turnId: string): Promise<void>;
@@ -855,6 +857,7 @@ export class ConversationOrchestrator {
       start = this.#codex.startTurn(
         threadId,
         prompt,
+        "restricted",
         (activity) => this.#enqueueActivity(turnOutput, activity, control),
       );
     } catch (error) {

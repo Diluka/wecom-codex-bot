@@ -35,6 +35,7 @@ try {
   const turnId = await client.startTurn(
     threadId,
     "Reply with one short sentence confirming that this Codex turn works. Do not use tools.",
+    "restricted",
   );
   const result = await withTimeout(completed.promise, 120_000);
   if (result.threadId !== threadId || result.turnId !== turnId) {
