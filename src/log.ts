@@ -1,5 +1,6 @@
 import pino, { type LogFn, type Logger, type SerializerFn } from "pino";
 import pretty, { type PrettyOptions } from "pino-pretty";
+import type { LogLevel } from "./config.ts";
 import { redactSecrets } from "./output.ts";
 
 const REQUEST_WARN = new Set(["runtime_unavailable", "shutdown_discarded"]);
@@ -26,6 +27,7 @@ type LogFields = Record<string, unknown>;
 export interface LoggerOptions {
   secrets?: Iterable<string>;
   destination?: PrettyOptions["destination"];
+  level?: LogLevel;
 }
 
 // Structural by design: the orchestrator's later event type needs no import here.
@@ -61,6 +63,7 @@ export function createLogger(options: LoggerOptions = {}): Logger {
     sync: true,
   });
   const root = pino({
+    level: options.level ?? "info",
     base: null,
     redact: {
       // Explicit paths preserve the actual key; Pino reports wildcard keys as

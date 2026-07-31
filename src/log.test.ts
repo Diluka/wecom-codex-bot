@@ -19,6 +19,29 @@ function captureLogs(): {
 }
 
 describe("createLogger", () => {
+  it("uses one configured threshold for scoped loggers", () => {
+    const infoCapture = captureLogs();
+    const infoLogger = createLogger({
+      level: "info",
+      destination: infoCapture.destination,
+    }).child({ scope: "codex" });
+    infoLogger.debug({ method: "safe/method" }, "notification");
+    infoLogger.info("ready");
+
+    const debugCapture = captureLogs();
+    const debugLogger = createLogger({
+      level: "debug",
+      destination: debugCapture.destination,
+    }).child({ scope: "codex" });
+    debugLogger.debug({ method: "safe/method" }, "notification");
+    debugLogger.info("ready");
+
+    assertEquals(infoCapture.output().includes("notification"), false);
+    assertMatch(infoCapture.output(), /INFO: \[codex\] ready/);
+    assertMatch(debugCapture.output(), /DEBUG: \[codex\] notification/);
+    assertMatch(debugCapture.output(), /INFO: \[codex\] ready/);
+  });
+
   it("formats scoped structured logs and recursively redacts secrets", () => {
     const capture = captureLogs();
     const logger: Logger = createLogger({
