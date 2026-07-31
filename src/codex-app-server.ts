@@ -1,5 +1,11 @@
 import { readJsonLines } from "./jsonl.ts";
 import type { CodexTurnOptions } from "./codex-turn.ts";
+import type {
+  CodexModel,
+  CodexThreadSession,
+  ConfigDefaults,
+  SettingsPatch,
+} from "./model-settings.ts";
 import {
   buildTurnAuthorityContext,
   type RequestAuthority,
@@ -346,17 +352,74 @@ export class CodexAppServerClient {
     }
   }
 
-  async startThread(): Promise<string> {
-    const result = await this.#request("thread/start", { cwd: this.#cwd });
-    return requiredNestedString(result, "thread", "id");
+  async startThread(): Promise<CodexThreadSession> {
+    return threadSession(
+      await this.#request("thread/start", { cwd: this.#cwd }),
+    );
   }
 
-  async resumeThread(threadId: string): Promise<string> {
-    const result = await this.#request("thread/resume", {
-      threadId,
+  async resumeThread(threadId: string): Promise<CodexThreadSession> {
+    return threadSession(
+      await this.#request("thread/resume", {
+        threadId,
+        cwd: this.#cwd,
+      }),
+    );
+  }
+
+  async listModels(): Promise<CodexModel[]> {
+    const models: CodexModel[] = [];
+    let cursor: string | null = null;
+    do {
+      const page = modelPage(
+        await this.#request("model/list", {
+          cursor,
+          limit: 100,
+          includeHidden: true,
+        }),
+      );
+      models.push(...page.data);
+      cursor = page.nextCursor;
+    } while (cursor !== null);
+    return models;
+  }
+
+  async readConfigDefaults(): Promise<ConfigDefaults> {
+    const result = await this.#request("config/read", {
       cwd: this.#cwd,
+      includeLayers: false,
     });
-    return requiredNestedString(result, "thread", "id");
+    const config = isObject(result) && isObject(result.config)
+      ? result.config
+      : {};
+    return {
+      model: nullableString(config.model, "config.model"),
+      effort: nullableString(
+        config.model_reasoning_effort,
+        "config.model_reasoning_effort",
+      ),
+    };
+  }
+
+  async updateThreadSettings(
+    threadId: string,
+    patch: SettingsPatch,
+  ): Promise<void> {
+    await this.#request("thread/settings/update", { threadId, ...patch });
+  }
+
+  async writeConfigDefaults(patch: SettingsPatch): Promise<void> {
+    const edits = Object.entries({
+      model: patch.model,
+      model_reasoning_effort: patch.effort,
+    }).filter((entry): entry is [string, string | null] =>
+      entry[1] !== undefined
+    ).map(([keyPath, value]) => ({ keyPath, value, mergeStrategy: "upsert" }));
+    if (edits.length === 0) return;
+    await this.#request("config/batchWrite", {
+      edits,
+      reloadUserConfig: false,
+    });
   }
 
   async startTurn(
@@ -1167,6 +1230,88 @@ function isRequestId(value: unknown): value is RequestId {
 
 function optionalString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
+}
+
+function threadSession(value: unknown): CodexThreadSession {
+  const result = isObject(value) ? value : {};
+  const thread = isObject(result.thread) ? result.thread : {};
+  const threadId = requiredString(thread.id, "thread.id");
+  const model = requiredString(result.model, "model");
+  const effort = result.reasoningEffort == null
+    ? null
+    : requiredString(result.reasoningEffort, "reasoningEffort");
+  return { threadId, settings: { model, effort } };
+}
+
+function modelPage(value: unknown): {
+  data: CodexModel[];
+  nextCursor: string | null;
+} {
+  const result = isObject(value) ? value : {};
+  if (!Array.isArray(result.data)) {
+    throw new Error("Codex RPC response is missing data");
+  }
+  return {
+    data: result.data.map((entry, index) =>
+      modelEntry(entry, `data[${index}]`)
+    ),
+    nextCursor: nullableString(result.nextCursor, "nextCursor"),
+  };
+}
+
+function modelEntry(value: unknown, path: string): CodexModel {
+  const entry = isObject(value) ? value : {};
+  if (!Array.isArray(entry.supportedReasoningEfforts)) {
+    throw new Error(
+      `Codex RPC response is missing ${path}.supportedReasoningEfforts`,
+    );
+  }
+  return {
+    id: requiredString(entry.id, `${path}.id`),
+    model: requiredString(entry.model, `${path}.model`),
+    displayName: requiredString(entry.displayName, `${path}.displayName`),
+    description: requiredString(entry.description, `${path}.description`),
+    hidden: requiredBoolean(entry.hidden, `${path}.hidden`),
+    isDefault: requiredBoolean(entry.isDefault, `${path}.isDefault`),
+    defaultReasoningEffort: requiredString(
+      entry.defaultReasoningEffort,
+      `${path}.defaultReasoningEffort`,
+    ),
+    supportedReasoningEfforts: entry.supportedReasoningEfforts.map(
+      (value, index) => {
+        const option = isObject(value) ? value : {};
+        const optionPath = `${path}.supportedReasoningEfforts[${index}]`;
+        return {
+          reasoningEffort: requiredString(
+            option.reasoningEffort,
+            `${optionPath}.reasoningEffort`,
+          ),
+          description: requiredString(
+            option.description,
+            `${optionPath}.description`,
+          ),
+        };
+      },
+    ),
+  };
+}
+
+function requiredString(value: unknown, path: string): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`Codex RPC response is missing ${path}`);
+  }
+  return value;
+}
+
+function requiredBoolean(value: unknown, path: string): boolean {
+  if (typeof value !== "boolean") {
+    throw new Error(`Codex RPC response is missing ${path}`);
+  }
+  return value;
+}
+
+function nullableString(value: unknown, path: string): string | null {
+  return value == null ? null : requiredString(value, path);
 }
 
 function requiredNestedString(

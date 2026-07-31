@@ -6,6 +6,10 @@ import {
   type RequestAuthority,
 } from "./owner-policy.ts";
 import { summarizeRequest } from "./log.ts";
+import type {
+  ModelSettingsSnapshot,
+  ModelSettingsUpdateResult,
+} from "./model-settings.ts";
 import {
   type OutputDecisionReason,
   TurnOutputPipeline,
@@ -75,6 +79,15 @@ export interface CodexPort {
   readonly generation: number;
   startThread(): Promise<string>;
   resumeThread(threadId: string): Promise<void>;
+  getModelSettings(threadId?: string): Promise<ModelSettingsSnapshot>;
+  setModel(
+    threadId: string | undefined,
+    model: string,
+  ): Promise<ModelSettingsUpdateResult>;
+  setEffort(
+    threadId: string | undefined,
+    effort: string,
+  ): Promise<ModelSettingsUpdateResult>;
   startTurn(
     threadId: string,
     prompt: string,
@@ -212,11 +225,13 @@ interface PendingRequest {
   message: RoutedText;
   messages: RoutedText[];
   traces: RequestTrace[];
+  settingsBarrier: Promise<void>;
 }
 
 interface DebounceBatch {
   messages: RoutedText[];
   traces: RequestTrace[];
+  settingsBarrier: Promise<void>;
   timer?: unknown;
   completion: Promise<void>;
   resolve: () => void;
@@ -240,7 +255,7 @@ interface ConversationSlot {
   debounce?: DebounceBatch;
   pending?: PendingRequest;
   current?: PendingRequest;
-  resetPending?: RoutedText;
+  resetPending?: ResetRequest;
   active?: ActiveTurn;
   control?: TurnControl;
   interruptRequested: boolean;
@@ -249,12 +264,21 @@ interface ConversationSlot {
   drain?: Promise<void>;
 }
 
+interface ResetRequest {
+  message: RoutedText;
+  settingsBarrier: Promise<void>;
+}
+
 interface RequestStatusDetails {
   replacedByMsgId?: string;
   triggerMsgId?: string;
   reason?: string;
   error?: unknown;
 }
+
+type SettingsCommand =
+  | { kind: "model"; value?: string; valid: boolean }
+  | { kind: "effort"; value?: string; valid: boolean };
 
 const TERMINAL_REQUEST_STATUSES = new Set<RequestStatus>([
   "duplicate_ignored",
@@ -288,11 +312,105 @@ function isInterruptible(active?: ActiveTurn): active is ActiveTurn {
   );
 }
 
+function settingsCommand(text: string): SettingsCommand | undefined {
+  const parts = text.trim().split(/\s+/);
+  if (parts[0] !== "/model" && parts[0] !== "/effort") return undefined;
+  return {
+    kind: parts[0] === "/model" ? "model" : "effort",
+    ...(parts.length === 2 ? { value: parts[1] } : {}),
+    valid: parts.length <= 2,
+  };
+}
+
+function modelHelp(snapshot: ModelSettingsSnapshot): string {
+  return [
+    `当前模型：\`${snapshot.settings.model}\``,
+    `可选模型：${
+      snapshot.models.map(({ model }) => `\`${model}\``).join("、")
+    }`,
+    "用法：`/model <model-id>`",
+  ].join("\n");
+}
+
+function effortHelp(snapshot: ModelSettingsSnapshot): string {
+  if (!snapshot.selectedModel) {
+    return [
+      `当前推理强度：\`${snapshot.settings.effort ?? "default"}\``,
+      `当前模型 \`${snapshot.settings.model}\` 不在模型目录中，无法显示或校验支持的推理强度。`,
+      "用法：`/effort <level>`",
+    ].join("\n");
+  }
+  const efforts = snapshot.selectedModel.supportedReasoningEfforts
+    .map(({ reasoningEffort }) => `\`${reasoningEffort}\``)
+    .join("、");
+  return [
+    `当前推理强度：\`${snapshot.settings.effort ?? "default"}\``,
+    `当前模型支持：${efforts}`,
+    "用法：`/effort <level>`",
+  ].join("\n");
+}
+
+function codeList(values: readonly string[]): string {
+  return values.map((value) => `\`${value}\``).join("、");
+}
+
+function settingsUpdateReply(
+  result: ModelSettingsUpdateResult,
+  activeTurn: boolean,
+): string {
+  if (result.status === "invalid_model") {
+    return `未知模型。可选模型：${codeList(result.availableModels)}`;
+  }
+  if (result.status === "invalid_effort") {
+    if (result.availableEfforts.length === 0) {
+      return `模型 \`${result.model}\` 不在模型目录中，无法校验或修改推理强度。请先用 \`/model <model-id>\` 切换到目录中的模型。`;
+    }
+    return `模型 \`${result.model}\` 不支持该强度。可选强度：${
+      codeList(result.availableEfforts)
+    }`;
+  }
+  if (!result.defaultPersisted && !result.threadUpdated) {
+    return `设置未修改：${result.persistenceError ?? "全局默认保存失败"}`;
+  }
+
+  const settings = `模型 \`${result.settings.model}\`，推理强度 \`${
+    result.settings.effort ?? "default"
+  }\``;
+  const lines = result.threadUpdated
+    ? [`当前 thread 已切换：${settings}。`]
+    : [`全局默认值已保存：${settings}。`];
+  if (result.effortAdjusted) {
+    lines.push(
+      `模型切换后，推理强度已自动调整为 \`${
+        result.settings.effort ?? "default"
+      }\`。`,
+    );
+  }
+  if (result.threadUpdated) {
+    lines.push(
+      result.defaultPersisted
+        ? "已保存为新会话默认值。"
+        : `全局默认值保存失败：${
+          result.persistenceError ?? "全局默认保存失败"
+        }`,
+    );
+  }
+  if (result.threadUpdated && activeTurn) {
+    lines.push("当前任务仍使用旧设置，后续任务将使用新设置。");
+  }
+  return lines.join("\n");
+}
+
+const SETTINGS_MUTATION_DENIED =
+  "权限不足：只有机器人 owner 可以修改模型或推理强度；不带参数的 `/model` 和 `/effort` 仍可查询。";
+
 const HELP = [
   "可用命令：",
   "- `/new`：中断当前任务并新建 Codex 会话",
   "- `/stop`：立即停止当前聊天中正在执行或等待的任务",
   "- `/status`：查看当前聊天的绑定与运行状态",
+  "- `/model [model-id]`：查询当前模型；带 model-id 时切换并保存为新会话默认值（仅 owner）",
+  "- `/effort [level]`：查询当前推理强度；带 level 时切换并保存为新会话默认值（仅 owner）",
   "- `/help`：显示本帮助",
 ].join("\n");
 
@@ -321,6 +439,9 @@ export class ConversationOrchestrator {
   readonly #interruptRetryDelaysMs: readonly number[];
   readonly #slots = new Map<ConversationKey, ConversationSlot>();
   readonly #loadedThreads = new Map<string, number>();
+  readonly #settingsCommandTails = new Map<ConversationKey, Promise<void>>();
+  readonly #settingsMutationTails = new Map<ConversationKey, Promise<void>>();
+  readonly #shutdownSignal = Promise.withResolvers<void>();
   #shuttingDown = false;
 
   constructor(options: ConversationOrchestratorOptions) {
@@ -370,9 +491,10 @@ export class ConversationOrchestrator {
 
   async handleText(message: RoutedText): Promise<void> {
     const command = message.text.trim();
+    const parsedSettingsCommand = settingsCommand(command);
     if (
       command === "/help" || command === "/status" || command === "/new" ||
-      command === "/stop"
+      command === "/stop" || parsedSettingsCommand
     ) {
       if (this.#shuttingDown) return;
       if (!this.#state.claimMessage(message.msgId, message.conversationKey)) {
@@ -383,7 +505,23 @@ export class ConversationOrchestrator {
         return;
       }
       if (command === "/status") {
-        await this.#output.send(message, this.#status(message.conversationKey));
+        await this.#enqueueSettingsCommand(
+          message.conversationKey,
+          async () => {
+            const status = await this.#status(message.conversationKey);
+            if (status === undefined || this.#shuttingDown) return;
+            await this.#output.send(message, status);
+          },
+        );
+        return;
+      }
+      if (parsedSettingsCommand) {
+        await this.#enqueueSettingsCommand(
+          message.conversationKey,
+          () => this.#handleSettingsCommand(message, parsedSettingsCommand),
+          parsedSettingsCommand.valid && parsedSettingsCommand.value !==
+              undefined,
+        );
         return;
       }
       if (command === "/stop") {
@@ -416,7 +554,12 @@ export class ConversationOrchestrator {
         );
         return;
       }
-      slot.resetPending = message;
+      slot.resetPending = {
+        message,
+        settingsBarrier: this.#settingsMutationTails.get(
+          message.conversationKey,
+        ) ?? Promise.resolve(),
+      };
       if (isInterruptible(slot.active)) this.#requestInterrupt(slot);
       if (!slot.drain) {
         slot.drain = this.#drain(message.conversationKey, slot).finally(() => {
@@ -440,10 +583,14 @@ export class ConversationOrchestrator {
       return;
     }
 
+    const settingsBarrier = this.#settingsMutationTails.get(
+      message.conversationKey,
+    ) ?? Promise.resolve();
     const request: PendingRequest = {
       message,
       messages: [message],
       traces: [trace],
+      settingsBarrier,
     };
     if (!this.#codex.ready) {
       this.#emitRequestStatuses(request, "runtime_unavailable");
@@ -468,10 +615,92 @@ export class ConversationOrchestrator {
         slot,
         message,
         trace,
+        settingsBarrier,
       );
     } else {
       await this.#enqueueRequest(message.conversationKey, slot, request);
     }
+  }
+
+  async #handleSettingsCommand(
+    message: RoutedText,
+    command: SettingsCommand,
+  ): Promise<void> {
+    if (this.#shuttingDown) return;
+    if (!command.valid) {
+      await this.#output.send(
+        message,
+        command.kind === "model"
+          ? "用法：`/model <model-id>`"
+          : "用法：`/effort <level>`",
+      );
+      return;
+    }
+    if (
+      command.value !== undefined &&
+      classifyRequestAuthority(this.#ownerUserId, [message.senderUserId]) !==
+        "owner"
+    ) {
+      await this.#output.send(message, SETTINGS_MUTATION_DENIED);
+      return;
+    }
+
+    let reply: string;
+    try {
+      const record = this.#state.getConversation(message.conversationKey);
+      if (command.value) {
+        const result = command.kind === "model"
+          ? await this.#codex.setModel(record?.threadId, command.value)
+          : await this.#codex.setEffort(record?.threadId, command.value);
+        if (this.#shuttingDown) return;
+        reply = settingsUpdateReply(
+          result,
+          Boolean(this.#slots.get(message.conversationKey)?.active),
+        );
+      } else {
+        const snapshot = await this.#codex.getModelSettings(record?.threadId);
+        if (this.#shuttingDown) return;
+        reply = command.kind === "model"
+          ? modelHelp(snapshot)
+          : effortHelp(snapshot);
+      }
+    } catch (error) {
+      if (this.#shuttingDown) return;
+      this.#report(error);
+      reply = `${command.value ? "修改" : "读取"}模型设置失败：${
+        errorMessage(error)
+      }`;
+    }
+    if (this.#shuttingDown) return;
+    await this.#output.send(message, reply);
+  }
+
+  #enqueueSettingsCommand(
+    conversationKey: ConversationKey,
+    operation: () => Promise<void>,
+    mutation = false,
+  ): Promise<void> {
+    const previous = this.#settingsCommandTails.get(conversationKey) ??
+      Promise.resolve();
+    const result = (async () => {
+      const ready = await Promise.race([
+        previous.then(() => true as const),
+        this.#shutdownSignal.promise.then(() => false as const),
+      ]);
+      if (!ready || this.#shuttingDown) return;
+      await operation();
+    })();
+    const tail = result.then(() => {}, () => {});
+    this.#settingsCommandTails.set(conversationKey, tail);
+    if (mutation) this.#settingsMutationTails.set(conversationKey, tail);
+    return result.finally(() => {
+      if (this.#settingsCommandTails.get(conversationKey) === tail) {
+        this.#settingsCommandTails.delete(conversationKey);
+      }
+      if (this.#settingsMutationTails.get(conversationKey) === tail) {
+        this.#settingsMutationTails.delete(conversationKey);
+      }
+    });
   }
 
   async #stopConversation(message: RoutedText): Promise<void> {
@@ -535,6 +764,7 @@ export class ConversationOrchestrator {
   async interruptAll(): Promise<void> {
     const drains: Promise<void>[] = [];
     this.#shuttingDown = true;
+    this.#shutdownSignal.resolve();
     for (const slot of this.#slots.values()) {
       this.#clearInterruptRetry(slot);
       const debounce = this.#cancelDebounce(slot);
@@ -612,6 +842,7 @@ export class ConversationOrchestrator {
     slot: ConversationSlot,
     message: RoutedText,
     trace: RequestTrace,
+    settingsBarrier: Promise<void>,
   ): Promise<void> {
     let batch = slot.debounce;
     if (!batch) {
@@ -619,6 +850,7 @@ export class ConversationOrchestrator {
       batch = {
         messages: [],
         traces: [],
+        settingsBarrier,
         completion: completion.promise,
         resolve: completion.resolve,
         reject: completion.reject,
@@ -627,6 +859,7 @@ export class ConversationOrchestrator {
     }
     batch.messages.push(message);
     batch.traces.push(trace);
+    batch.settingsBarrier = settingsBarrier;
     if (batch.timer !== undefined) {
       this.#messageDebounceTimers.clearTimeout(batch.timer);
     }
@@ -775,9 +1008,24 @@ export class ConversationOrchestrator {
   }
 
   async #resetConversation(
-    message: RoutedText,
+    request: ResetRequest,
     control: TurnControl,
   ): Promise<void> {
+    const settingsReady = await this.#raceWithForce(
+      () =>
+        Promise.race([
+          request.settingsBarrier.then(() => true as const),
+          this.#shutdownSignal.promise.then(() => false as const),
+        ]),
+      control,
+    );
+    if (
+      settingsReady.type === "forced" ||
+      (settingsReady.type === "value" && !settingsReady.value)
+    ) return;
+    if (settingsReady.type === "error") throw settingsReady.error;
+
+    const message = request.message;
     try {
       const started = await this.#startAndBindThread(message, control);
       if (started === undefined) return;
@@ -804,6 +1052,19 @@ export class ConversationOrchestrator {
     control: TurnControl,
   ): Promise<void> {
     const message = request.message;
+    const settingsReady = await this.#raceWithForce(
+      () =>
+        Promise.race([
+          request.settingsBarrier.then(() => true as const),
+          this.#shutdownSignal.promise.then(() => false as const),
+        ]),
+      control,
+    );
+    if (
+      settingsReady.type === "forced" ||
+      (settingsReady.type === "value" && !settingsReady.value)
+    ) return;
+    if (settingsReady.type === "error") throw settingsReady.error;
     const threadId = await this.#ensureThread(request, control);
     if (threadId === undefined) return;
 
@@ -1524,6 +1785,7 @@ export class ConversationOrchestrator {
       message: batch.messages[batch.messages.length - 1],
       messages: batch.messages,
       traces: batch.traces,
+      settingsBarrier: batch.settingsBarrier,
     };
   }
 
@@ -1740,12 +2002,32 @@ export class ConversationOrchestrator {
     }
   }
 
-  #status(conversationKey: ConversationKey): string {
+  async #status(
+    conversationKey: ConversationKey,
+  ): Promise<string | undefined> {
     const record = this.#state.getConversation(conversationKey);
     const slot = this.#slots.get(conversationKey);
+    let model = "unknown";
+    let effort = "unknown";
+    let source: "thread" | "default" = record ? "thread" : "default";
+    if (this.#codex.ready) {
+      try {
+        const snapshot = await this.#codex.getModelSettings(record?.threadId);
+        if (this.#shuttingDown) return undefined;
+        model = snapshot.settings.model;
+        effort = snapshot.settings.effort ?? "default";
+        source = snapshot.source;
+      } catch (error) {
+        if (this.#shuttingDown) return undefined;
+        this.#report(error);
+      }
+    }
+    const suffix = source === "default" ? " (default)" : "";
     return [
       `conversation: \`${conversationKey}\``,
       `thread: \`${record?.threadId ?? "not bound"}\``,
+      `model: \`${model}\`${suffix}`,
+      `effort: \`${effort}\`${suffix}`,
       `codex: ${this.#codex.ready ? "ready" : "unavailable"}`,
       `turn: ${slot?.active ? "in_progress" : record?.lastStatus ?? "idle"}`,
       `queued: ${
