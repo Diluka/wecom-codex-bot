@@ -3,6 +3,16 @@ import { describe, it } from "@std/testing/bdd";
 import { WeComChatOutput } from "./chat-output.ts";
 import type { RoutedText } from "./orchestrator.ts";
 import { ConversationSendQueue, TRUNCATION_MARKER } from "./output.ts";
+import type { ProgressTail } from "./progress-tail.ts";
+
+const COMPLETED_SUMMARY = "[content] *已完成上一阶段，继续处理中…*";
+
+function summaryTail(index: number): ProgressTail {
+  return {
+    key: JSON.stringify(["reasoning-1", index]),
+    completedText: COMPLETED_SUMMARY,
+  };
+}
 
 function message(msgId = "m1"): RoutedText {
   return {
@@ -59,6 +69,22 @@ describe("WeComChatOutput", () => {
     assertEquals(gateway.streams.length, 1);
     assertEquals(gateway.streams[0].finish, true);
     assertEquals(gateway.streams[0].content, "running [REDACTED]");
+  });
+
+  it("forwards keyed progress tails to the active stream", async () => {
+    const gateway = new FakeGateway();
+    const output = new WeComChatOutput({ gateway, secrets: [] });
+    const progress = await output.startProgress(message());
+
+    progress.append("[content] *first section*", summaryTail(0));
+    progress.append("[content] *first section updated*", summaryTail(0));
+    progress.append("[content] *second section*", summaryTail(1));
+    await progress.finish();
+
+    assertEquals(
+      gateway.streams.at(-1)?.content,
+      `${COMPLETED_SUMMARY}\n[content] *second section*`,
+    );
   });
 
   it("sends final Markdown in at most four UTF-8-safe chunks", async () => {

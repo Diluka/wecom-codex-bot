@@ -1,3 +1,5 @@
+import type { ProgressTail } from "./progress-tail.ts";
+
 export const DEFAULT_TAIL_BYTES = 16 * 1024;
 export const DEFAULT_SPLIT_BYTES = 18 * 1024;
 export const DEFAULT_MAX_PARTS = 4;
@@ -145,6 +147,36 @@ export class ProgressBuffer {
       this.#maxBytes,
     );
     return this;
+  }
+
+  replaceTail(expected: string, replacement: string): boolean {
+    const prefix = this.#prefixBeforeTail(expected);
+    if (prefix === null) return false;
+    this.#replaceFromPrefix(prefix, replacement);
+    return true;
+  }
+
+  replaceTailBlock(expected: string, replacement: string): string | null {
+    const prefix = this.#prefixBeforeTail(expected);
+    if (prefix === null) return null;
+    const block = progressBlockSeparator(prefix, replacement) + replacement;
+    this.#replaceFromPrefix(prefix, block);
+    return block;
+  }
+
+  #prefixBeforeTail(expected: string): string | null {
+    const redactedExpected = redactSecrets(expected, this.#secrets);
+    if (!redactedExpected || !this.#content.endsWith(redactedExpected)) {
+      return null;
+    }
+    return this.#content.slice(0, -redactedExpected.length);
+  }
+
+  #replaceFromPrefix(prefix: string, replacement: string): void {
+    this.#content = utf8Tail(
+      redactSecrets(prefix + replacement, this.#secrets),
+      this.#maxBytes,
+    );
   }
 
   snapshot(): string {
@@ -524,6 +556,24 @@ const systemTimers: TimerApi = {
   },
 };
 
+function progressBlockSeparator(current: string, next: string): string {
+  const currentEndsWithBreak = current.endsWith("\n") || current.endsWith("\r");
+  const nextStartsWithBreak = next.startsWith("\n") || next.startsWith("\r");
+  return current && !currentEndsWithBreak && !nextStartsWithBreak ? "\n" : "";
+}
+
+function appendProgressSnapshot(
+  target: ProgressBuffer,
+  content: string,
+): void {
+  if (!content) return;
+  target.append(progressBlockSeparator(target.snapshot(), content) + content);
+}
+
+interface TrackedProgressTail extends ProgressTail {
+  content: string;
+}
+
 export interface StreamControllerOptions {
   conversationKey: string;
   frame: unknown;
@@ -563,6 +613,7 @@ export class StreamController {
   #finished = false;
   #rotationAttempts = 0;
   #rotationDisabled = false;
+  #replaceableTail?: TrackedProgressTail;
 
   constructor(options: StreamControllerOptions) {
     this.#conversationKey = options.conversationKey;
@@ -591,10 +642,52 @@ export class StreamController {
 
   append(content: string): this {
     if (this.#finished) throw new Error("stream is already finished");
+    this.#replaceableTail = undefined;
     this.#buffer.append(content);
+    this.#afterWrite();
+    return this;
+  }
+
+  appendBlock(
+    content: string,
+    progressTail?: ProgressTail,
+  ): this {
+    if (this.#finished) throw new Error("stream is already finished");
+
+    const nextTail = progressTail;
+    const previous = this.#replaceableTail;
+    if (nextTail && previous) {
+      if (nextTail.key === previous.key) {
+        const replacement = this.#buffer.replaceTailBlock(
+          previous.content,
+          content,
+        );
+        if (replacement !== null) {
+          this.#replaceableTail = { ...nextTail, content: replacement };
+          this.#afterWrite();
+          return this;
+        }
+      } else {
+        this.#buffer.replaceTailBlock(
+          previous.content,
+          previous.completedText,
+        );
+      }
+    }
+
+    const separator = progressBlockSeparator(this.#buffer.snapshot(), content);
+    const block = separator + content;
+    this.#buffer.append(block);
+    this.#replaceableTail = nextTail
+      ? { ...nextTail, content: block }
+      : undefined;
+    this.#afterWrite();
+    return this;
+  }
+
+  #afterWrite(): void {
     this.#armFlush();
     this.#armRotation();
-    return this;
   }
 
   flush(): Promise<boolean> {
@@ -669,8 +762,16 @@ export class StreamController {
     if (this.#finished) return;
     this.#clearFlushTimer();
     const previousBuffer = this.#buffer;
+    const previousTail = this.#replaceableTail;
+    if (previousTail) {
+      previousBuffer.replaceTailBlock(
+        previousTail.content,
+        previousTail.completedText,
+      );
+    }
     const nextBuffer = new ProgressBuffer(this.#bufferOptions);
     this.#buffer = nextBuffer;
+    this.#replaceableTail = undefined;
     const content = previousBuffer.snapshot();
     if (content.length > 0) {
       const finished = await this.#sink.send(
@@ -682,8 +783,8 @@ export class StreamController {
       );
       if (!finished) {
         const restoredBuffer = new ProgressBuffer(this.#bufferOptions);
-        restoredBuffer.append(previousBuffer.snapshot());
-        restoredBuffer.append(nextBuffer.snapshot());
+        appendProgressSnapshot(restoredBuffer, previousBuffer.snapshot());
+        appendProgressSnapshot(restoredBuffer, nextBuffer.snapshot());
         this.#buffer = restoredBuffer;
         this.#rotationAttempts++;
         if (this.#rotationAttempts < this.#maxRotationAttempts) {
@@ -698,8 +799,8 @@ export class StreamController {
     if (this.#finished) {
       if (nextBuffer.snapshot().length > 0) {
         const continuationBuffer = new ProgressBuffer(this.#bufferOptions);
-        continuationBuffer.append(this.#continuationMarker);
-        continuationBuffer.append(nextBuffer.snapshot());
+        appendProgressSnapshot(continuationBuffer, this.#continuationMarker);
+        appendProgressSnapshot(continuationBuffer, nextBuffer.snapshot());
         this.#buffer = continuationBuffer;
         this.#streamId = this.#streamIdFactory();
       }
@@ -707,8 +808,8 @@ export class StreamController {
     }
 
     const continuationBuffer = new ProgressBuffer(this.#bufferOptions);
-    continuationBuffer.append(this.#continuationMarker);
-    continuationBuffer.append(nextBuffer.snapshot());
+    appendProgressSnapshot(continuationBuffer, this.#continuationMarker);
+    appendProgressSnapshot(continuationBuffer, nextBuffer.snapshot());
     this.#buffer = continuationBuffer;
     this.#streamId = this.#streamIdFactory();
     const started = await this.#sink.send(

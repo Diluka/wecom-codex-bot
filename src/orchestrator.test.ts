@@ -23,6 +23,7 @@ import type {
 } from "./model-settings.ts";
 import { OUTPUT_TAGS, type OutputSettings } from "./output-settings.ts";
 import { ConversationSendQueue } from "./output.ts";
+import type { ProgressTail } from "./progress-tail.ts";
 
 function message(
   conversationKey: `single:${string}` | `group:${string}`,
@@ -276,11 +277,44 @@ class FakeCodex implements CodexPort {
   }
 }
 
+interface FakeProgressEntry {
+  msgId: string;
+  chunks: string[];
+  finished: boolean;
+  progressTail?: ProgressTail & { chunkIndex: number };
+}
+
+function appendProgressChunk(
+  entry: FakeProgressEntry,
+  text: string,
+  progressTail?: ProgressTail,
+): void {
+  const previous = entry.progressTail;
+  if (progressTail && previous) {
+    if (progressTail.key === previous.key) {
+      entry.chunks[previous.chunkIndex] = text;
+      entry.progressTail = { ...progressTail, chunkIndex: previous.chunkIndex };
+      return;
+    }
+    entry.chunks[previous.chunkIndex] = previous.completedText;
+  }
+
+  const current = entry.chunks.join("");
+  const currentEndsWithBreak = current.endsWith("\n") ||
+    current.endsWith("\r");
+  const nextStartsWithBreak = text.startsWith("\n") || text.startsWith("\r");
+  if (current && !currentEndsWithBreak && !nextStartsWithBreak) {
+    entry.chunks.push("\n");
+  }
+  entry.chunks.push(text);
+  entry.progressTail = progressTail
+    ? { ...progressTail, chunkIndex: entry.chunks.length - 1 }
+    : undefined;
+}
+
 class FakeOutput implements ChatOutput {
   readonly sent: Array<{ msgId: string; text: string; final: boolean }> = [];
-  readonly progress: Array<
-    { msgId: string; chunks: string[]; finished: boolean }
-  > = [];
+  readonly progress: FakeProgressEntry[] = [];
   readonly sendErrors: Error[] = [];
   readonly lateProgressAppends: Array<{ msgId: string; text: string }> = [];
   readonly startProgressGates: Promise<void>[] = [];
@@ -305,12 +339,12 @@ class FakeOutput implements ChatOutput {
     };
     this.progress.push(entry);
     return {
-      append: (text: string) => {
+      append: (text: string, progressTail?: ProgressTail) => {
         if (entry.finished) {
           this.lateProgressAppends.push({ msgId: message.msgId, text });
           return;
         }
-        entry.chunks.push(text);
+        appendProgressChunk(entry, text, progressTail);
       },
       finish: () => {
         entry.finished = true;
@@ -393,9 +427,7 @@ class QueueBlockedOutput implements ChatOutput {
   readonly directGate = Promise.withResolvers<void>();
   readonly afterShutdownGate = Promise.withResolvers<void>();
   afterShutdownWaiters = 0;
-  readonly progress: Array<
-    { msgId: string; chunks: string[]; finished: boolean }
-  > = [];
+  readonly progress: FakeProgressEntry[] = [];
   readonly lateProgressAppends: Array<{ msgId: string; text: string }> = [];
   readonly #queue = new ConversationSendQueue();
 
@@ -420,12 +452,12 @@ class QueueBlockedOutput implements ChatOutput {
     };
     this.progress.push(entry);
     return Promise.resolve({
-      append: (text: string) => {
+      append: (text: string, progressTail?: ProgressTail) => {
         if (entry.finished) {
           this.lateProgressAppends.push({ msgId: message.msgId, text });
           return;
         }
-        entry.chunks.push(text);
+        appendProgressChunk(entry, text, progressTail);
       },
       finish: async () => {
         const attempt = await this.#queue.enqueueCritical(
@@ -2300,6 +2332,73 @@ describe("ConversationOrchestrator", () => {
         "[turn] completed",
       ].join("\n"),
       finish: true,
+    }]);
+  });
+  it("preserves keyed summary transitions across suppressed and direct events", async () => {
+    const settings = outputSettings();
+    settings.toolFormat = "summary";
+    const { codex, orchestrator, output } = setup({
+      outputSettings: settings,
+    });
+    const running = orchestrator.handleText(
+      message("single:alice", "summary-tail", "work"),
+    );
+    await waitFor(() => codex.starts.length === 1);
+    const turn = codex.starts[0];
+    const summary = (
+      body: string,
+      summaryIndex: number,
+    ): ActivityEvent => ({
+      tag: "CONTENT",
+      body,
+      reasoningSummary: { itemId: "reasoning-1", summaryIndex },
+      delivery: "progress",
+    });
+
+    await turn.onActivity(summary("**first ", 0));
+    await turn.onActivity({
+      tag: "TOOL",
+      summary: "deno test",
+      itemId: "tool-1",
+      toolState: "started",
+      delivery: "progress",
+    });
+    await turn.onActivity(summary("section", 0));
+    await turn.onActivity({
+      tag: "CONTENT",
+      body: "needs input",
+      delivery: "direct",
+    });
+    await turn.onActivity(summary("**", 0));
+    await turn.onActivity(summary("**second section**", 1));
+    await turn.onActivity({
+      tag: "CONTENT",
+      body: "visible commentary",
+      delivery: "progress",
+    });
+    await turn.onActivity(summary(" resumed", 1));
+    turn.resolve({ status: "completed" });
+    await running;
+
+    assertEquals(output.progress[0].chunks, [
+      "[queue] 已提交给 Codex",
+      "\n",
+      "[turn] started",
+      "\n",
+      "[content] *已完成上一阶段，继续处理中…*",
+      "\n",
+      "[content] *second section*",
+      "\n",
+      "[content] visible commentary",
+      "\n",
+      "[content] **second section** resumed",
+      "\n",
+      "[turn] completed",
+    ]);
+    assertEquals(output.sent, [{
+      msgId: "summary-tail",
+      text: "needs input",
+      final: false,
     }]);
   });
   it("routes direct user input and final answers when every output level is off", async () => {

@@ -1,9 +1,11 @@
 import type { ActivityEvent } from "./activity-event.ts";
 import type { OutputSettings } from "./output-settings.ts";
+import type { ProgressTail } from "./progress-tail.ts";
 
 const EXCERPT_LIMIT = 800;
 const LINE_LIMIT = 160;
 const FALLBACK_ITEM = Symbol("fallback item");
+const COMPLETED_REASONING_SUMMARY = "*已完成上一阶段，继续处理中…*";
 
 type StreamItemKey = string | typeof FALLBACK_ITEM;
 type StreamStates<T> = Map<string, Map<StreamItemKey, T>>;
@@ -35,11 +37,13 @@ export interface OutputPipelineDecision {
   output: string | null;
   disposition: "rendered" | "suppressed";
   reason: OutputDecisionReason;
+  progressTail?: ProgressTail;
 }
 
 /** Applies per-turn detail filtering and label rendering to activity events. */
 export class TurnOutputPipeline {
   readonly #settings: OutputSettings;
+  readonly #reasoningSummaries = new Map<string, Map<number, string>>();
   readonly #excerpts: StreamStates<ExcerptState> = new Map();
   readonly #lines: StreamStates<LineState> = new Map();
 
@@ -65,19 +69,28 @@ export class TurnOutputPipeline {
       return suppressed("tool_format_summary");
     }
 
-    const level = this.#settings.levels[event.tag];
+    const summarySnapshot = this.#reasoningSummarySnapshot(event);
+    const renderable = summarySnapshot ?? event;
+    const level = this.#settings.levels[renderable.tag];
     if (level === "off") return suppressed("level_off");
 
-    const source = sourceText(event);
-    if (source === null) return suppressed("no_source");
+    const rawSource = sourceText(renderable);
+    if (rawSource === null) return suppressed("no_source");
+    const source = summarySnapshot === null
+      ? rawSource
+      : italicizeFullLineBold(rawSource);
 
     let visible: string | null;
     let reason: OutputDecisionReason;
     if (level === "line") {
-      visible = this.#line(event, source);
+      visible = summarySnapshot
+        ? summaryLine(source)
+        : this.#line(renderable, source);
       reason = visible === null ? "line_complete" : "line";
     } else if (level === "excerpt") {
-      visible = this.#excerpt(event, source);
+      visible = summarySnapshot
+        ? summaryExcerpt(source)
+        : this.#excerpt(renderable, source);
       reason = visible === null ? "excerpt_complete" : "excerpt";
     } else {
       visible = source;
@@ -87,17 +100,47 @@ export class TurnOutputPipeline {
       return suppressed(visible === null ? reason : "no_visible_text");
     }
 
-    const output = this.#settings.labels[event.tag] === "show"
-      ? `[${event.tag.toLowerCase()}] ${visible}`
-      : visible;
-    return rendered(output, reason);
+    const output = renderLabel(this.#settings, renderable.tag, visible);
+    const progressTail = summarySnapshot && event.reasoningSummary
+      ? {
+        key: JSON.stringify([
+          event.reasoningSummary.itemId,
+          event.reasoningSummary.summaryIndex,
+        ]),
+        completedText: renderLabel(
+          this.#settings,
+          "CONTENT",
+          COMPLETED_REASONING_SUMMARY,
+        ),
+      }
+      : undefined;
+    return rendered(output, reason, progressTail);
   }
 
   clear(): void {
+    this.#reasoningSummaries.clear();
     this.#excerpts.clear();
     this.#lines.clear();
   }
 
+  #reasoningSummarySnapshot(event: ActivityEvent): ActivityEvent | null {
+    if (
+      this.#settings.toolFormat !== "summary" || event.tag !== "CONTENT" ||
+      event.body === undefined || !event.reasoningSummary
+    ) {
+      return null;
+    }
+
+    const { itemId, summaryIndex } = event.reasoningSummary;
+    let sections = this.#reasoningSummaries.get(itemId);
+    if (!sections) {
+      sections = new Map();
+      this.#reasoningSummaries.set(itemId, sections);
+    }
+    const body = (sections.get(summaryIndex) ?? "") + event.body;
+    sections.set(summaryIndex, body);
+    return { ...event, body };
+  }
   #excerpt(event: ActivityEvent, source: string): string | null {
     const state = streamState(
       this.#excerpts,
@@ -164,8 +207,14 @@ export class TurnOutputPipeline {
 function rendered(
   output: string,
   reason: OutputDecisionReason,
+  progressTail?: ProgressTail,
 ): OutputPipelineDecision {
-  return { output, disposition: "rendered", reason };
+  return {
+    output,
+    disposition: "rendered",
+    reason,
+    ...(progressTail ? { progressTail } : {}),
+  };
 }
 
 function suppressed(reason: OutputDecisionReason): OutputPipelineDecision {
@@ -177,6 +226,128 @@ function sourceText(event: ActivityEvent): string | null {
     value !== undefined
   );
   return parts.length === 0 ? null : parts.join("\n");
+}
+
+function renderLabel(
+  settings: OutputSettings,
+  tag: ActivityEvent["tag"],
+  text: string,
+): string {
+  return settings.labels[tag] === "show"
+    ? `[${tag.toLowerCase()}] ${text}`
+    : text;
+}
+
+function italicizeFullLineBold(source: string): string {
+  let fence: MarkdownFence | null = null;
+  return source.split(/(\r?\n)/).map((part, index) => {
+    if (index % 2 !== 0) return part;
+    if (fence) {
+      if (isClosingFence(part, fence)) fence = null;
+      return part;
+    }
+    if (isIndentedCodeLine(part)) return part;
+
+    fence = openingFence(part);
+    return fence ? part : italicizeBoldLine(part);
+  }).join("");
+}
+
+interface MarkdownFence {
+  marker: "`" | "~";
+  length: number;
+}
+
+function openingFence(line: string): MarkdownFence | null {
+  const match = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+  if (!match) return null;
+
+  const markers = match[1];
+  const marker = markers[0] as MarkdownFence["marker"];
+  if (marker === "`" && match[2].includes("`")) return null;
+  return { marker, length: markers.length };
+}
+
+function isClosingFence(line: string, fence: MarkdownFence): boolean {
+  const match = /^ {0,3}(`+|~+)[ \t]*$/.exec(line);
+  if (!match) return false;
+  return match[1][0] === fence.marker && match[1].length >= fence.length;
+}
+
+function isIndentedCodeLine(line: string): boolean {
+  let column = 0;
+  for (const character of line) {
+    if (character === " ") {
+      column += 1;
+    } else if (character === "\t") {
+      column += 4 - (column % 4);
+    } else {
+      return false;
+    }
+    if (column >= 4) return true;
+  }
+  return false;
+}
+
+function italicizeBoldLine(line: string): string {
+  const trimmed = line.trim();
+  if (
+    !trimmed.startsWith("**") || !trimmed.endsWith("**") ||
+    trimmed.includes("`") || isEscapedAt(trimmed, trimmed.length - 2) ||
+    countBoldMarkers(trimmed) !== 2
+  ) {
+    return line;
+  }
+
+  const content = trimmed.slice(2, -2);
+  if (!content.trim()) return line;
+
+  const start = line.indexOf(trimmed);
+  return `${line.slice(0, start)}*${content}*${
+    line.slice(start + trimmed.length)
+  }`;
+}
+
+function countBoldMarkers(value: string): number {
+  let count = 0;
+  for (let index = 0; index < value.length - 1; index += 1) {
+    if (value[index] === "*" && value[index + 1] === "*") count += 1;
+  }
+  return count;
+}
+
+function isEscapedAt(value: string, index: number): boolean {
+  let backslashes = 0;
+  for (
+    let cursor = index - 1;
+    cursor >= 0 && value[cursor] === "\\";
+    cursor--
+  ) {
+    backslashes += 1;
+  }
+  return backslashes % 2 === 1;
+}
+
+function summaryExcerpt(source: string): string {
+  const codePoints = Array.from(source);
+  return codePoints.length <= EXCERPT_LIMIT
+    ? source
+    : `${codePoints.slice(0, EXCERPT_LIMIT).join("")}...`;
+}
+
+function summaryLine(source: string): string | null {
+  const lines = source.split(/\r?\n/);
+  const firstIndex = lines.findIndex((value) => value.trim());
+  if (firstIndex === -1) return null;
+
+  const first = lines[firstIndex].trim();
+  const codePoints = Array.from(first);
+  const hasLaterContent = lines.slice(firstIndex + 1).some((value) =>
+    value.trim()
+  );
+  return codePoints.length > LINE_LIMIT || hasLaterContent
+    ? `${codePoints.slice(0, LINE_LIMIT).join("")}...`
+    : first;
 }
 
 function streamState<T>(

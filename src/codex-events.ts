@@ -1,4 +1,8 @@
-import type { ActivityEvent, ActivityToolState } from "./activity-event.ts";
+import type {
+  ActivityEvent,
+  ActivityToolState,
+  ReasoningSummaryMetadata,
+} from "./activity-event.ts";
 
 export interface CodexNotification {
   method: string;
@@ -147,6 +151,17 @@ function itemId(params: Record<string, unknown>): string | undefined {
   return text(params.itemId) ?? text(record(params.item)?.id);
 }
 
+function reasoningSummaryMetadata(
+  params: Record<string, unknown>,
+): ReasoningSummaryMetadata | undefined {
+  const itemId = text(params.itemId);
+  const summaryIndex = params.summaryIndex;
+  return itemId !== undefined && typeof summaryIndex === "number" &&
+      Number.isSafeInteger(summaryIndex) && summaryIndex >= 0
+    ? { itemId, summaryIndex }
+    : undefined;
+}
+
 function toolMetadata(
   item: Record<string, unknown>,
   params: Record<string, unknown>,
@@ -256,9 +271,11 @@ export function describeCodexNotification(
   switch (notification.method) {
     case "item/reasoning/summaryTextDelta": {
       const body = text(params.delta);
+      const reasoningSummary = reasoningSummaryMetadata(params);
       return scopedEvent(params, {
         tag: "CONTENT",
         ...(body !== undefined ? { body } : {}),
+        ...(reasoningSummary ? { reasoningSummary } : {}),
       });
     }
     case "item/reasoning/textDelta":

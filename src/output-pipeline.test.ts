@@ -45,6 +45,18 @@ function progress(
   return { delivery: "progress", ...event };
 }
 
+function reasoningSummary(
+  body: string,
+  summaryIndex = 0,
+  itemId = "reasoning-1",
+): ActivityEvent {
+  return progress({
+    tag: "CONTENT",
+    body,
+    reasoningSummary: { itemId, summaryIndex },
+  });
+}
+
 function toolStarted(itemId: string | undefined): ActivityEvent {
   return progress({
     tag: "TOOL",
@@ -134,6 +146,282 @@ describe("TurnOutputPipeline", () => {
       disposition: "suppressed",
       reason: "tool_format_summary",
     });
+  });
+
+  it("renders keyed italic snapshots for reasoning summary deltas", () => {
+    const pipeline = new TurnOutputPipeline(
+      outputSettings({ toolFormat: "summary" }),
+    );
+
+    assertEquals(
+      pipeline.applyWithDecision(reasoningSummary("**Checking tests**", 0)),
+      {
+        output: "[content] *Checking tests*",
+        disposition: "rendered",
+        reason: "full",
+        progressTail: {
+          key: JSON.stringify(["reasoning-1", 0]),
+          completedText: "[content] *已完成上一阶段，继续处理中…*",
+        },
+      },
+    );
+    assertEquals(
+      pipeline.applyWithDecision(reasoningSummary("**Running**", 1)),
+      {
+        output: "[content] *Running*",
+        disposition: "rendered",
+        reason: "full",
+        progressTail: {
+          key: JSON.stringify(["reasoning-1", 1]),
+          completedText: "[content] *已完成上一阶段，继续处理中…*",
+        },
+      },
+    );
+    assertEquals(
+      new TurnOutputPipeline(
+        outputSettings({
+          labels: { CONTENT: "hide" },
+          toolFormat: "summary",
+        }),
+      ).applyWithDecision(reasoningSummary("**Hidden label**")),
+      {
+        output: "*Hidden label*",
+        disposition: "rendered",
+        reason: "full",
+        progressTail: {
+          key: JSON.stringify(["reasoning-1", 0]),
+          completedText: "*已完成上一阶段，继续处理中…*",
+        },
+      },
+    );
+    assertEquals(
+      pipeline.applyWithDecision(
+        progress({ tag: "CONTENT", body: "ordinary commentary" }),
+      ),
+      {
+        output: "[content] ordinary commentary",
+        disposition: "rendered",
+        reason: "full",
+      },
+    );
+  });
+
+  it("waits for a complete outer bold pair before italicizing a snapshot", () => {
+    const pipeline = new TurnOutputPipeline(
+      outputSettings({ toolFormat: "summary" }),
+    );
+
+    assertEquals(
+      pipeline.applyWithDecision(reasoningSummary("**Checking ")),
+      {
+        output: "[content] **Checking ",
+        disposition: "rendered",
+        reason: "full",
+        progressTail: {
+          key: JSON.stringify(["reasoning-1", 0]),
+          completedText: "[content] *已完成上一阶段，继续处理中…*",
+        },
+      },
+    );
+    assertEquals(
+      pipeline.applyWithDecision(reasoningSummary("tests**")),
+      {
+        output: "[content] *Checking tests*",
+        disposition: "rendered",
+        reason: "full",
+        progressTail: {
+          key: JSON.stringify(["reasoning-1", 0]),
+          completedText: "[content] *已完成上一阶段，继续处理中…*",
+        },
+      },
+    );
+  });
+
+  it("only italicizes complete full-line bold reasoning summaries", () => {
+    const pipeline = new TurnOutputPipeline(
+      outputSettings({ toolFormat: "summary" }),
+    );
+
+    for (
+      const [summaryIndex, body] of [
+        "before **inline** after",
+        "`**code**`",
+        "\\**escaped**",
+        "**escaped\\**",
+        "**incomplete",
+      ].entries()
+    ) {
+      assertEquals(
+        pipeline.apply(reasoningSummary(body, summaryIndex)),
+        `[content] ${body}`,
+      );
+    }
+    assertEquals(
+      pipeline.apply(progress({ tag: "CONTENT", body: "**ordinary**" })),
+      "[content] **ordinary**",
+    );
+  });
+
+  it("preserves full-line bold inside backtick fenced code", () => {
+    const pipeline = new TurnOutputPipeline(
+      outputSettings({ toolFormat: "summary" }),
+    );
+    const summary = [
+      "**before**",
+      "```ts",
+      "**literal**",
+      "```",
+      "**after**",
+    ].join("\n");
+
+    assertEquals(
+      pipeline.apply(reasoningSummary(summary)),
+      [
+        "[content] *before*",
+        "```ts",
+        "**literal**",
+        "```",
+        "*after*",
+      ].join("\n"),
+    );
+  });
+
+  it("preserves full-line bold inside tilde fenced code", () => {
+    const pipeline = new TurnOutputPipeline(
+      outputSettings({ toolFormat: "summary" }),
+    );
+    const summary = [
+      "**before**",
+      "~~~ markdown",
+      "**literal**",
+      "~~~",
+      "**after**",
+    ].join("\n");
+
+    assertEquals(
+      pipeline.apply(reasoningSummary(summary)),
+      [
+        "[content] *before*",
+        "~~~ markdown",
+        "**literal**",
+        "~~~",
+        "*after*",
+      ].join("\n"),
+    );
+  });
+
+  it("preserves full-line bold inside four-space indented code", () => {
+    const pipeline = new TurnOutputPipeline(
+      outputSettings({ toolFormat: "summary" }),
+    );
+    const summary = "**before**\n    **literal**\n**after**";
+
+    assertEquals(
+      pipeline.apply(reasoningSummary(summary)),
+      "[content] *before*\n    **literal**\n*after*",
+    );
+  });
+
+  it("preserves full-line bold inside tab-indented code", () => {
+    const pipeline = new TurnOutputPipeline(
+      outputSettings({ toolFormat: "summary" }),
+    );
+    const summary = "**before**\n\t**literal**\n**after**";
+
+    assertEquals(
+      pipeline.apply(reasoningSummary(summary)),
+      "[content] *before*\n\t**literal**\n*after*",
+    );
+  });
+
+  it("preserves full-line bold after one to three spaces and a tab", () => {
+    const pipeline = new TurnOutputPipeline(
+      outputSettings({ toolFormat: "summary" }),
+    );
+    const summary = [
+      "**before**",
+      " \t**literal**",
+      "  \t**literal**",
+      "   \t**literal**",
+      "**after**",
+    ].join("\n");
+
+    assertEquals(
+      pipeline.apply(reasoningSummary(summary)),
+      [
+        "[content] *before*",
+        " \t**literal**",
+        "  \t**literal**",
+        "   \t**literal**",
+        "*after*",
+      ].join("\n"),
+    );
+  });
+
+  it("italicizes summary lines before line and excerpt projection", () => {
+    const line = new TurnOutputPipeline(
+      outputSettings({
+        levels: { CONTENT: "line" },
+        toolFormat: "summary",
+      }),
+    );
+    assertEquals(
+      line.apply(reasoningSummary("**First**\n**Second**")),
+      "[content] *First*...",
+    );
+
+    const excerpt = new TurnOutputPipeline(
+      outputSettings({
+        levels: { CONTENT: "excerpt" },
+        toolFormat: "summary",
+      }),
+    );
+    assertEquals(
+      excerpt.apply(reasoningSummary("**Excerpt**")),
+      "[content] *Excerpt*",
+    );
+  });
+
+  it("keeps reasoning summary deltas independent outside summary format", () => {
+    const pipeline = new TurnOutputPipeline(outputSettings());
+
+    assertEquals(
+      pipeline.apply(reasoningSummary("Checking ")),
+      "[content] Checking ",
+    );
+    assertEquals(
+      pipeline.apply(reasoningSummary("tests")),
+      "[content] tests",
+    );
+  });
+
+  it("recomputes limited summary snapshots and clears their accumulated text", () => {
+    const line = new TurnOutputPipeline(
+      outputSettings({
+        levels: { CONTENT: "line" },
+        label: "hide",
+        toolFormat: "summary",
+      }),
+    );
+    assertEquals(line.apply(reasoningSummary("Checking ")), "Checking");
+    assertEquals(line.apply(reasoningSummary("tests")), "Checking tests");
+
+    const excerpt = new TurnOutputPipeline(
+      outputSettings({
+        levels: { CONTENT: "excerpt" },
+        label: "hide",
+        toolFormat: "summary",
+      }),
+    );
+    const first = "🙂".repeat(799);
+    assertEquals(excerpt.apply(reasoningSummary(first)), first);
+    assertEquals(
+      excerpt.apply(reasoningSummary("ab")),
+      `${first}a...`,
+    );
+
+    excerpt.clear();
+    assertEquals(excerpt.apply(reasoningSummary("fresh")), "fresh");
   });
 
   it("preserves non-tool progress in summary format", () => {

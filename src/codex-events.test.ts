@@ -13,12 +13,18 @@ describe("describeCodexNotification", () => {
         params: {
           threadId: "thread-1",
           turnId: "turn-1",
+          itemId: "reasoning-1",
+          summaryIndex: 0,
           delta: "正在定位调用链",
         },
       }),
       {
         tag: "CONTENT",
         body: "正在定位调用链",
+        reasoningSummary: {
+          itemId: "reasoning-1",
+          summaryIndex: 0,
+        },
         threadId: "thread-1",
         turnId: "turn-1",
         delivery: "progress",
@@ -38,6 +44,30 @@ describe("describeCodexNotification", () => {
       }),
       null,
     );
+  });
+
+  it("keeps malformed reasoning summary metadata append-only", () => {
+    for (
+      const params of [
+        { summaryIndex: 0 },
+        { itemId: "reasoning-1" },
+        { itemId: "reasoning-1", summaryIndex: -1 },
+        { itemId: "reasoning-1", summaryIndex: 0.5 },
+        { itemId: "reasoning-1", summaryIndex: Number.MAX_SAFE_INTEGER + 1 },
+      ]
+    ) {
+      assertEquals(
+        describeCodexNotification({
+          method: "item/reasoning/summaryTextDelta",
+          params: { ...params, delta: "append me" },
+        }),
+        {
+          tag: "CONTENT",
+          body: "append me",
+          delivery: "progress",
+        },
+      );
+    }
   });
 
   it("keeps commentary raw and reserves final answers for turn outcomes", () => {

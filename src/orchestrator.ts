@@ -19,6 +19,7 @@ import {
   DEFAULT_OUTPUT_SETTINGS,
   type OutputSettings,
 } from "./output-settings.ts";
+import type { ProgressTail } from "./progress-tail.ts";
 import type {
   ChatType,
   ConversationKey,
@@ -99,7 +100,7 @@ export interface CodexPort {
 }
 
 export interface ProgressHandle {
-  append(text: string): void;
+  append(text: string, progressTail?: ProgressTail): void;
   finish(): Promise<void>;
   detach(): void;
 }
@@ -241,8 +242,6 @@ interface DebounceBatch {
 interface TurnOutput {
   message: RoutedText;
   progress: ProgressHandle;
-  progressWritten: boolean;
-  progressEndsWithLineBreak: boolean;
   pipeline: TurnOutputPipeline;
   activityTail: Promise<void>;
   acceptingActivities: boolean;
@@ -1377,8 +1376,6 @@ export class ConversationOrchestrator {
     return {
       message,
       progress,
-      progressWritten: false,
-      progressEndsWithLineBreak: false,
       pipeline: new TurnOutputPipeline(this.#effectiveOutputSettings(message)),
       activityTail: Promise.resolve(),
       acceptingActivities: true,
@@ -1592,19 +1589,7 @@ export class ConversationOrchestrator {
         await this.#output.send(turnOutput.message, rendered);
       }
     } else {
-      const startsWithLineBreak = rendered.startsWith("\n") ||
-        rendered.startsWith("\r");
-      if (
-        turnOutput.progressWritten &&
-        !turnOutput.progressEndsWithLineBreak &&
-        !startsWithLineBreak
-      ) {
-        turnOutput.progress.append("\n");
-      }
-      turnOutput.progress.append(rendered);
-      turnOutput.progressWritten = true;
-      turnOutput.progressEndsWithLineBreak = rendered.endsWith("\n") ||
-        rendered.endsWith("\r");
+      turnOutput.progress.append(rendered, decision.progressTail);
     }
     if (activity.tag === "SHUTDOWN") turnOutput.shutdownHandled = true;
   }
