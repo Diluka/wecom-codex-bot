@@ -334,6 +334,30 @@ describe("TurnOutputPipeline", () => {
     );
   });
 
+  it("preserves full-line bold after one to three spaces and a tab", () => {
+    const pipeline = new TurnOutputPipeline(
+      outputSettings({ toolFormat: "summary" }),
+    );
+    const summary = [
+      "**before**",
+      " \t**literal**",
+      "  \t**literal**",
+      "   \t**literal**",
+      "**after**",
+    ].join("\n");
+
+    assertEquals(
+      pipeline.apply(reasoningSummary(summary)),
+      [
+        "[content] *before*",
+        " \t**literal**",
+        "  \t**literal**",
+        "   \t**literal**",
+        "*after*",
+      ].join("\n"),
+    );
+  });
+
   it("italicizes summary lines before line and excerpt projection", () => {
     const line = new TurnOutputPipeline(
       outputSettings({

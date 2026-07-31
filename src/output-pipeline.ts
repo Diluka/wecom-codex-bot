@@ -275,7 +275,18 @@ function isClosingFence(line: string, fence: MarkdownFence): boolean {
 }
 
 function isIndentedCodeLine(line: string): boolean {
-  return line.startsWith("    ") || line.startsWith("\t");
+  let column = 0;
+  for (const character of line) {
+    if (character === " ") {
+      column += 1;
+    } else if (character === "\t") {
+      column += 4 - (column % 4);
+    } else {
+      return false;
+    }
+    if (column >= 4) return true;
+  }
+  return false;
 }
 
 function italicizeBoldLine(line: string): string {
