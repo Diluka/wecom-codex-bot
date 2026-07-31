@@ -110,42 +110,22 @@ export function splitUtf8(
   return result;
 }
 
-export function redactSecrets(
-  value: string,
-  secrets: Iterable<string>,
-): string {
-  const uniqueSecrets = [...new Set(secrets)]
-    .filter((secret) => secret.length > 0)
-    .sort((left, right) => right.length - left.length);
-  let redacted = value;
-  for (const secret of uniqueSecrets) {
-    redacted = redacted.split(secret).join("[REDACTED]");
-  }
-  return redacted;
-}
-
 export interface ProgressBufferOptions {
   maxBytes?: number;
-  secrets?: Iterable<string>;
 }
 
-/** Retains a redacted, UTF-8-safe tail of streamed progress. */
+/** Retains a UTF-8-safe tail of streamed progress. */
 export class ProgressBuffer {
   readonly #maxBytes: number;
-  readonly #secrets: string[];
   #content = "";
 
   constructor(options: ProgressBufferOptions = {}) {
     this.#maxBytes = options.maxBytes ?? DEFAULT_TAIL_BYTES;
     validateByteLimit(this.#maxBytes);
-    this.#secrets = [...(options.secrets ?? [])];
   }
 
   append(content: string): this {
-    this.#content = utf8Tail(
-      redactSecrets(this.#content + content, this.#secrets),
-      this.#maxBytes,
-    );
+    this.#content = utf8Tail(this.#content + content, this.#maxBytes);
     return this;
   }
 
@@ -578,7 +558,6 @@ export interface StreamControllerOptions {
   conversationKey: string;
   frame: unknown;
   sink: WeComSink;
-  secrets?: Iterable<string>;
   maxBufferBytes?: number;
   flushIntervalMs?: number;
   rotateAfterMs?: number;
@@ -621,7 +600,6 @@ export class StreamController {
     this.#sink = options.sink;
     this.#bufferOptions = {
       maxBytes: options.maxBufferBytes,
-      secrets: [...(options.secrets ?? [])],
     };
     this.#buffer = new ProgressBuffer(this.#bufferOptions);
     this.#flushIntervalMs = options.flushIntervalMs ??

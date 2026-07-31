@@ -6,7 +6,6 @@ import type {
 } from "./orchestrator.ts";
 import {
   ConversationSendQueue,
-  redactSecrets,
   splitUtf8,
   StreamController,
   type StreamControllerOptions,
@@ -25,7 +24,6 @@ export interface WeComReplyGateway {
 
 export interface WeComChatOutputOptions {
   gateway: WeComReplyGateway;
-  secrets: Iterable<string>;
   onError?: (error: Error) => void;
   queue?: ConversationSendQueue;
   streamControllerOptions?: Pick<
@@ -34,10 +32,9 @@ export interface WeComChatOutputOptions {
   >;
 }
 
-/** Delivers redacted direct and streaming responses through WeCom. */
+/** Delivers direct and streaming responses through WeCom. */
 export class WeComChatOutput implements ChatOutput {
   readonly #gateway: WeComReplyGateway;
-  readonly #secrets: string[];
   readonly #onError?: (error: Error) => void;
   readonly #streamControllerOptions: WeComChatOutputOptions[
     "streamControllerOptions"
@@ -48,7 +45,6 @@ export class WeComChatOutput implements ChatOutput {
 
   constructor(options: WeComChatOutputOptions) {
     this.#gateway = options.gateway;
-    this.#secrets = [...options.secrets];
     this.#onError = options.onError;
     this.#queue = options.queue ?? new ConversationSendQueue();
     this.#streamControllerOptions = options.streamControllerOptions;
@@ -72,8 +68,7 @@ export class WeComChatOutput implements ChatOutput {
     content: string,
     final = false,
   ): Promise<void> {
-    const safeContent = redactSecrets(content, this.#secrets);
-    const parts = splitUtf8(safeContent);
+    const parts = splitUtf8(content);
 
     for (const part of parts) {
       const operation = async () => {
@@ -111,7 +106,6 @@ export class WeComChatOutput implements ChatOutput {
       conversationKey: message.conversationKey,
       frame: message.frame,
       sink: this.#sink,
-      secrets: this.#secrets,
     });
     this.#active.add(controller);
 

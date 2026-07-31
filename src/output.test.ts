@@ -4,7 +4,6 @@ import {
   CONTINUATION_MARKER,
   ConversationSendQueue,
   ProgressBuffer,
-  redactSecrets,
   splitUtf8,
   StreamController,
   type TimerApi,
@@ -132,25 +131,14 @@ describe("UTF-8 output helpers", () => {
     for (const part of parts) assert(encoder.encode(part).byteLength <= 48);
   });
 
-  it("redacts actual secret values literally and longest first", () => {
-    assertEquals(
-      redactSecrets("tokens: abc$123 and abc", ["abc", "abc$123", ""]),
-      "tokens: [REDACTED] and [REDACTED]",
-    );
-  });
-
-  it("ProgressBuffer rolls its tail and redacts a secret across appends", () => {
-    const progress = new ProgressBuffer({
-      maxBytes: 32,
-      secrets: ["top-secret"],
-    });
+  it("ProgressBuffer rolls its tail without inspecting content", () => {
+    const progress = new ProgressBuffer({ maxBytes: 32 });
 
     progress.append("old-content-that-will-roll ");
     progress.append("top-");
     progress.append("secret latest🙂");
 
-    assertEquals(progress.snapshot().includes("top-secret"), false);
-    assert(progress.snapshot().includes("[REDACTED]"));
+    assert(progress.snapshot().includes("top-secret"));
     assert(progress.snapshot().endsWith(" latest🙂"));
     assert(encoder.encode(progress.snapshot()).byteLength <= 32);
   });

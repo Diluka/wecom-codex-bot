@@ -19,9 +19,7 @@ if (Deno.env.get("RUN_CODEX_TURN") !== "1") {
 const workspace = await Deno.realPath(
   resolve(Deno.cwd(), Deno.env.get("CODEX_WORKSPACE") ?? "."),
 );
-const secret = Deno.env.get("BOT_SECRET") ?? "";
 const logger = createLogger({
-  secrets: [secret],
   level: Deno.env.get("LOG_LEVEL") === "debug" ? "debug" : "info",
 });
 const codexLogger = logger.child({ scope: "codex" });

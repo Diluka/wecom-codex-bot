@@ -1,14 +1,14 @@
 import { once } from "node:events";
 import pino, {
+  type Bindings,
+  type ChildLoggerOptions,
   type DestinationStream,
   type LogFn,
   type Logger,
-  type SerializerFn,
 } from "pino";
 import pretty, { type PrettyOptions } from "pino-pretty";
 import type { CodexAppServerLifecycleEvent } from "./codex-app-server.ts";
 import type { LogLevel } from "./config.ts";
-import { redactSecrets } from "./output.ts";
 
 const REQUEST_WARN = new Set(["runtime_unavailable", "shutdown_discarded"]);
 const REQUEST_ERROR = new Set(["failed", "runtime_lost"]);
@@ -22,18 +22,14 @@ const RESERVED_LOG_FIELDS = new Set([
   "name",
   "v",
 ]);
-const REDACT_PATHS = [...RESERVED_LOG_FIELDS, "*"];
 const OMIT_LOG_VALUE = Symbol("omit-log-value");
 const MAX_LOG_TEXT_LENGTH = 100;
 const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, {
   granularity: "grapheme",
 });
-const OMIT_BINDING: SerializerFn = () => undefined;
-
 type LogFields = Record<string, unknown>;
 
 export interface LoggerOptions {
-  secrets?: Iterable<string>;
   destination?: PrettyOptions["destination"];
   stream?: DestinationStream;
   level?: LogLevel;
@@ -82,7 +78,6 @@ export interface RequestStatusEventLike {
 }
 
 export function createLogger(options: LoggerOptions = {}): Logger {
-  const secrets = [...(options.secrets ?? [])];
   const stream = options.stream ??
     pretty({
       colorize: false,
@@ -98,37 +93,17 @@ export function createLogger(options: LoggerOptions = {}): Logger {
   const root = pino({
     level: options.level ?? "info",
     base: null,
-    redact: {
-      // Explicit paths preserve the actual key; Pino reports wildcard keys as
-      // an internal symbol when serializing child bindings.
-      paths: REDACT_PATHS,
-      censor(value, path) {
-        const key = path[0];
-        if (
-          key !== "scope" && key !== "msg" && RESERVED_LOG_FIELDS.has(key)
-        ) {
-          return undefined;
-        }
-        const redacted = redactValue(value, secrets);
-        if (redacted === OMIT_LOG_VALUE) return undefined;
-        return (key === "scope" || key === "msg") &&
-            typeof redacted === "string"
-          ? singleLine(redacted)
-          : redacted;
-      },
-    },
     hooks: {
       logMethod(args, method) {
-        const sanitizedArgs = args.map((argument, index) =>
-          sanitizeLogArgument(argument, index === 0, secrets)
+        const normalizedArgs = args.map((argument, index) =>
+          normalizeLogArgument(argument, index === 0)
         ) as Parameters<LogFn>;
-        method.apply(this, sanitizedArgs);
+        method.apply(this, normalizedArgs);
       },
     },
   }, stream);
 
-  protectChildBindingKeys(root, secrets);
-  return root;
+  return normalizeChildLogger(root);
 }
 
 export function createLogTransport(
@@ -187,11 +162,8 @@ export async function closeLogTransport(
   await closed;
 }
 
-export function summarizeRequest(
-  text: string,
-  secrets: Iterable<string> = [],
-): string {
-  const normalized = redactSecrets(text, secrets).replace(/\s+/gu, " ").trim();
+export function summarizeRequest(text: string): string {
+  const normalized = text.replace(/\s+/gu, " ").trim();
   const graphemes = [...GRAPHEME_SEGMENTER.segment(normalized)];
   const summary = graphemes.slice(0, 10).map(({ segment }) => segment).join("");
   return graphemes.length > 10 ? `${summary}…` : summary;
@@ -258,17 +230,16 @@ export function logAppServerStderr(logger: Logger, message: string): void {
   logger.debug({ chunk_length: message.length }, "app_server_stderr");
 }
 
-function sanitizeLogArgument(
+function normalizeLogArgument(
   value: unknown,
   isFirst: boolean,
-  secrets: readonly string[],
 ): unknown {
-  if (isFirst && isLogFields(value)) return redactFields(value, secrets);
+  if (isFirst && isLogFields(value)) return normalizeFields(value);
   if (typeof value === "string") {
-    return sanitizeText(value, secrets);
+    return normalizeText(value);
   }
-  const redacted = redactValue(value, secrets);
-  return redacted === OMIT_LOG_VALUE ? null : redacted;
+  const normalized = normalizeValue(value);
+  return normalized === OMIT_LOG_VALUE ? null : normalized;
 }
 
 function isLogFields(value: unknown): value is LogFields {
@@ -276,58 +247,51 @@ function isLogFields(value: unknown): value is LogFields {
     !Array.isArray(value) && !(value instanceof Error);
 }
 
-function redactFields(
-  fields: LogFields,
-  secrets: readonly string[],
-): LogFields {
+function normalizeFields(fields: LogFields): LogFields {
   const result: LogFields = Object.create(null);
   const seen = new WeakMap<object, unknown>();
   seen.set(fields, result);
   for (const key of Object.keys(fields)) {
     if (RESERVED_LOG_FIELDS.has(key)) continue;
-    const redacted = redactValue(
-      fields[key],
-      secrets,
-      seen,
-    );
-    if (redacted === OMIT_LOG_VALUE) continue;
-    result[sanitizeText(key, secrets)] = redacted;
+    const normalized = normalizeValue(fields[key], seen);
+    if (normalized === OMIT_LOG_VALUE) continue;
+    result[normalizeText(key)] = normalized;
   }
   return result;
 }
 
-function protectChildBindingKeys(
-  logger: Logger,
-  secrets: readonly string[],
-): void {
-  const protectedSecrets = secrets.filter((secret) => secret.length > 0);
-  const serializersSymbol = pino.symbols.serializersSym;
-  const internals = logger as
-    & Logger
-    & Record<
-      typeof serializersSymbol,
-      Record<PropertyKey, SerializerFn | undefined>
-    >;
-  const serializers = internals[serializersSymbol];
-
-  // Pino serializes child bindings before logMethod runs. Its exported
-  // serializer slot is the native pre-serialization boundary for their keys.
-  internals[serializersSymbol] = new Proxy(serializers, {
-    get(target, key, receiver) {
-      if (
-        typeof key === "string" &&
-        protectedSecrets.some((secret) => key.includes(secret))
-      ) {
-        return OMIT_BINDING;
-      }
-      return Reflect.get(target, key, receiver);
-    },
-  });
+function normalizeChildLogger(logger: Logger): Logger {
+  const child = logger.child as unknown as (
+    this: Logger,
+    bindings: Bindings,
+    options?: ChildLoggerOptions,
+  ) => Logger;
+  logger.child = (function (
+    this: Logger,
+    bindings: Bindings,
+    options?: ChildLoggerOptions,
+  ): Logger {
+    return child.call(this, normalizeChildBindings(bindings), options);
+  }) as unknown as Logger["child"];
+  return logger;
 }
 
-function redactValue(
+function normalizeChildBindings(bindings: Bindings): Bindings {
+  // Pino calls hasOwnProperty while serializing child bindings.
+  const result: Bindings = {};
+  const seen = new WeakMap<object, unknown>();
+  seen.set(bindings, result);
+  for (const key of Object.keys(bindings)) {
+    if (key !== "scope" && RESERVED_LOG_FIELDS.has(key)) continue;
+    const normalized = normalizeValue(bindings[key], seen);
+    if (normalized === OMIT_LOG_VALUE) continue;
+    result[normalizeText(key)] = normalized;
+  }
+  return result;
+}
+
+function normalizeValue(
   value: unknown,
-  secrets: readonly string[],
   seen = new WeakMap<object, unknown>(),
 ): unknown {
   if (
@@ -336,24 +300,24 @@ function redactValue(
   ) {
     return OMIT_LOG_VALUE;
   }
-  if (typeof value === "string") return sanitizeText(value, secrets);
+  if (typeof value === "string") return normalizeText(value);
   if (value instanceof Error) {
     const previous = seen.get(value);
     if (previous !== undefined) return previous;
     const result: LogFields = Object.create(null);
     seen.set(value, result);
-    result.type = sanitizeText(value.name, secrets);
-    result.message = sanitizeText(value.message, secrets);
-    if (value.stack) result.stack = sanitizeStackFrame(value.stack, secrets);
+    result.type = normalizeText(value.name);
+    result.message = normalizeText(value.message);
+    if (value.stack) result.stack = normalizeStackFrame(value.stack);
     if (value.cause !== undefined) {
-      const cause = redactValue(value.cause, secrets, seen);
+      const cause = normalizeValue(value.cause, seen);
       if (cause !== OMIT_LOG_VALUE) result.cause = cause;
     }
     for (const [key, entry] of Object.entries(value)) {
       if (key === "cause") continue;
-      const redacted = redactValue(entry, secrets, seen);
-      if (redacted === OMIT_LOG_VALUE) continue;
-      result[sanitizeText(key, secrets)] = redacted;
+      const normalized = normalizeValue(entry, seen);
+      if (normalized === OMIT_LOG_VALUE) continue;
+      result[normalizeText(key)] = normalized;
     }
     return result;
   }
@@ -365,8 +329,8 @@ function redactValue(
     const result: unknown[] = [];
     seen.set(value, result);
     for (const entry of value) {
-      const redacted = redactValue(entry, secrets, seen);
-      result.push(redacted === OMIT_LOG_VALUE ? null : redacted);
+      const normalized = normalizeValue(entry, seen);
+      result.push(normalized === OMIT_LOG_VALUE ? null : normalized);
     }
     return result;
   }
@@ -374,9 +338,9 @@ function redactValue(
   const result: LogFields = Object.create(null);
   seen.set(value, result);
   for (const [key, entry] of Object.entries(value)) {
-    const redacted = redactValue(entry, secrets, seen);
-    if (redacted === OMIT_LOG_VALUE) continue;
-    result[sanitizeText(key, secrets)] = redacted;
+    const normalized = normalizeValue(entry, seen);
+    if (normalized === OMIT_LOG_VALUE) continue;
+    result[normalizeText(key)] = normalized;
   }
   return result;
 }
@@ -385,8 +349,8 @@ function singleLine(value: string): string {
   return value.replace(/\r\n|\r|\n/gu, "\\n");
 }
 
-function sanitizeText(value: string, secrets: readonly string[]): string {
-  return truncateText(singleLine(redactSecrets(value, secrets)));
+function normalizeText(value: string): string {
+  return truncateText(singleLine(value));
 }
 
 function truncateText(value: string): string {
@@ -397,11 +361,8 @@ function truncateText(value: string): string {
   ).join("") + "…";
 }
 
-function sanitizeStackFrame(
-  stack: string,
-  secrets: readonly string[],
-): string {
-  const lines = redactSecrets(stack, secrets).split(/\r\n|\r|\n/gu);
+function normalizeStackFrame(stack: string): string {
+  const lines = stack.split(/\r\n|\r|\n/gu);
   const frame = lines.slice(1).find((line) => line.trim()) ?? lines[0] ?? "";
   const value = singleLine(frame.trim());
   const graphemes = [...GRAPHEME_SEGMENTER.segment(value)];

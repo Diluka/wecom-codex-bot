@@ -2289,7 +2289,6 @@ describe("ConversationOrchestrator", () => {
     const codex = new FakeCodex();
     const streams: Array<{ content: string; finish: boolean }> = [];
     const output = new WeComChatOutput({
-      secrets: [],
       gateway: {
         reply: () => Promise.resolve(true),
         replyStream: (_frame, _streamId, content, finish = false) => {
@@ -2789,7 +2788,6 @@ describe("ConversationOrchestrator", () => {
     const state = new FakeState();
     const codex = new FakeCodex();
     const output = new WeComChatOutput({
-      secrets: [],
       onError: (error) => outputErrors.push(error),
       streamControllerOptions: { maxFinishAttempts: 1 },
       gateway: {

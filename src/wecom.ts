@@ -4,7 +4,6 @@ import {
   WSClient,
   type WsFrameHeaders,
 } from "@wecom/aibot-node-sdk";
-import { redactSecrets } from "./output.ts";
 
 export type ChatType = "single" | "group";
 export type ConversationKey = `single:${string}` | `group:${string}`;
@@ -27,12 +26,11 @@ type Listener = (...args: unknown[]) => void;
 type MaybePromise<T> = T | Promise<T>;
 export type SdkLogLevel = "debug" | "info" | "warn" | "error";
 
-export function createSafeSdkLogger(
-  secret: string,
+export function createSdkLogger(
   write: (level: SdkLogLevel, message: string) => void = () => {},
 ): Logger {
   const record = (level: SdkLogLevel, message: string): void => {
-    write(level, redactSecrets(message, [secret]));
+    write(level, message);
   };
 
   return {
@@ -51,7 +49,7 @@ export function createWeComClient(
   return new WSClient({
     botId,
     secret,
-    logger: createSafeSdkLogger(secret, onSdkLog),
+    logger: createSdkLogger(onSdkLog),
   }) as unknown as WeComClientLike;
 }
 
@@ -166,20 +164,6 @@ function errorCode(error: Error): unknown {
   return (error as Error & { code?: unknown }).code;
 }
 
-function redactReplyValue(value: unknown, secret: string): unknown {
-  if (typeof value === "string") return redactSecrets(value, [secret]);
-  if (Array.isArray(value)) {
-    return value.map((item) => redactReplyValue(item, secret));
-  }
-  if (typeof value !== "object" || value === null) return value;
-
-  const redacted: Record<string, unknown> = {};
-  for (const [key, item] of Object.entries(value)) {
-    redacted[key] = redactReplyValue(item, secret);
-  }
-  return redacted;
-}
-
 /** Adapts the WeCom WebSocket SDK to normalized bot messages and replies. */
 export class WeComGateway {
   readonly #client: WeComClientLike;
@@ -210,11 +194,7 @@ export class WeComGateway {
     cmd?: string,
   ): Promise<boolean> {
     try {
-      await this.#client.reply(
-        frame,
-        redactReplyValue(body, this.#options.secret),
-        cmd,
-      );
+      await this.#client.reply(frame, body, cmd);
       return true;
     } catch (error) {
       this.#report(error);
@@ -234,7 +214,7 @@ export class WeComGateway {
       await this.#client.replyStream(
         frame,
         streamId,
-        redactSecrets(content, [this.#options.secret]),
+        content,
         finish,
       );
       return true;

@@ -8,7 +8,7 @@ import { describe, it } from "@std/testing/bdd";
 import { WSClient } from "@wecom/aibot-node-sdk";
 import {
   conversationKey,
-  createSafeSdkLogger,
+  createSdkLogger,
   createWeComClient,
   normalizeTextFrame,
   type WeComClientLike,
@@ -306,7 +306,7 @@ describe("WeComGateway", () => {
     assertMatch(errors[0].message, /reply failed/);
   });
 
-  it("redacts the actual bot secret from every reply", async () => {
+  it("forwards reply content without inspecting values", async () => {
     const client = new FakeClient();
     const gateway = new WeComGateway({
       botId: "bot",
@@ -331,9 +331,9 @@ describe("WeComGateway", () => {
 
     assertEquals(client.replies[0].body, {
       msgtype: "text",
-      text: { content: "leak [REDACTED]" },
+      text: { content: "leak actual-$ecret" },
     });
-    assertEquals(client.streams[0].content, "leak [REDACTED]");
+    assertEquals(client.streams[0].content, "leak actual-$ecret");
   });
 
   it("treats kicked-off and exhausted connection errors as fatal", async () => {
@@ -368,11 +368,10 @@ describe("WeComGateway", () => {
     assertInstanceOf(createWeComClient("bot", "secret"), WSClient);
   });
 
-  it("forwards every SDK log level with redacted messages", () => {
+  it("forwards every SDK log level without inspecting messages", () => {
     const entries: Array<{ level: string; message: string }> = [];
-    const logger = createSafeSdkLogger(
-      "actual-$ecret",
-      (level, message) => entries.push({ level, message }),
+    const logger = createSdkLogger((level, message) =>
+      entries.push({ level, message })
     );
     logger.debug("callback actual-$ecret");
     logger.info("connected actual-$ecret");
@@ -382,19 +381,19 @@ describe("WeComGateway", () => {
     assertEquals(entries, [
       {
         level: "debug",
-        message: "callback [REDACTED]",
+        message: "callback actual-$ecret",
       },
       {
         level: "info",
-        message: "connected [REDACTED]",
+        message: "connected actual-$ecret",
       },
       {
         level: "warn",
-        message: "connection [REDACTED]",
+        message: "connection actual-$ecret",
       },
       {
         level: "error",
-        message: "failed [REDACTED]",
+        message: "failed actual-$ecret",
       },
     ]);
   });
