@@ -51,9 +51,10 @@ Secret。
 
 机器人每次启动都会记录 `owner_configuration` lifecycle
 日志。配置有效时，日志中的 `configured` 为 `true`，`owner_user_id`
-是规范化后的实际 ID，并服从 Pino 字符串统一的 100 个 Unicode
-字素簇上限。未设置、空值或无效时，`configured` 为 `false`，`owner_user_id` 为
-`null`。既有 request 日志保持不变，仍会记录每条消息真实的 sender `user_id`。
+是规范化后的配置值；与其他 Pino 字符串一样，超过 100 个 Unicode
+字素簇时会被截断。未设置、空值或无效时，`configured` 为 `false`，
+`owner_user_id` 为 `null`。既有 request 日志保持不变，仍会记录每条消息真实的
+sender `user_id`。
 
 restricted turn 的写操作、测试、构建、格式化和依赖安装等必须在隔离 worktree 中
 执行。worktree 位置、分支命名、验证、提交约定，以及 PR/MR 的类型、模板和工作流均
@@ -213,10 +214,10 @@ OUTPUT_GROUP_FORMAT_TOOL=summary
 另外生成替代标识。只有 `received` 状态包含 `summary`：正文先脱敏、折叠空白，再按
 Unicode 字素簇截取前 10 个，超长时追加 `…`，不会把完整聊天正文写到终端。
 
-启动时的 `owner_configuration` lifecycle 日志会记录规范化后的 owner ID，并服从
-Pino 字符串统一的 100 个 Unicode 字素簇上限；未配置、空值、无效时记录
-`null`。如果真实请求由该用户发送，上述既有 request 日志也会记录其真实
-`user_id`。
+启动时的 `owner_configuration` lifecycle 日志会把规范化后的 owner ID 作为
+`owner_user_id`；该字段与其他 Pino 字符串一样，超过 100 个 Unicode 字素簇时会被
+截断。未配置、空值、无效时记录 `null`。如果真实请求由该用户发送，上述既有
+request 日志也会记录其真实 `user_id`。
 
 内建命令 `/help`、`/status`、`/model`、`/effort`、`/new`、`/stop` 和不支持的消息
 类型不产生 request 状态。未知斜杠命令仍按普通文本请求处理。
