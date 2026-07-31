@@ -51,16 +51,24 @@ export const DEFAULT_OUTPUT_SETTINGS: OutputSettings = {
   toolFormat: "individual",
 };
 
+function readOptionalEnum<T extends string>(
+  env: Record<string, string | undefined>,
+  name: string,
+  values: readonly T[],
+): T | undefined {
+  const value = env[name]?.trim();
+  if (!value) return undefined;
+  if ((values as readonly string[]).includes(value)) return value as T;
+  throw new Error(`Invalid environment variable: ${name}`);
+}
+
 function optionalEnum<T extends string>(
   env: Record<string, string | undefined>,
   name: string,
   values: readonly T[],
   defaultValue: T,
 ): T {
-  const value = env[name]?.trim();
-  if (!value) return defaultValue;
-  if ((values as readonly string[]).includes(value)) return value as T;
-  throw new Error(`Invalid environment variable: ${name}`);
+  return readOptionalEnum(env, name, values) ?? defaultValue;
 }
 
 export function parseOutputSettings(
@@ -100,5 +108,51 @@ export function parseOutputSettings(
       TOOL_OUTPUT_FORMATS,
       DEFAULT_OUTPUT_SETTINGS.toolFormat,
     ),
+  };
+}
+
+export function parseGroupOutputSettings(
+  env: Record<string, string | undefined>,
+  defaults: OutputSettings,
+): OutputSettings {
+  const level = readOptionalEnum(
+    env,
+    "OUTPUT_GROUP_LEVEL",
+    OUTPUT_LEVELS,
+  );
+  const label = readOptionalEnum(
+    env,
+    "OUTPUT_GROUP_LABEL",
+    OUTPUT_LABELS,
+  );
+
+  return {
+    level: level ?? defaults.level,
+    levels: Object.fromEntries(
+      OUTPUT_TAGS.map((tag) => [
+        tag,
+        readOptionalEnum(
+          env,
+          `OUTPUT_GROUP_LEVEL_${tag}`,
+          OUTPUT_LEVELS,
+        ) ?? level ?? defaults.levels[tag],
+      ]),
+    ) as Record<OutputTag, OutputLevel>,
+    label: label ?? defaults.label,
+    labels: Object.fromEntries(
+      OUTPUT_TAGS.map((tag) => [
+        tag,
+        readOptionalEnum(
+          env,
+          `OUTPUT_GROUP_LABEL_${tag}`,
+          OUTPUT_LABELS,
+        ) ?? label ?? defaults.labels[tag],
+      ]),
+    ) as Record<OutputTag, OutputLabel>,
+    toolFormat: readOptionalEnum(
+      env,
+      "OUTPUT_GROUP_FORMAT_TOOL",
+      TOOL_OUTPUT_FORMATS,
+    ) ?? defaults.toolFormat,
   };
 }

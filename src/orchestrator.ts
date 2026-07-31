@@ -90,6 +90,7 @@ export interface ConversationOrchestratorOptions {
   output: ChatOutput;
   workspace: string;
   outputSettings?: OutputSettings;
+  groupOutputSettings?: OutputSettings;
   onError?: (error: Error) => void;
   shutdownGraceMs?: number;
   interruptRetryDelaysMs?: readonly number[];
@@ -154,6 +155,7 @@ export class ConversationOrchestrator {
   readonly #output: ChatOutput;
   readonly #workspace: string;
   readonly #outputSettings: OutputSettings;
+  readonly #groupOutputSettings: OutputSettings;
   readonly #onError?: (error: Error) => void;
   readonly #shutdownGraceMs: number;
   readonly #interruptRetryDelaysMs: readonly number[];
@@ -167,6 +169,8 @@ export class ConversationOrchestrator {
     this.#output = options.output;
     this.#workspace = options.workspace;
     this.#outputSettings = options.outputSettings ?? DEFAULT_OUTPUT_SETTINGS;
+    this.#groupOutputSettings = options.groupOutputSettings ??
+      this.#outputSettings;
     this.#onError = options.onError;
     this.#shutdownGraceMs = options.shutdownGraceMs ?? 30_000;
     this.#interruptRetryDelaysMs = options.interruptRetryDelaysMs ?? [
@@ -566,7 +570,11 @@ export class ConversationOrchestrator {
       progress,
       progressWritten: false,
       progressEndsWithLineBreak: false,
-      pipeline: new TurnOutputPipeline(this.#outputSettings),
+      pipeline: new TurnOutputPipeline(
+        message.chatType === "group"
+          ? this.#groupOutputSettings
+          : this.#outputSettings,
+      ),
       activityTail: Promise.resolve(),
       acceptingActivities: true,
       finished: false,

@@ -1,5 +1,9 @@
 import { join, resolve } from "node:path";
-import { type OutputSettings, parseOutputSettings } from "./output-settings.ts";
+import {
+  type OutputSettings,
+  parseGroupOutputSettings,
+  parseOutputSettings,
+} from "./output-settings.ts";
 
 export interface BotConfig {
   botId: string;
@@ -8,6 +12,7 @@ export interface BotConfig {
   stateDbPath: string;
   botRoot: string;
   outputSettings: OutputSettings;
+  groupOutputSettings: OutputSettings;
 }
 
 function required(
@@ -29,6 +34,7 @@ export async function loadConfig(
   const botSecret = required(env, "BOT_SECRET");
   const workspaceValue = required(env, "CODEX_WORKSPACE");
   const outputSettings = parseOutputSettings(env);
+  const groupOutputSettings = parseGroupOutputSettings(env, outputSettings);
   const botRoot = await Deno.realPath(baseDir);
   const workspace = await Deno.realPath(resolve(botRoot, workspaceValue));
   const stat = await Deno.stat(workspace);
@@ -44,5 +50,6 @@ export async function loadConfig(
     stateDbPath: join(botRoot, ".data", "bot.sqlite"),
     botRoot,
     outputSettings,
+    groupOutputSettings,
   };
 }

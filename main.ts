@@ -74,6 +74,7 @@ const orchestrator = new ConversationOrchestrator({
   output,
   workspace: config.workspace,
   outputSettings: config.outputSettings,
+  groupOutputSettings: config.groupOutputSettings,
   onError: (error) => safeLog("error", error),
 });
 context.orchestrator = orchestrator;
