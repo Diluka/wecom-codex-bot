@@ -210,6 +210,47 @@ describe("createLogger", () => {
     }
   });
 
+  it("omits secrets from native child binding keys", () => {
+    const capture = captureLogs();
+    const logger: Logger = createLogger({
+      secrets: ["actual-secret"],
+      destination: capture.destination,
+    });
+
+    logger.child({
+      scope: "request",
+      "actual-secret": "safe-value",
+    }).info("ready");
+    logger.flush();
+
+    const output = capture.output();
+    assertEquals(output.includes("actual-secret"), false);
+    assertEquals(output.includes("safe-value"), false);
+    assertMatch(output, / INFO: \[request\] ready/);
+  });
+
+  it("preserves Pino JSON for syntax-like secrets in child binding keys", () => {
+    for (const secret of ['"', '":"', "\\"]) {
+      const capture = captureLogs();
+      const logger: Logger = createLogger({
+        secrets: [secret],
+        destination: capture.destination,
+      });
+
+      logger.child({
+        scope: "request",
+        [secret]: "unsafe-binding",
+      }).info({ marker: "safe" }, "ready");
+      logger.flush();
+
+      const output = capture.output().trimEnd();
+      assertMatch(output, / INFO: \[request\] ready /);
+      assertEquals(output.includes("unsafe-binding"), false);
+      assertMatch(output, /"marker":"safe"/);
+      assertEquals(output.split("\n").length, 1);
+    }
+  });
+
   it("keeps multiline messages on one physical log line", () => {
     const capture = captureLogs();
     const logger: Logger = createLogger({ destination: capture.destination });

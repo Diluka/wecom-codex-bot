@@ -1265,6 +1265,35 @@ describe("ConversationOrchestrator", () => {
       "failed",
     ]);
   });
+  it("keeps a stopped start failure reply interrupted", async () => {
+    const output = new PendingFinalOutput();
+    const { codex, orchestrator, requestEvents } = setup({ output });
+    codex.startThreadErrors.push(new Error("startThread failed"));
+    const running = orchestrator.handleText(
+      message("single:alice", "m1", "work"),
+    );
+    await output.finalStarted.promise;
+
+    await orchestrator.handleText(
+      message("single:alice", "stop", "/stop"),
+    );
+    await running;
+    output.finalGate.resolve();
+    await Promise.resolve();
+
+    const events = requestEvents.filter(({ msgId }) => msgId === "m1");
+    assertEquals(events.map(({ state }) => state), [
+      "received",
+      "queued",
+      "thread_starting",
+      "reply_sending",
+      "reply_skipped",
+      "interrupted",
+    ]);
+    assertEquals(events.at(-2)?.reason, "stop");
+    assertEquals(events.at(-1)?.reason, "stop");
+    assertEquals(events.some(({ state }) => state === "failed"), false);
+  });
   it("does not interrupt a failed startTurn while its progress is finishing", async () => {
     const output = new PendingProgressFinishOutput();
     const { codex, orchestrator, requestEvents } = setup({ output });

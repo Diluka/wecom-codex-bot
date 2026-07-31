@@ -153,6 +153,7 @@ interface TurnControl {
   forceComplete: (outcome: TurnOutcome) => void;
   forceSignal: Promise<TurnOutcome>;
   forced: boolean;
+  forcedOutcome?: TurnOutcome;
 }
 
 type ForceRaceResult<T> =
@@ -729,7 +730,11 @@ export class ConversationOrchestrator {
           } catch {
             // Continue draining newer work when the fallback cannot be sent.
           }
-          this.#emitRequestStatuses(request, "failed", { error: failure });
+          if (control.forcedOutcome) {
+            this.#emitForcedTerminal(request, control.forcedOutcome);
+          } else {
+            this.#emitRequestStatuses(request, "failed", { error: failure });
+          }
         }
       } finally {
         if (slot.active?.control === control) {
@@ -1101,6 +1106,7 @@ export class ConversationOrchestrator {
     control.forceComplete = (outcome) => {
       if (control.forced) return;
       control.forced = true;
+      control.forcedOutcome = outcome;
       forced.resolve(outcome);
     };
     return control;
@@ -1189,7 +1195,7 @@ export class ConversationOrchestrator {
     this.#setRequestPhase(request, "reply");
     if (control.forced) {
       this.#emitRequestStatuses(request, "reply_skipped", {
-        reason: "shutdown",
+        reason: forcedReplyReason(control.forcedOutcome),
       });
       return;
     }
@@ -1214,7 +1220,7 @@ export class ConversationOrchestrator {
     }
     if (result === "forced") {
       this.#emitRequestStatuses(request, "reply_skipped", {
-        reason: "shutdown",
+        reason: forcedReplyReason(control.forcedOutcome),
       });
     } else {
       this.#emitRequestStatuses(request, "reply_sent");
@@ -1481,11 +1487,21 @@ export class ConversationOrchestrator {
   }
 
   #emitForcedOutcome(request: PendingRequest, outcome: TurnOutcome): void {
-    this.#emitRequestStatuses(request, "reply_skipped", { reason: "shutdown" });
+    this.#emitRequestStatuses(request, "reply_skipped", {
+      reason: forcedReplyReason(outcome),
+    });
+    this.#emitForcedTerminal(request, outcome);
+  }
+
+  #emitForcedTerminal(request: PendingRequest, outcome: TurnOutcome): void {
     this.#emitRequestStatuses(
       request,
       outcomeRequestStatus(outcome.status),
-      outcome.error ? { error: outcome.error } : {},
+      outcome.status === "interrupted"
+        ? { reason: "stop" }
+        : outcome.error
+        ? { error: outcome.error }
+        : {},
     );
   }
 
@@ -1695,4 +1711,8 @@ function outcomeRequestStatus(status: string): RequestStatus {
     default:
       return "failed";
   }
+}
+
+function forcedReplyReason(outcome?: TurnOutcome): "stop" | "shutdown" {
+  return outcome?.status === "interrupted" ? "stop" : "shutdown";
 }

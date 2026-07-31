@@ -153,10 +153,14 @@ OUTPUT_GROUP_FORMAT_TOOL=merge_same
 另外生成替代标识。只有 `received` 状态包含 `summary`：正文先脱敏、折叠空白，再按
 Unicode 字素簇截取前 10 个，超长时追加 `…`，不会把完整聊天正文写到终端。
 
-内建命令 `/help`、`/status`、`/new` 和不支持的消息类型不产生 request 状态；未知
-斜杠命令仍按普通文本请求处理。Codex 的原始 `ActivityEvent` 内容也不写入终端，仍
-只经过企业微信输出管线；`OUTPUT_*` 不影响上述终端日志。本项目不提供 `LOG_*`
-配置。所有结构化字段和消息都会在 Pino 边界递归脱敏。
+内建命令 `/help`、`/status`、`/new`、`/stop` 和不支持的消息类型不产生 request
+状态。未知斜杠命令仍按普通文本请求处理。
+
+Codex 的原始 `ActivityEvent` 不写终端日志，只经过企业微信输出管线。
+
+`OUTPUT_*` 不影响上述终端日志，本项目也不提供 `LOG_*` 配置。
+
+所有结构化字段和消息都会在 Pino 边界递归脱敏。
 
 当前实验配置把 `.env` 放在 Codex 工作区内，因此 Codex 可以读取机器人
 Secret。发送到企业微信的内容会脱敏，但这不构成可靠的 Secret 隔离。

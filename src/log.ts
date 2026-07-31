@@ -1,4 +1,4 @@
-import pino, { type LogFn, type Logger } from "pino";
+import pino, { type LogFn, type Logger, type SerializerFn } from "pino";
 import pretty, { type PrettyOptions } from "pino-pretty";
 import { redactSecrets } from "./output.ts";
 
@@ -19,6 +19,7 @@ const OMIT_LOG_VALUE = Symbol("omit-log-value");
 const REQUEST_SEGMENTER = new Intl.Segmenter(undefined, {
   granularity: "grapheme",
 });
+const OMIT_BINDING: SerializerFn = () => undefined;
 
 type LogFields = Record<string, unknown>;
 
@@ -90,6 +91,7 @@ export function createLogger(options: LoggerOptions = {}): Logger {
     },
   }, stream);
 
+  protectChildBindingKeys(root, secrets);
   return root;
 }
 
@@ -167,6 +169,35 @@ function redactFields(
     result[redactSecrets(key, secrets)] = redacted;
   }
   return result;
+}
+
+function protectChildBindingKeys(
+  logger: Logger,
+  secrets: readonly string[],
+): void {
+  const protectedSecrets = secrets.filter((secret) => secret.length > 0);
+  const serializersSymbol = pino.symbols.serializersSym;
+  const internals = logger as
+    & Logger
+    & Record<
+      typeof serializersSymbol,
+      Record<PropertyKey, SerializerFn | undefined>
+    >;
+  const serializers = internals[serializersSymbol];
+
+  // Pino serializes child bindings before logMethod runs. Its exported
+  // serializer slot is the native pre-serialization boundary for their keys.
+  internals[serializersSymbol] = new Proxy(serializers, {
+    get(target, key, receiver) {
+      if (
+        typeof key === "string" &&
+        protectedSecrets.some((secret) => key.includes(secret))
+      ) {
+        return OMIT_BINDING;
+      }
+      return Reflect.get(target, key, receiver);
+    },
+  });
 }
 
 function redactValue(
