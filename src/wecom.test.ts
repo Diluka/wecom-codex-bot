@@ -371,12 +371,14 @@ describe("WeComGateway", () => {
   });
 
   it("uses an SDK logger that drops message bodies and redacts retained logs", () => {
+    const entries: Array<{ level: string; message: string }> = [];
     const gateway = new WeComGateway({
       botId: "bot",
       secret: "actual-$ecret",
       onText: () => {},
       onUnsupported: () => {},
       onFatal: () => {},
+      onSdkLog: (level, message) => entries.push({ level, message }),
     });
     const logger = (
       gateway.client as unknown as {
@@ -388,28 +390,17 @@ describe("WeComGateway", () => {
         };
       }
     ).options.logger;
-    const entries: string[] = [];
-    const originalDebug = console.debug;
-    const originalWarn = console.warn;
-    console.debug = (...values: unknown[]) => entries.push(values.join(" "));
-    console.warn = (...values: unknown[]) => entries.push(values.join(" "));
+    logger.debug(
+      'body={"text":{"content":"private chat actual-$ecret"}}',
+      { body: { text: { content: "private chat actual-$ecret" } } },
+    );
+    logger.warn("connection warning actual-$ecret", {
+      body: { text: { content: "private chat" } },
+    });
 
-    try {
-      logger.debug(
-        'body={"text":{"content":"private chat actual-$ecret"}}',
-        { body: { text: { content: "private chat actual-$ecret" } } },
-      );
-      logger.warn("connection warning actual-$ecret", {
-        body: { text: { content: "private chat" } },
-      });
-    } finally {
-      console.debug = originalDebug;
-      console.warn = originalWarn;
-    }
-
-    assertEquals(entries.length, 1);
-    assertMatch(entries[0], /connection warning \[REDACTED\]/);
-    assertEquals(entries[0].includes("private chat"), false);
-    assertEquals(entries[0].includes("actual-$ecret"), false);
+    assertEquals(entries, [{
+      level: "warn",
+      message: "connection warning [REDACTED]",
+    }]);
   });
 });

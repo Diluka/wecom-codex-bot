@@ -3,17 +3,19 @@ import { WeComChatOutput } from "./src/chat-output.ts";
 import { CodexRuntime } from "./src/codex-runtime.ts";
 import { loadConfig } from "./src/config.ts";
 import { BotLifecycle } from "./src/lifecycle.ts";
-import { logTerminal } from "./src/log.ts";
+import { createLogger, logRequestStatus, summarizeRequest } from "./src/log.ts";
 import { ConversationOrchestrator } from "./src/orchestrator.ts";
 import { StateStore } from "./src/state.ts";
 import { WeComGateway } from "./src/wecom.ts";
 
 const config = await loadConfig();
+const logger = createLogger({ secrets: [config.botSecret] });
+const requestLogger = logger.child({ scope: "request" });
+const codexLogger = logger.child({ scope: "codex" });
+const wecomLogger = logger.child({ scope: "wecom" });
+const outputLogger = logger.child({ scope: "output" });
+const lifecycleLogger = logger.child({ scope: "lifecycle" });
 await Deno.mkdir(dirname(config.stateDbPath), { recursive: true });
-
-const safeLog = (level: "info" | "error", value: unknown): void => {
-  logTerminal(level, value, [config.botSecret]);
-};
 
 const state = new StateStore(config.stateDbPath);
 const context: {
@@ -24,18 +26,26 @@ let shutdownPromise: Promise<void> | undefined;
 let exitCode = 0;
 let signalListenersInstalled = false;
 
-const shutdown = (code: number, reason?: unknown): Promise<void> => {
+type ShutdownSignal = "SIGINT" | "SIGTERM";
+
+const shutdown = (code: number, signal?: ShutdownSignal): Promise<void> => {
   exitCode = Math.max(exitCode, code);
-  if (reason !== undefined) safeLog("error", reason);
+  Deno.exitCode = exitCode;
   if (!shutdownPromise) {
+    lifecycleLogger.info({ signal, exit_code: exitCode }, "stopping");
     shutdownPromise = (async () => {
-      if (signalListenersInstalled) {
-        Deno.removeSignalListener("SIGINT", onSignal);
-        Deno.removeSignalListener("SIGTERM", onSignal);
-        signalListenersInstalled = false;
+      try {
+        if (signalListenersInstalled) {
+          Deno.removeSignalListener("SIGINT", onSigint);
+          Deno.removeSignalListener("SIGTERM", onSigterm);
+          signalListenersInstalled = false;
+        }
+        await context.lifecycle?.stop();
+      } finally {
+        Deno.exitCode = exitCode;
+        lifecycleLogger.info({ exit_code: exitCode }, "stopped");
+        logger.flush();
       }
-      await context.lifecycle?.stop();
-      Deno.exitCode = exitCode;
     })();
   }
   return shutdownPromise;
@@ -43,8 +53,12 @@ const shutdown = (code: number, reason?: unknown): Promise<void> => {
 
 const runtime = new CodexRuntime({
   workspace: config.workspace,
-  onDiagnostic: (message) => safeLog("info", message.trimEnd()),
-  onFatal: (error) => shutdown(1, error),
+  onDiagnostic: (message) =>
+    codexLogger.info({ source: "app_server" }, message.trimEnd()),
+  onFatal: (error) => {
+    codexLogger.error({ error }, "fatal");
+    return shutdown(1);
+  },
 });
 
 const gateway = new WeComGateway({
@@ -57,15 +71,19 @@ const gateway = new WeComGateway({
       { ...message, frame },
       messageType,
     ),
-  onReady: () => safeLog("info", "Enterprise WeChat bot authenticated"),
-  onFatal: (error) => shutdown(1, error),
-  onError: (error) => safeLog("error", error),
+  onReady: () => wecomLogger.info({}, "authenticated"),
+  onFatal: (error) => {
+    wecomLogger.error({ error }, "fatal");
+    return shutdown(1);
+  },
+  onError: (error) => wecomLogger.error({ error }, "error"),
+  onSdkLog: (level, message) => wecomLogger[level]({ source: "sdk" }, message),
 });
 
 const output = new WeComChatOutput({
   gateway,
   secrets: [config.botSecret],
-  onError: (error) => safeLog("error", error),
+  onError: (error) => outputLogger.error({ error }, "error"),
 });
 
 const orchestrator = new ConversationOrchestrator({
@@ -75,7 +93,9 @@ const orchestrator = new ConversationOrchestrator({
   workspace: config.workspace,
   outputSettings: config.outputSettings,
   groupOutputSettings: config.groupOutputSettings,
-  onError: (error) => safeLog("error", error),
+  onError: (error) => requestLogger.error({ error }, "error"),
+  onRequestStatus: (event) => logRequestStatus(requestLogger, event),
+  summarizeRequest: (text) => summarizeRequest(text, [config.botSecret]),
 });
 context.orchestrator = orchestrator;
 
@@ -85,23 +105,28 @@ const lifecycle = new BotLifecycle({
   gateway,
   orchestrator,
   output,
-  onError: (error) => safeLog("error", error),
+  onError: (error) => lifecycleLogger.error({ error }, "cleanup_failed"),
 });
 context.lifecycle = lifecycle;
 
-const onSignal = (): void => {
-  void shutdown(0, "Received shutdown signal");
+const onSigint = (): void => {
+  void shutdown(0, "SIGINT");
 };
-Deno.addSignalListener("SIGINT", onSignal);
-Deno.addSignalListener("SIGTERM", onSignal);
+const onSigterm = (): void => {
+  void shutdown(0, "SIGTERM");
+};
+Deno.addSignalListener("SIGINT", onSigint);
+Deno.addSignalListener("SIGTERM", onSigterm);
 signalListenersInstalled = true;
 
+lifecycleLogger.info({ workspace: config.workspace }, "starting");
 try {
   const runtimeLost = await lifecycle.start();
-  safeLog(
-    "info",
-    `Bot started in ${config.workspace}; recovered ${runtimeLost} stale turn(s)`,
-  );
+  lifecycleLogger.info({
+    workspace: config.workspace,
+    stale_turns: runtimeLost,
+  }, "started");
 } catch (error) {
-  await shutdown(1, error);
+  lifecycleLogger.error({ error }, "start_failed");
+  await shutdown(1);
 }

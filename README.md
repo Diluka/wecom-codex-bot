@@ -129,10 +129,38 @@ OUTPUT_GROUP_FORMAT_TOOL=merge_same
 它们不再被读取、校验，也不会继续影响运行时行为；迁移时应删除旧变量并改用
 `OUTPUT_*`。
 
-原始 `ActivityEvent` 的架构边界是：未来会分发给两个独立配置的管线——本次迭代
-负责企业微信消息的 `OutputPipeline`，以及未来迭代负责终端日志的 `LogPipeline`。
-本次迭代不提供 `LOG_*`，不会把活动事件打印到终端，也不会让企业微信的输出过滤
-影响未来日志。
+### 终端日志
+
+前台终端统一使用 Pino 和 Pino Pretty 输出单行结构化日志，格式如下：
+
+```text
+[2026-07-31T14:22:33.456 +0800] INFO: [request] received {"chat_type":"group","chat_id":"room-1","user_id":"alice","msg_id":"m1","summary":"检查订单状态是否完成…","active_count":1,"pending_count":0}
+```
+
+方括号中的时间是带本地时区偏移的 ISO 时间，不是固定 UTC 时间。`INFO` 是 Pino
+级别，第二个方括号是 scope。终端日志只有以下五个 scope：
+
+| scope       | 内容                                         |
+| ----------- | -------------------------------------------- |
+| `request`   | 普通文本请求的状态、计数和编排错误。         |
+| `codex`     | Codex App Server 的诊断和致命错误。          |
+| `wecom`     | 企业微信鉴权、SDK 日志、网关错误和致命错误。 |
+| `output`    | 企业微信回复、流式输出和限流发送错误。       |
+| `lifecycle` | 启动、恢复、信号、清理和关闭状态。           |
+
+同一普通文本请求的每个状态都会重复携带消息中的真实 `chat_id`、`user_id` 和
+`msg_id`；获得 Codex 标识后，后续状态还会重复真实 `thread_id` 和 `turn_id`，不会
+另外生成替代标识。只有 `received` 状态包含 `summary`：正文先脱敏、折叠空白，再按
+Unicode 字素簇截取前 10 个，超长时追加 `…`，不会把完整聊天正文写到终端。
+
+内建命令 `/help`、`/status`、`/new`、`/stop` 和不支持的消息类型不产生 request
+状态。未知斜杠命令仍按普通文本请求处理。
+
+Codex 的原始 `ActivityEvent` 不写终端日志，只经过企业微信输出管线。
+
+`OUTPUT_*` 不影响上述终端日志，本项目也不提供 `LOG_*` 配置。
+
+所有结构化字段和消息都会在 Pino 边界递归脱敏。
 
 当前实验配置把 `.env` 放在 Codex 工作区内，因此 Codex 可以读取机器人
 Secret。发送到企业微信的内容会脱敏，但这不构成可靠的 Secret 隔离。
@@ -207,6 +235,14 @@ deno task test
 deno task smoke
 deno fmt --check
 deno lint
+```
+
+需要运行时权限的 task 已在 `deno.json` 中使用配置文件权限集，并通过 `-P` 启用；
+无需在命令行重复展开权限。Deno 目前会打印下面这条实验性功能警告，这是预期输出，
+不表示验证失败：
+
+```text
+Warning Permissions in the config file is an experimental feature and may change in the future.
 ```
 
 `deno task smoke` 只验证本机 `codex app-server --stdio` 握手，不会启动模型
