@@ -60,6 +60,10 @@ if (processLogError !== undefined) {
     archived_log: archivedLogPath,
   }, "logging_ready");
 }
+lifecycleLogger.info({
+  configured: config.ownerUserId !== undefined,
+  owner_user_id: config.ownerUserId ?? null,
+}, "owner_configuration");
 await Deno.mkdir(dirname(config.stateDbPath), { recursive: true });
 
 const state = new StateStore(config.stateDbPath);
