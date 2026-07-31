@@ -128,7 +128,7 @@ describe("finishSmoke", () => {
     assertMatch(harness.output(), / ERROR: \[codex\] close_failed /);
     assertMatch(
       harness.output(),
-      /"error":\{"type":"Error","message":"close failed","stack":"Error: close failed\\n/,
+      /"error":\{"type":"Error","message":"close failed","stack":"at Object\.<anonymous> \(.*smoke-cleanup\.test\.ts:\d+:\d+\)"/,
     );
   });
 

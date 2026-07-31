@@ -7,6 +7,7 @@ import {
   type AppServerProcessStatus,
   classifyAppServerMessage,
   CodexAppServerClient,
+  type CodexAppServerLifecycleEvent,
   CodexRpcError,
   selectFinalAgentMessage,
   type SpawnAppServer,
@@ -28,6 +29,7 @@ class FakeAppServerProcess implements AppServerProcess {
   #resolveStatus!: (status: AppServerProcessStatus) => void;
   #inputBuffer = "";
   #exited = false;
+  #statusResolved = false;
   readonly #exitOnStdinClose: boolean;
   readonly #exitOnKill: boolean;
 
@@ -82,11 +84,21 @@ class FakeAppServerProcess implements AppServerProcess {
   }
 
   exit(status: AppServerProcessStatus): void {
+    this.closeStreams();
+    this.resolveStatus(status);
+  }
+
+  resolveStatus(status: AppServerProcessStatus): void {
+    if (this.#statusResolved) return;
+    this.#statusResolved = true;
+    this.#resolveStatus(status);
+  }
+
+  closeStreams(): void {
     if (this.#exited) return;
     this.#exited = true;
     this.#stdoutController.close();
     this.#stderrController.close();
-    this.#resolveStatus(status);
   }
 
   #receive(chunk: Uint8Array): void {
@@ -291,7 +303,9 @@ describe("CodexAppServerClient thread settings", () => {
         "turn-new",
       );
       equal(
-        await client.startTurn("thread-existing", "Ship changes", "owner"),
+        await client.startTurn("thread-existing", "Ship changes", "owner", {
+          summary: "auto",
+        }),
         "turn-new",
       );
       await client.interrupt("thread-existing", "turn-new");
@@ -339,6 +353,7 @@ describe("CodexAppServerClient thread settings", () => {
               value: "Bot verified authority for the current turn: owner",
             },
           },
+          summary: "auto",
         },
       });
       deepStrictEqual(requests[5], {
@@ -766,10 +781,12 @@ describe("CodexAppServerClient", () => {
       method: string;
       params: Record<string, unknown>;
     }> = [];
+    const lifecycleEvents: CodexAppServerLifecycleEvent[] = [];
     const client = await CodexAppServerClient.start({
       cwd: "/workspace/project",
       spawn: createSpawn(fake),
       callbacks: {
+        onLifecycle: (event) => lifecycleEvents.push(event),
         onNotification: (notification) => notifications.push(notification),
       },
     });
@@ -810,9 +827,16 @@ describe("CodexAppServerClient", () => {
         method: "future/notification",
         params: { value: 1 },
       });
+      fake.send({
+        method: "turn/completed",
+        params: {
+          threadId: "thread-1",
+          turn: { id: "turn-1", status: "completed", error: null },
+        },
+      });
 
       await waitFor(
-        () => notifications.length === 5,
+        () => notifications.length === 6,
         "generic notification callbacks",
       );
       deepStrictEqual(
@@ -823,6 +847,7 @@ describe("CodexAppServerClient", () => {
           "item/reasoning/summaryTextDelta",
           "item/commandExecution/outputDelta",
           "future/notification",
+          "turn/completed",
         ],
       );
       deepStrictEqual(notifications[0].params, {
@@ -847,6 +872,141 @@ describe("CodexAppServerClient", () => {
         itemId: "command-1",
         delta: "stdout",
       });
+      deepStrictEqual(
+        lifecycleEvents.filter((event) => event.event === "item_delta").map(
+          (
+            {
+              event,
+              level,
+              method,
+              threadId,
+              turnId,
+              itemId,
+              deltaLength,
+              deltaChunks,
+            },
+          ) => ({
+            event,
+            level,
+            method,
+            threadId,
+            turnId,
+            itemId,
+            deltaLength,
+            deltaChunks,
+          }),
+        ),
+        [
+          {
+            event: "item_delta",
+            level: "debug",
+            method: "item/agentMessage/delta",
+            threadId: "thread-1",
+            turnId: "turn-1",
+            itemId: "message-1",
+            deltaLength: 7,
+            deltaChunks: 1,
+          },
+          {
+            event: "item_delta",
+            level: "debug",
+            method: "item/reasoning/summaryTextDelta",
+            threadId: "thread-1",
+            turnId: "turn-1",
+            itemId: "reasoning-1",
+            deltaLength: 7,
+            deltaChunks: 1,
+          },
+          {
+            event: "item_delta",
+            level: "debug",
+            method: "item/commandExecution/outputDelta",
+            threadId: "thread-1",
+            turnId: "turn-1",
+            itemId: "command-1",
+            deltaLength: 6,
+            deltaChunks: 1,
+          },
+        ],
+      );
+      const lifecycleJson = JSON.stringify(lifecycleEvents);
+      assertEquals(lifecycleJson.includes('"delta":"partial"'), false);
+      assertEquals(lifecycleJson.includes('"delta":"summary"'), false);
+      assertEquals(lifecycleJson.includes('"delta":"stdout"'), false);
+
+      fake.send({
+        method: "guardianWarning",
+        params: { message: "sandbox warning" },
+      });
+      await waitFor(
+        () =>
+          lifecycleEvents.some((event) => event.method === "guardianWarning"),
+        "guardian warning lifecycle",
+      );
+      const guardianWarning = lifecycleEvents.find((event) =>
+        event.method === "guardianWarning"
+      );
+      assertEquals(guardianWarning?.event, "server_warning");
+      assertEquals(guardianWarning?.level, "warn");
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("aggregates repeated delta chunks until the item completes", async () => {
+    const fake = new FakeAppServerProcess();
+    const lifecycleEvents: CodexAppServerLifecycleEvent[] = [];
+    const client = await CodexAppServerClient.start({
+      cwd: "/workspace/project",
+      spawn: createSpawn(fake),
+      callbacks: {
+        onLifecycle: (event) => lifecycleEvents.push(event),
+      },
+    });
+
+    try {
+      for (const delta of ["first", "second"]) {
+        fake.send({
+          method: "item/commandExecution/outputDelta",
+          params: {
+            threadId: "thread-1",
+            turnId: "turn-1",
+            itemId: "command-1",
+            delta,
+          },
+        });
+      }
+      fake.send({
+        method: "item/completed",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          item: {
+            id: "command-1",
+            type: "commandExecution",
+            status: "completed",
+          },
+        },
+      });
+
+      await waitFor(
+        () => lifecycleEvents.some((event) => event.event === "item_completed"),
+        "completed item lifecycle",
+      );
+      const deltas = lifecycleEvents.filter((event) =>
+        event.event === "item_delta"
+      );
+      deepStrictEqual(deltas, [{
+        level: "debug",
+        event: "item_delta",
+        method: "item/commandExecution/outputDelta",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "command-1",
+        itemType: undefined,
+        deltaChunks: 2,
+        deltaLength: 11,
+      }]);
     } finally {
       await client.close();
     }
@@ -855,7 +1015,7 @@ describe("CodexAppServerClient", () => {
   it("fails server requests closed and interrupts on requestUserInput", async () => {
     const fake = new FakeAppServerProcess();
     const userInputEvents: unknown[] = [];
-    const diagnostics: string[] = [];
+    const lifecycleEvents: CodexAppServerLifecycleEvent[] = [];
     const client = await CodexAppServerClient.start({
       cwd: "/workspace/project",
       spawn: createSpawn(fake, [], (message) => {
@@ -864,8 +1024,8 @@ describe("CodexAppServerClient", () => {
         }
       }),
       callbacks: {
+        onLifecycle: (event) => lifecycleEvents.push(event),
         onRequestUserInput: (event) => userInputEvents.push(event),
-        onDiagnostic: (message) => diagnostics.push(message),
       },
     });
 
@@ -941,36 +1101,68 @@ describe("CodexAppServerClient", () => {
         threadId: "thread-1",
         turnId: "turn-1",
       });
-      match(
-        diagnostics.join(""),
-        /Declined item\/commandExecution\/requestApproval: interactive approvals are disabled/,
-      );
-      match(
-        diagnostics.join(""),
-        /Declined item\/fileChange\/requestApproval: interactive approvals are disabled/,
-      );
-      match(
-        diagnostics.join(""),
-        /Declined item\/permissions\/requestApproval: permission grants are disabled/,
-      );
-      match(
-        diagnostics.join(""),
-        /Declined mcpServer\/elicitation\/request: MCP elicitation is disabled/,
+      deepStrictEqual(
+        lifecycleEvents.filter((event) =>
+          event.event === "server_request_declined"
+        ).map(({ method, requestId, policy, threadId, turnId, itemId }) => ({
+          method,
+          requestId,
+          policy,
+          threadId,
+          turnId,
+          itemId,
+        })),
+        [
+          {
+            method: "item/commandExecution/requestApproval",
+            requestId: 90,
+            policy: "interactive_approval_disabled",
+            threadId: "thread-1",
+            turnId: "turn-1",
+            itemId: "cmd-1",
+          },
+          {
+            method: "item/fileChange/requestApproval",
+            requestId: 91,
+            policy: "interactive_approval_disabled",
+            threadId: "thread-1",
+            turnId: "turn-1",
+            itemId: "file-1",
+          },
+          {
+            method: "item/permissions/requestApproval",
+            requestId: 92,
+            policy: "permission_grant_disabled",
+            threadId: "thread-1",
+            turnId: "turn-1",
+            itemId: "perm-1",
+          },
+          {
+            method: "mcpServer/elicitation/request",
+            requestId: 93,
+            policy: "mcp_elicitation_disabled",
+            threadId: "thread-1",
+            turnId: "turn-1",
+            itemId: undefined,
+          },
+        ],
       );
     } finally {
       await client.close();
     }
   });
 
-  it("treats stderr as diagnostic and rejects pending RPCs on exit", async () => {
+  it("separates stderr and closes pending RPC lifecycles on exit", async () => {
     const fake = new FakeAppServerProcess();
-    const diagnostics: string[] = [];
+    const stderr: string[] = [];
+    const lifecycleEvents: CodexAppServerLifecycleEvent[] = [];
     const exits: AppServerProcessStatus[] = [];
     const client = await CodexAppServerClient.start({
       cwd: "/workspace/project",
       spawn: createSpawn(fake),
       callbacks: {
-        onDiagnostic: (message) => diagnostics.push(message),
+        onStderr: (message) => stderr.push(message),
+        onLifecycle: (event) => lifecycleEvents.push(event),
         onExit: (status) => exits.push(status),
       },
     });
@@ -981,13 +1173,69 @@ describe("CodexAppServerClient", () => {
     );
 
     fake.sendStderr('{"method":"not-a-protocol-message"}\n');
-    await waitFor(() => diagnostics.length > 0, "stderr diagnostic callback");
+    await waitFor(() => stderr.length > 0, "stderr callback");
     fake.exit({ success: false, code: 7, signal: null });
 
     await rejects(pending, /App Server exited/);
     await waitFor(() => exits.length === 1, "exit callback");
-    match(diagnostics.join(""), /not-a-protocol-message/);
+    match(stderr.join(""), /not-a-protocol-message/);
+    deepStrictEqual(
+      lifecycleEvents.filter((event) => event.event === "rpc_failed").map(
+        ({ method, requestId, failure }) => ({ method, requestId, failure }),
+      ),
+      [{ method: "thread/start", requestId: 2, failure: "process_exit" }],
+    );
     deepStrictEqual(exits, [{ success: false, code: 7, signal: null }]);
+  });
+
+  it("drains buffered stdout before flushing delta aggregates on exit", async () => {
+    const fake = new FakeAppServerProcess();
+    const lifecycleEvents: CodexAppServerLifecycleEvent[] = [];
+    const client = await CodexAppServerClient.start({
+      cwd: "/workspace/project",
+      spawn: createSpawn(fake),
+      callbacks: {
+        onLifecycle: (event) => lifecycleEvents.push(event),
+      },
+    });
+
+    fake.resolveStatus({ success: false, code: 9, signal: null });
+    await Promise.resolve();
+    fake.send({
+      method: "item/reasoning/summaryTextDelta",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "reasoning-1",
+        delta: "private summary",
+      },
+    });
+    fake.closeStreams();
+
+    await waitFor(
+      () => lifecycleEvents.some((event) => event.event === "process_exited"),
+      "process exit after stdout drain",
+    );
+    const deltaIndex = lifecycleEvents.findIndex((event) =>
+      event.event === "item_delta"
+    );
+    const exitIndex = lifecycleEvents.findIndex((event) =>
+      event.event === "process_exited"
+    );
+    assertEquals(deltaIndex >= 0, true);
+    assertEquals(deltaIndex < exitIndex, true);
+    deepStrictEqual(lifecycleEvents[deltaIndex], {
+      level: "debug",
+      event: "item_delta",
+      method: "item/reasoning/summaryTextDelta",
+      threadId: "thread-1",
+      turnId: "turn-1",
+      itemId: "reasoning-1",
+      itemType: undefined,
+      deltaChunks: 1,
+      deltaLength: 15,
+    });
+    await client.close();
   });
 
   it("times out an unresponsive RPC and terminates the process", async () => {

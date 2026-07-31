@@ -3,12 +3,14 @@ import {
   type AppServerProcessStatus,
   type CodexAppServerCallbacks,
   CodexAppServerClient,
+  type CodexAppServerLifecycleEvent,
   type CodexAppServerOptions,
   type RequestUserInputEvent,
   type ThreadStartedEvent,
   type TurnCompletedEvent,
 } from "./codex-app-server.ts";
 import type { ActivityEvent } from "./activity-event.ts";
+import type { CodexTurnOptions } from "./codex-turn.ts";
 import type { RequestAuthority } from "./owner-policy.ts";
 import {
   describeCodexNotification,
@@ -38,6 +40,7 @@ export interface CodexRuntimeClient {
     threadId: string,
     prompt: string,
     authority: RequestAuthority,
+    options?: CodexTurnOptions,
   ): Promise<string>;
   interrupt(threadId: string, turnId: string): Promise<void>;
   listModels(): Promise<CodexModel[]>;
@@ -78,6 +81,10 @@ export interface CodexRuntimeOptions {
   delay?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   onFatal?: (error: Error) => MaybePromise<void>;
   onDiagnostic?: (message: string) => MaybePromise<void>;
+  onAppServerStderr?: (message: string) => MaybePromise<void>;
+  onAppServerLifecycle?: (
+    event: CodexAppServerLifecycleEvent,
+  ) => MaybePromise<void>;
   onTrace?: (trace: CodexRuntimeTrace) => MaybePromise<void>;
 }
 
@@ -138,6 +145,10 @@ export class CodexRuntime implements CodexPort {
   ) => Promise<void>;
   readonly #onFatal?: (error: Error) => MaybePromise<void>;
   readonly #onDiagnostic?: (message: string) => MaybePromise<void>;
+  readonly #onAppServerStderr?: (message: string) => MaybePromise<void>;
+  readonly #onAppServerLifecycle?: (
+    event: CodexAppServerLifecycleEvent,
+  ) => MaybePromise<void>;
   readonly #onTrace?: (trace: CodexRuntimeTrace) => MaybePromise<void>;
   readonly #activeTurns = new Map<string, ActiveTurn>();
   readonly #bufferedActivities = new Map<string, ActivityEvent[]>();
@@ -179,6 +190,8 @@ export class CodexRuntime implements CodexPort {
     this.#delay = options.delay ?? defaultDelay;
     this.#onFatal = options.onFatal;
     this.#onDiagnostic = options.onDiagnostic;
+    this.#onAppServerStderr = options.onAppServerStderr;
+    this.#onAppServerLifecycle = options.onAppServerLifecycle;
     this.#onTrace = options.onTrace;
   }
 
@@ -397,13 +410,19 @@ export class CodexRuntime implements CodexPort {
     prompt: string,
     authority: RequestAuthority,
     onActivity: (event: ActivityEvent) => void | Promise<void>,
+    options?: CodexTurnOptions,
   ): Promise<CodexTurnHandle> {
     const client = this.#requireClient();
     const clientToken = this.#clientToken;
     const pendingStart = this.#startPendingTurn(threadId);
     let activated = false;
     try {
-      const turnId = await client.startTurn(threadId, prompt, authority);
+      const turnId = await client.startTurn(
+        threadId,
+        prompt,
+        authority,
+        options,
+      );
       const { promise: completion, resolve } = Promise.withResolvers<
         TurnOutcome
       >();
@@ -486,10 +505,12 @@ export class CodexRuntime implements CodexPort {
 
   #callbacks(token: object): CodexAppServerCallbacks {
     return {
+      onLifecycle: (event) => this.#appServerLifecycle(event),
       onNotification: (event) => this.#handleNotification(token, event),
       onThreadStarted: (event) => this.#handleThreadStarted(token, event),
       onTurnCompleted: (event) => this.#handleTurnCompleted(token, event),
       onRequestUserInput: (event) => this.#handleRequestUserInput(token, event),
+      onStderr: (message) => this.#appServerStderr(message),
       onDiagnostic: (message) => this.#diagnostic(message),
       onExit: (status) => this.#handleExit(token, status),
     };
@@ -1203,6 +1224,30 @@ export class CodexRuntime implements CodexPort {
       if (result instanceof Promise) void result.catch(() => {});
     } catch {
       // Diagnostic callbacks must never affect runtime state transitions.
+    }
+  }
+
+  #appServerLifecycle(event: CodexAppServerLifecycleEvent): void {
+    if (!this.#onAppServerLifecycle) return;
+    try {
+      const result = this.#onAppServerLifecycle(event);
+      if (isPromiseLike(result)) {
+        void Promise.resolve(result).catch(() => {});
+      }
+    } catch {
+      // Logging callbacks must never affect runtime state.
+    }
+  }
+
+  #appServerStderr(message: string): void {
+    if (!this.#onAppServerStderr) return;
+    try {
+      const result = this.#onAppServerStderr(message);
+      if (isPromiseLike(result)) {
+        void Promise.resolve(result).catch(() => {});
+      }
+    } catch {
+      // Stderr observers must never affect runtime state.
     }
   }
 

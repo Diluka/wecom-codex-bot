@@ -13,6 +13,7 @@ import {
   type TurnOutcome,
 } from "./orchestrator.ts";
 import type { ActivityEvent } from "./activity-event.ts";
+import type { CodexTurnOptions } from "./codex-turn.ts";
 import type { RequestAuthority } from "./owner-policy.ts";
 import { WeComChatOutput } from "./chat-output.ts";
 import type {
@@ -132,6 +133,7 @@ interface StartedTurn {
   threadId: string;
   prompt: string;
   authority: RequestAuthority;
+  options?: CodexTurnOptions;
   onActivity: (event: ActivityEvent) => void | Promise<void>;
   turnId: string;
   resolve: (outcome: TurnOutcome) => void;
@@ -244,6 +246,7 @@ class FakeCodex implements CodexPort {
     prompt: string,
     authority: RequestAuthority,
     onActivity: (event: ActivityEvent) => void | Promise<void>,
+    options?: CodexTurnOptions,
   ): Promise<CodexTurnHandle> {
     this.startTurnAttempts++;
     const gate = this.startTurnGates.shift();
@@ -256,6 +259,7 @@ class FakeCodex implements CodexPort {
       threadId,
       prompt,
       authority,
+      ...(options ? { options } : {}),
       onActivity,
       turnId,
       resolve,
@@ -3993,6 +3997,34 @@ describe("ConversationOrchestrator", () => {
     assertEquals(groupChunks.includes("[tool] tools started"), true);
     assertEquals(groupChunks.includes("[tool] deno test\nstarted"), false);
     assertEquals(groupChunks.includes("[tool] git status\nstarted"), false);
+  });
+  it("requests reasoning summaries only for chats using summary tool format", async () => {
+    const singleSettings = outputSettings();
+    const groupSettings = outputSettings();
+    groupSettings.toolFormat = "summary";
+    const { codex, orchestrator } = setup({
+      outputSettings: singleSettings,
+      groupOutputSettings: groupSettings,
+    });
+    const single = orchestrator.handleText(
+      message("single:alice", "single-summary-option", "single work"),
+    );
+    const group = orchestrator.handleText(
+      message("group:room", "group-summary-option", "group work", "bob"),
+    );
+    await waitFor(() => codex.starts.length === 2);
+    const singleTurn = codex.starts.find((turn) =>
+      turn.prompt.includes("msgid: single-summary-option")
+    )!;
+    const groupTurn = codex.starts.find((turn) =>
+      turn.prompt.includes("msgid: group-summary-option")
+    )!;
+
+    assertEquals(singleTurn.options, undefined);
+    assertEquals(groupTurn.options, { summary: "auto" });
+    singleTurn.resolve({ status: "completed" });
+    groupTurn.resolve({ status: "completed" });
+    await Promise.all([single, group]);
   });
 
   it("traces every message in one debounced Codex request", async () => {

@@ -1,4 +1,5 @@
 import { readJsonLines } from "./jsonl.ts";
+import type { CodexTurnOptions } from "./codex-turn.ts";
 import type {
   CodexModel,
   CodexThreadSession,
@@ -13,6 +14,68 @@ import {
 type JsonObject = Record<string, unknown>;
 type RequestId = string | number;
 type EventCallback<T> = (event: T) => unknown;
+
+export type CodexAppServerLogLevel = "debug" | "info" | "warn" | "error";
+
+export interface CodexAppServerLifecycleEvent {
+  level: CodexAppServerLogLevel;
+  event:
+    | "process_started"
+    | "client_ready"
+    | "client_closing"
+    | "process_exited"
+    | "process_signal_sent"
+    | "process_signal_failed"
+    | "rpc_started"
+    | "rpc_completed"
+    | "rpc_failed"
+    | "thread_started"
+    | "turn_started"
+    | "turn_completed"
+    | "item_started"
+    | "item_completed"
+    | "item_delta"
+    | "notification_received"
+    | "server_warning"
+    | "server_error"
+    | "server_request_received"
+    | "server_request_declined"
+    | "server_request_answered"
+    | "server_request_unsupported"
+    | "server_request_failed"
+    | "protocol_invalid_json"
+    | "protocol_unknown_message"
+    | "stream_failed";
+  method?: string;
+  requestId?: RequestId;
+  threadId?: string;
+  turnId?: string;
+  itemId?: string;
+  itemType?: string;
+  status?: string;
+  elapsedMs?: number;
+  deltaLength?: number;
+  deltaChunks?: number;
+  summaryParts?: number;
+  contentParts?: number;
+  questionCount?: number;
+  errorCode?: number;
+  failure?:
+    | "timeout"
+    | "write_failed"
+    | "rpc_error"
+    | "process_exit"
+    | "handler_failed";
+  policy?:
+    | "interactive_approval_disabled"
+    | "permission_grant_disabled"
+    | "mcp_elicitation_disabled";
+  exitCode?: number;
+  signal?: string | null;
+  success?: boolean;
+  expected?: boolean;
+  pendingRequests?: number;
+}
 
 export interface AppServerProcessStatus {
   success: boolean;
@@ -68,10 +131,12 @@ export interface AdditionalContextEntry {
 }
 
 export interface CodexAppServerCallbacks {
+  onLifecycle?: EventCallback<CodexAppServerLifecycleEvent>;
   onNotification?: EventCallback<AppServerNotification>;
   onThreadStarted?: EventCallback<ThreadStartedEvent>;
   onTurnCompleted?: EventCallback<TurnCompletedEvent>;
   onRequestUserInput?: EventCallback<RequestUserInputEvent>;
+  onStderr?: EventCallback<string>;
   onDiagnostic?: EventCallback<string>;
   onExit?: EventCallback<AppServerProcessStatus>;
 }
@@ -155,9 +220,21 @@ export class CodexAppServerExitedError extends Error {
 }
 
 interface PendingRequest {
+  method: string;
+  startedAt: number;
   resolve: (result: unknown) => void;
   reject: (error: unknown) => void;
   timeoutId: ReturnType<typeof setTimeout>;
+}
+
+interface DeltaAggregate {
+  method: string;
+  threadId?: string;
+  turnId?: string;
+  itemId?: string;
+  itemType?: string;
+  chunks: number;
+  length: number;
 }
 
 const DEFAULT_RPC_TIMEOUT_MS = 30_000;
@@ -178,10 +255,14 @@ export class CodexAppServerClient {
   readonly #terminationGraceMs: number;
   readonly #pending = new Map<RequestId, PendingRequest>();
   readonly #completedMessages = new Map<string, CompletedAgentMessage[]>();
+  readonly #deltaAggregates = new Map<string, DeltaAggregate>();
+  readonly #stdoutDone: Promise<void>;
+  readonly #stderrDone: Promise<void>;
   readonly #exitPromise: Promise<AppServerProcessStatus>;
   #nextRequestId = 0;
   #exited = false;
   #stdinClosed = false;
+  #closing = false;
   #terminating = false;
   #forceKillTimer?: ReturnType<typeof setTimeout>;
 
@@ -201,14 +282,15 @@ export class CodexAppServerClient {
     this.#closeTimeoutMs = closeTimeoutMs;
     this.#terminationGraceMs = terminationGraceMs;
 
-    void this.#readStdout();
-    void this.#readStderr();
+    this.#stdoutDone = this.#readStdout();
+    this.#stderrDone = this.#readStderr();
     this.#exitPromise = this.#watchExit();
   }
 
   static async start(
     options: CodexAppServerOptions,
   ): Promise<CodexAppServerClient> {
+    const startedAt = performance.now();
     const environment = Deno.env.toObject();
     delete environment.WECOM_OWNER_USER_ID;
     delete environment.BOT_ID;
@@ -243,6 +325,7 @@ export class CodexAppServerClient {
         DEFAULT_TERMINATION_GRACE_MS,
       ),
     );
+    client.#lifecycle({ level: "info", event: "process_started" });
 
     try {
       await client.#request("initialize", {
@@ -257,6 +340,11 @@ export class CodexAppServerClient {
         },
       });
       await client.#writeMessage({ method: "initialized" });
+      client.#lifecycle({
+        level: "info",
+        event: "client_ready",
+        elapsedMs: elapsedMs(startedAt),
+      });
       return client;
     } catch (error) {
       await client.close();
@@ -338,6 +426,7 @@ export class CodexAppServerClient {
     threadId: string,
     text: string,
     authority: RequestAuthority,
+    options: CodexTurnOptions = {},
   ): Promise<string> {
     const additionalContext: Record<string, AdditionalContextEntry> = {
       wecom_owner_policy: {
@@ -350,6 +439,7 @@ export class CodexAppServerClient {
       input: [{ type: "text", text, text_elements: [] }],
       cwd: this.#cwd,
       additionalContext,
+      ...(options.summary ? { summary: options.summary } : {}),
     });
     return requiredNestedString(result, "turn", "id");
   }
@@ -359,6 +449,10 @@ export class CodexAppServerClient {
   }
 
   async close(): Promise<AppServerProcessStatus> {
+    if (!this.#closing) {
+      this.#closing = true;
+      this.#lifecycle({ level: "info", event: "client_closing" });
+    }
     if (!this.#stdinClosed) {
       this.#stdinClosed = true;
       try {
@@ -368,6 +462,12 @@ export class CodexAppServerClient {
           "closing App Server stdin",
         );
       } catch (error) {
+        this.#lifecycle({
+          level: "warn",
+          event: "stream_failed",
+          method: "stdin",
+          failure: "handler_failed",
+        });
         if (!this.#exited) {
           this.#diagnostic(`${errorMessage(error)}\n`);
           this.#terminate();
@@ -382,6 +482,12 @@ export class CodexAppServerClient {
         "waiting for App Server exit",
       );
     } catch (error) {
+      this.#lifecycle({
+        level: "warn",
+        event: "stream_failed",
+        method: "process_status",
+        failure: "handler_failed",
+      });
       this.#diagnostic(`${errorMessage(error)}\n`);
       this.#terminate();
       return await withTimeout(
@@ -398,18 +504,49 @@ export class CodexAppServerClient {
     }
 
     const id = ++this.#nextRequestId;
+    const startedAt = performance.now();
+    this.#lifecycle({
+      level: "debug",
+      event: "rpc_started",
+      method,
+      requestId: id,
+    });
     const response = new Promise<unknown>((resolve, reject) => {
       const timeoutId = setTimeout(() => {
         const pending = this.#takePending(id);
         if (!pending) return;
+        this.#lifecycle({
+          level: "warn",
+          event: "rpc_failed",
+          method: pending.method,
+          requestId: id,
+          elapsedMs: elapsedMs(pending.startedAt),
+          failure: "timeout",
+        });
         pending.reject(new CodexRpcTimeoutError(method, this.#rpcTimeoutMs));
         this.#terminate();
       }, this.#rpcTimeoutMs);
-      this.#pending.set(id, { resolve, reject, timeoutId });
+      this.#pending.set(id, {
+        method,
+        startedAt,
+        resolve,
+        reject,
+        timeoutId,
+      });
     });
 
     void this.#writeMessage({ method, id, params }).catch((error) => {
       const pending = this.#takePending(id);
+      if (pending) {
+        this.#lifecycle({
+          level: "warn",
+          event: "rpc_failed",
+          method: pending.method,
+          requestId: id,
+          elapsedMs: elapsedMs(pending.startedAt),
+          failure: "write_failed",
+        });
+      }
       pending?.reject(error);
     });
     return await response;
@@ -429,6 +566,10 @@ export class CodexAppServerClient {
         try {
           message = JSON.parse(line);
         } catch (error) {
+          this.#lifecycle({
+            level: "warn",
+            event: "protocol_invalid_json",
+          });
           this.#diagnostic(
             `Invalid App Server JSONL: ${errorMessage(error)}\n`,
           );
@@ -437,6 +578,12 @@ export class CodexAppServerClient {
         this.#handleMessage(message);
       }
     } catch (error) {
+      this.#lifecycle({
+        level: "warn",
+        event: "stream_failed",
+        method: "stdout",
+        failure: "handler_failed",
+      });
       this.#diagnostic(`App Server stdout failed: ${errorMessage(error)}\n`);
     }
   }
@@ -449,11 +596,17 @@ export class CodexAppServerClient {
         const { value, done } = await reader.read();
         if (done) break;
         const text = decoder.decode(value, { stream: true });
-        if (text) this.#diagnostic(text);
+        if (text) this.#stderr(text);
       }
       const tail = decoder.decode();
-      if (tail) this.#diagnostic(tail);
+      if (tail) this.#stderr(tail);
     } catch (error) {
+      this.#lifecycle({
+        level: "warn",
+        event: "stream_failed",
+        method: "stderr",
+        failure: "handler_failed",
+      });
       this.#diagnostic(`App Server stderr failed: ${errorMessage(error)}\n`);
     } finally {
       reader.releaseLock();
@@ -472,18 +625,39 @@ export class CodexAppServerClient {
         this.#handleResponse(message as JsonObject);
         break;
       case "unknown":
+        this.#lifecycle({ level: "warn", event: "protocol_unknown_message" });
         break;
     }
   }
 
   #handleResponse(message: JsonObject): void {
     const id = message.id;
-    if (!isRequestId(id)) return;
+    if (!isRequestId(id)) {
+      this.#lifecycle({ level: "warn", event: "protocol_unknown_message" });
+      return;
+    }
     const pending = this.#takePending(id);
-    if (!pending) return;
+    if (!pending) {
+      this.#lifecycle({
+        level: "debug",
+        event: "notification_received",
+        method: "unmatched_response",
+        requestId: id,
+      });
+      return;
+    }
 
     if (hasOwn(message, "error") && message.error != null) {
       const error = isObject(message.error) ? message.error : {};
+      this.#lifecycle({
+        level: "warn",
+        event: "rpc_failed",
+        method: pending.method,
+        requestId: id,
+        elapsedMs: elapsedMs(pending.startedAt),
+        failure: "rpc_error",
+        errorCode: typeof error.code === "number" ? error.code : undefined,
+      });
       pending.reject(
         new CodexRpcError(
           typeof error.code === "number" ? error.code : undefined,
@@ -494,6 +668,13 @@ export class CodexAppServerClient {
       );
       return;
     }
+    this.#lifecycle({
+      level: "debug",
+      event: "rpc_completed",
+      method: pending.method,
+      requestId: id,
+      elapsedMs: elapsedMs(pending.startedAt),
+    });
     pending.resolve(message.result);
   }
 
@@ -501,37 +682,76 @@ export class CodexAppServerClient {
     const id = message.id;
     const method = message.method;
     if (!isRequestId(id) || typeof method !== "string") return;
+    const context = lifecycleContext(message.params);
+    this.#lifecycle({
+      level: "debug",
+      event: "server_request_received",
+      method,
+      requestId: id,
+      ...context,
+    });
 
     try {
       switch (method) {
         case "item/commandExecution/requestApproval":
         case "item/fileChange/requestApproval":
-          this.#recordDecline(method, "interactive approvals are disabled");
+          this.#recordDecline(
+            method,
+            id,
+            "interactive_approval_disabled",
+            context,
+          );
           await this.#writeMessage({ id, result: { decision: "decline" } });
+          this.#recordServerRequestAnswer(method, id, context);
           return;
         case "execCommandApproval":
         case "applyPatchApproval":
-          this.#recordDecline(method, "interactive approvals are disabled");
+          this.#recordDecline(
+            method,
+            id,
+            "interactive_approval_disabled",
+            context,
+          );
           await this.#writeMessage({ id, result: { decision: "denied" } });
+          this.#recordServerRequestAnswer(method, id, context);
           return;
         case "item/permissions/requestApproval":
-          this.#recordDecline(method, "permission grants are disabled");
+          this.#recordDecline(
+            method,
+            id,
+            "permission_grant_disabled",
+            context,
+          );
           await this.#writeMessage({
             id,
             result: { permissions: {}, scope: "turn" },
           });
+          this.#recordServerRequestAnswer(method, id, context);
           return;
         case "mcpServer/elicitation/request":
-          this.#recordDecline(method, "MCP elicitation is disabled");
+          this.#recordDecline(
+            method,
+            id,
+            "mcp_elicitation_disabled",
+            context,
+          );
           await this.#writeMessage({
             id,
             result: { action: "decline", content: null, _meta: null },
           });
+          this.#recordServerRequestAnswer(method, id, context);
           return;
         case "item/tool/requestUserInput":
           await this.#handleRequestUserInput(id, message.params);
           return;
         default:
+          this.#lifecycle({
+            level: "warn",
+            event: "server_request_unsupported",
+            method,
+            requestId: id,
+            ...context,
+          });
           await this.#writeMessage({
             id,
             error: {
@@ -541,6 +761,14 @@ export class CodexAppServerClient {
           });
       }
     } catch (error) {
+      this.#lifecycle({
+        level: "error",
+        event: "server_request_failed",
+        method,
+        requestId: id,
+        failure: "handler_failed",
+        ...context,
+      });
       this.#diagnostic(`Failed to answer ${method}: ${errorMessage(error)}\n`);
     }
   }
@@ -564,6 +792,16 @@ export class CodexAppServerClient {
       });
     }
     await this.#writeMessage({ id, result: { answers: {} } });
+    this.#lifecycle({
+      level: "info",
+      event: "server_request_answered",
+      method: "item/tool/requestUserInput",
+      requestId: id,
+      ...(threadId ? { threadId } : {}),
+      ...(turnId ? { turnId } : {}),
+      ...(itemId ? { itemId } : {}),
+      questionCount: questions.length,
+    });
 
     if (threadId && turnId) {
       void this.interrupt(threadId, turnId).catch((error) => {
@@ -581,6 +819,20 @@ export class CodexAppServerClient {
     const params = isObject(message.params) ? message.params : {};
     if (typeof method !== "string") return;
 
+    const lifecycle = notificationLifecycleEvent(method, params);
+    if (lifecycle.event === "item_delta") {
+      this.#recordDelta(lifecycle);
+    } else {
+      if (lifecycle.event === "item_completed") {
+        this.#flushDeltaAggregates(lifecycle);
+      } else if (lifecycle.event === "turn_completed") {
+        this.#flushDeltaAggregates({
+          threadId: lifecycle.threadId,
+          turnId: lifecycle.turnId,
+        });
+      }
+      this.#lifecycle(lifecycle);
+    }
     this.#emit(this.#callbacks.onNotification, { method, params });
 
     switch (method) {
@@ -653,16 +905,37 @@ export class CodexAppServerClient {
   async #watchExit(): Promise<AppServerProcessStatus> {
     const status = await this.#process.status;
     this.#exited = true;
+    await Promise.all([this.#stdoutDone, this.#stderrDone]);
     if (this.#forceKillTimer !== undefined) {
       clearTimeout(this.#forceKillTimer);
       this.#forceKillTimer = undefined;
     }
+    const pendingRequests = this.#pending.size;
+    const expected = this.#closing;
     const error = new CodexAppServerExitedError(status);
-    for (const pending of this.#pending.values()) {
+    for (const [requestId, pending] of this.#pending) {
       clearTimeout(pending.timeoutId);
+      this.#lifecycle({
+        level: "warn",
+        event: "rpc_failed",
+        method: pending.method,
+        requestId,
+        elapsedMs: elapsedMs(pending.startedAt),
+        failure: "process_exit",
+      });
       pending.reject(error);
     }
     this.#pending.clear();
+    this.#flushDeltaAggregates();
+    this.#lifecycle({
+      level: expected && status.success ? "info" : "warn",
+      event: "process_exited",
+      exitCode: status.code,
+      signal: status.signal,
+      success: status.success,
+      expected,
+      pendingRequests,
+    });
     this.#emit(this.#callbacks.onExit, status);
     return status;
   }
@@ -680,7 +953,18 @@ export class CodexAppServerClient {
     this.#terminating = true;
     try {
       this.#process.kill("SIGTERM");
+      this.#lifecycle({
+        level: "warn",
+        event: "process_signal_sent",
+        signal: "SIGTERM",
+      });
     } catch (error) {
+      this.#lifecycle({
+        level: "error",
+        event: "process_signal_failed",
+        signal: "SIGTERM",
+        failure: "handler_failed",
+      });
       this.#diagnostic(
         `Failed to terminate Codex App Server: ${errorMessage(error)}\n`,
       );
@@ -690,7 +974,18 @@ export class CodexAppServerClient {
       if (this.#exited) return;
       try {
         this.#process.kill("SIGKILL");
+        this.#lifecycle({
+          level: "warn",
+          event: "process_signal_sent",
+          signal: "SIGKILL",
+        });
       } catch (error) {
+        this.#lifecycle({
+          level: "error",
+          event: "process_signal_failed",
+          signal: "SIGKILL",
+          failure: "handler_failed",
+        });
         this.#diagnostic(
           `Failed to kill Codex App Server: ${errorMessage(error)}\n`,
         );
@@ -728,9 +1023,197 @@ export class CodexAppServerClient {
     }
   }
 
-  #recordDecline(method: string, reason: string): void {
-    this.#diagnostic(`Declined ${method}: ${reason}\n`);
+  #stderr(message: string): void {
+    const callback = this.#callbacks.onStderr;
+    if (!callback) return;
+    try {
+      const result = callback(message);
+      if (result instanceof Promise) void result.catch(() => {});
+    } catch {
+      // Stderr observers must never affect protocol processing.
+    }
   }
+
+  #recordDelta(event: CodexAppServerLifecycleEvent): void {
+    const method = event.method;
+    if (!method) return;
+    const key = JSON.stringify([
+      method,
+      event.threadId,
+      event.turnId,
+      event.itemId,
+    ]);
+    const aggregate = this.#deltaAggregates.get(key) ?? {
+      method,
+      threadId: event.threadId,
+      turnId: event.turnId,
+      itemId: event.itemId,
+      itemType: event.itemType,
+      chunks: 0,
+      length: 0,
+    };
+    aggregate.chunks++;
+    aggregate.length += event.deltaLength ?? 0;
+    this.#deltaAggregates.set(key, aggregate);
+  }
+
+  #flushDeltaAggregates(
+    scope: Pick<
+      CodexAppServerLifecycleEvent,
+      "threadId" | "turnId" | "itemId"
+    > = {},
+  ): void {
+    for (const [key, aggregate] of this.#deltaAggregates) {
+      if (scope.threadId && aggregate.threadId !== scope.threadId) continue;
+      if (scope.turnId && aggregate.turnId !== scope.turnId) continue;
+      if (scope.itemId && aggregate.itemId !== scope.itemId) continue;
+      this.#deltaAggregates.delete(key);
+      this.#lifecycle({
+        level: "debug",
+        event: "item_delta",
+        method: aggregate.method,
+        threadId: aggregate.threadId,
+        turnId: aggregate.turnId,
+        itemId: aggregate.itemId,
+        itemType: aggregate.itemType,
+        deltaChunks: aggregate.chunks,
+        deltaLength: aggregate.length,
+      });
+    }
+  }
+
+  #lifecycle(event: CodexAppServerLifecycleEvent): void {
+    const callback = this.#callbacks.onLifecycle;
+    if (!callback) return;
+    try {
+      const result = callback(event);
+      if (result instanceof Promise) void result.catch(() => {});
+    } catch {
+      // Logging must never affect protocol processing.
+    }
+  }
+
+  #recordDecline(
+    method: string,
+    requestId: RequestId,
+    policy: NonNullable<CodexAppServerLifecycleEvent["policy"]>,
+    context: ReturnType<typeof lifecycleContext>,
+  ): void {
+    this.#lifecycle({
+      level: "warn",
+      event: "server_request_declined",
+      method,
+      requestId,
+      policy,
+      ...context,
+    });
+  }
+
+  #recordServerRequestAnswer(
+    method: string,
+    requestId: RequestId,
+    context: ReturnType<typeof lifecycleContext>,
+  ): void {
+    this.#lifecycle({
+      level: "debug",
+      event: "server_request_answered",
+      method,
+      requestId,
+      ...context,
+    });
+  }
+}
+
+type LifecycleContext = Pick<
+  CodexAppServerLifecycleEvent,
+  | "threadId"
+  | "turnId"
+  | "itemId"
+  | "itemType"
+  | "status"
+  | "deltaLength"
+  | "summaryParts"
+  | "contentParts"
+  | "questionCount"
+>;
+
+function lifecycleContext(rawParams: unknown): LifecycleContext {
+  const params = isObject(rawParams) ? rawParams : {};
+  const thread = isObject(params.thread) ? params.thread : {};
+  const turn = isObject(params.turn) ? params.turn : {};
+  const item = isObject(params.item) ? params.item : {};
+  const delta = typeof params.delta === "string"
+    ? params.delta
+    : typeof params.deltaBase64 === "string"
+    ? params.deltaBase64
+    : undefined;
+  const questions = Array.isArray(params.questions) ? params.questions : [];
+
+  return compactLifecycleContext({
+    threadId: optionalString(params.threadId) ?? optionalString(thread.id),
+    turnId: optionalString(params.turnId) ?? optionalString(turn.id),
+    itemId: optionalString(params.itemId) ?? optionalString(item.id),
+    itemType: optionalString(item.type),
+    status: optionalString(params.status) ?? optionalString(turn.status) ??
+      optionalString(item.status),
+    deltaLength: delta?.length,
+    summaryParts: Array.isArray(item.summary) ? item.summary.length : undefined,
+    contentParts: Array.isArray(item.content) ? item.content.length : undefined,
+    questionCount: questions.length > 0 ? questions.length : undefined,
+  });
+}
+
+function compactLifecycleContext(context: LifecycleContext): LifecycleContext {
+  return Object.fromEntries(
+    Object.entries(context).filter(([, value]) => value !== undefined),
+  ) as LifecycleContext;
+}
+
+function notificationLifecycleEvent(
+  method: string,
+  params: JsonObject,
+): CodexAppServerLifecycleEvent {
+  const context = lifecycleContext(params);
+  switch (method) {
+    case "thread/started":
+      return { level: "info", event: "thread_started", method, ...context };
+    case "turn/started":
+      return { level: "info", event: "turn_started", method, ...context };
+    case "turn/completed":
+      return {
+        level: context.status === "failed" ? "warn" : "info",
+        event: "turn_completed",
+        method,
+        ...context,
+      };
+    case "item/started":
+      return { level: "debug", event: "item_started", method, ...context };
+    case "item/completed":
+      return { level: "debug", event: "item_completed", method, ...context };
+    case "warning":
+    case "guardianWarning":
+    case "configWarning":
+      return { level: "warn", event: "server_warning", method, ...context };
+    case "error":
+      return { level: "error", event: "server_error", method, ...context };
+    default: {
+      const delta = isDeltaNotification(method);
+      return {
+        level: "debug",
+        event: delta ? "item_delta" : "notification_received",
+        method,
+        ...context,
+      };
+    }
+  }
+}
+
+function isDeltaNotification(method: string): boolean {
+  return method.endsWith("Delta") || method.endsWith("/delta");
+}
+
+function elapsedMs(startedAt: number): number {
+  return Math.max(0, Math.round(performance.now() - startedAt));
 }
 
 function isObject(value: unknown): value is JsonObject {

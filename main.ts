@@ -7,6 +7,8 @@ import {
   closeLogTransport,
   createLogger,
   createLogTransport,
+  logAppServerLifecycle,
+  logAppServerStderr,
   logRequestStatus,
   type LogTransport,
   summarizeRequest,
@@ -121,7 +123,14 @@ const shutdown = (code: number, signal?: ShutdownSignal): Promise<void> => {
 const runtime = new CodexRuntime({
   workspace: config.workspace,
   developerInstructions: buildOwnerDeveloperInstructions(config.ownerUserId),
-  onTrace: (trace) =>
+  onAppServerLifecycle: (event) => logAppServerLifecycle(codexLogger, event),
+  onAppServerStderr: (message) => logAppServerStderr(codexLogger, message),
+  onTrace: (trace) => {
+    if (
+      trace.method.endsWith("Delta") || trace.method.endsWith("/delta")
+    ) {
+      return;
+    }
     codexLogger.debug({
       method: trace.method,
       decision: trace.decision,
@@ -130,9 +139,10 @@ const runtime = new CodexRuntime({
       thread_id: trace.threadId,
       turn_id: trace.turnId,
       tag: trace.tag,
-    }, "notification_route"),
+    }, "notification_route");
+  },
   onDiagnostic: (message) =>
-    codexLogger.info({ source: "app_server" }, message.trimEnd()),
+    codexLogger.warn({ source: "runtime" }, message.trimEnd()),
   onFatal: (error) => {
     codexLogger.error({ error }, "fatal");
     return shutdown(1);
@@ -174,7 +184,8 @@ const orchestrator = new ConversationOrchestrator({
   groupOutputSettings: config.groupOutputSettings,
   onError: (error) => requestLogger.error({ error }, "error"),
   onRequestStatus: (event) => logRequestStatus(requestLogger, event),
-  onOutputDecision: (event) =>
+  onOutputDecision: (event) => {
+    if (event.tag === "TOOL_RESULT") return;
     outputLogger.debug({
       tag: event.tag,
       delivery: event.delivery,
@@ -182,7 +193,8 @@ const orchestrator = new ConversationOrchestrator({
       reason: event.reason,
       thread_id: event.threadId,
       turn_id: event.turnId,
-    }, "activity_decision"),
+    }, "activity_decision");
+  },
   summarizeRequest: (text) => summarizeRequest(text, [config.botSecret]),
 });
 context.orchestrator = orchestrator;

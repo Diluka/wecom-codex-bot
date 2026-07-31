@@ -133,8 +133,11 @@ OUTPUT_FORMAT_TOOL=merge_same
 `summary` 是明确的工具详情隐藏模式。它不会读取 `ActivityEvent.summary` 中记录的
 命令、查询或工具名称，也不会调用模型或根据工具列表自行生成摘要。
 
-它只沿用 App Server 通知 `item/reasoning/summaryTextDelta`。该通知已作为
-`CONTENT` 流式输出。普通 commentary 目前也属于 `CONTENT`，行为保持不变。
+它只沿用 App Server 通知
+`item/reasoning/summaryTextDelta`。当最终生效的工具格式为 `summary`
+时，机器人会在对应的 `turn/start` 请求中显式传入 `summary: "auto"`，
+再把该通知作为 `CONTENT` 流式输出。其他三种工具格式不传这个字段，继续使用现有
+Codex 配置和模型默认值。普通 commentary 目前也属于 `CONTENT`，行为保持不变。
 
 摘要仍服从 `OUTPUT_LEVEL_CONTENT` 和 `OUTPUT_LABEL_CONTENT`。如果 App Server
 没有返回 reasoning summary，工具活动就保持静默。工具名称、命令、参数、状态和结果
@@ -199,13 +202,13 @@ OUTPUT_GROUP_FORMAT_TOOL=summary
 方括号中的时间是带本地时区偏移的 ISO 时间，不是固定 UTC 时间。`INFO` 是 Pino
 级别，第二个方括号是 scope。终端日志只有以下五个 scope：
 
-| scope       | 内容                                          |
-| ----------- | --------------------------------------------- |
-| `request`   | 普通文本请求的状态、计数和编排错误。          |
-| `codex`     | Codex App Server 的诊断、通知路由和致命错误。 |
-| `wecom`     | 企业微信鉴权、SDK 日志、网关错误和致命错误。  |
-| `output`    | 输出过滤决策、企业微信流式输出和发送错误。    |
-| `lifecycle` | 启动、恢复、信号、清理和关闭状态。            |
+| scope       | 内容                                                 |
+| ----------- | ---------------------------------------------------- |
+| `request`   | 普通文本请求的状态、计数和编排错误。                 |
+| `codex`     | Codex App Server 的进程、RPC、事件、通知路由和错误。 |
+| `wecom`     | 企业微信鉴权、SDK 日志、网关错误和致命错误。         |
+| `output`    | 输出过滤决策、企业微信流式输出和发送错误。           |
+| `lifecycle` | 启动、恢复、信号、清理和关闭状态。                   |
 
 同一普通文本请求的每个状态都会重复携带消息中的真实 `chat_id`、`user_id` 和
 `msg_id`；获得 Codex 标识后，后续状态还会重复真实 `thread_id` 和 `turn_id`，不会
@@ -218,16 +221,29 @@ Unicode 字素簇截取前 10 个，超长时追加 `…`，不会把完整聊�
 内建命令 `/help`、`/status`、`/model`、`/effort`、`/new`、`/stop` 和不支持的消息
 类型不产生 request 状态。未知斜杠命令仍按普通文本请求处理。
 
-`debug` 会额外记录两类安全的结构化决策：
+`info` 会记录 App Server 进程就绪和退出、thread 启动、turn 启动和终态。
+`warn`/`error` 用于 RPC 失败或超时、协议异常、策略拒绝、失败
+turn、非预期进程退出和无法恢复的 fatal。App Server 原始 stderr 记为 `debug`，
+只记录 chunk 长度而不记录原文；客户端或 runtime 自身诊断记为 `warn`。
 
-- `codex/notification_route`：App Server 通知的方法名、thread/turn、runtime
-  generation，以及通知被投递、缓冲或忽略的原因。
+`debug` 会额外记录下列结构化细节：
+
+- `codex/rpc_started`、`rpc_completed`：RPC 方法、request ID 和耗时。
+- `codex/item_started`、`item_completed`、`item_delta`：item
+  ID、类型、状态，以及 delta 长度或 reasoning summary/content 分段数。同一
+  method/thread/turn/item 的 delta 会累计 chunk 数和总长度，并在 item、turn
+  完成或进程退出时只记录一次。
+- `codex/notification_route`：通知的方法名、thread/turn、runtime
+  generation，以及通知被投递、缓冲或忽略的原因；高频 delta 不逐块重复记录。
 - `output/activity_decision`：活动标签、投递类型，以及内容被渲染或抑制的原因；例如
-  `tool_format_summary`、`level_off`、`line_complete`。
+  `tool_format_summary`、`level_off`、`line_complete`。此外，高频 `TOOL_RESULT`
+  不逐块重复记录。
 
-DEBUG 日志不会记录聊天正文、reasoning summary 文本、命令、参数、工具输出、
-`toolId` 或具体 `itemId`。因此可用下面的配置判断 App Server 是否发出了 reasoning
-summary，以及它是否在输出管线中被过滤：
+机器人新增的 Codex 生命周期、决策和 App Server stderr 日志不会记录聊天正文、
+reasoning summary 文本、命令、参数或工具输出；它们只记录功能性元数据。企业微信
+SDK 属于上游原始诊断流，仍可能包含文本片段。所有经过 Pino 的消息和字符串字段都会
+先单行化、递归脱敏，再按 Unicode 字素簇截断到最多 100 个字符。因此可用下面的
+配置判断 App Server 是否发出了 reasoning summary，以及它是否在输出管线中被过滤：
 
 ```dotenv
 LOG_LEVEL=debug
@@ -243,7 +259,7 @@ OUTPUT_FORMAT_TOOL=summary
 `OUTPUT_*` 不影响运行日志。`logs/` 是本地运行状态并已被 Git 忽略；文件中仍包含
 排障所需的 chat/thread/turn 标识，不应提交或公开。
 
-所有结构化字段和消息都会在 Pino 边界递归脱敏。
+所有结构化字段和消息都会在 Pino 边界递归脱敏并限制字符串长度。
 
 当前实验配置把 `.env` 放在 Codex 工作区内，因此 Codex 可以读取机器人
 Secret。发送到企业微信的内容会脱敏，但这不构成可靠的 Secret 隔离。
