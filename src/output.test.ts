@@ -12,8 +12,17 @@ import {
   utf8Tail,
   WeComSink,
 } from "./output.ts";
+import type { ProgressTail } from "./progress-tail.ts";
 
 const encoder = new TextEncoder();
+const COMPLETED_SUMMARY = "*已完成上一阶段，继续处理中…*";
+
+function tail(section: string, index: number): ProgressTail {
+  return {
+    key: `${section}:${index}`,
+    completedText: COMPLETED_SUMMARY,
+  };
+}
 
 interface ScheduledTimer {
   at: number;
@@ -365,6 +374,141 @@ describe("WeComSink", () => {
 });
 
 describe("StreamController", () => {
+  it("refreshes one summary key and seals each completed key in place", async () => {
+    const calls: SendCall[] = [];
+    const controller = new StreamController({
+      conversationKey: "single:alice",
+      frame: { key: "single:alice" },
+      sink: recordingSink(calls),
+      streamIdFactory: () => "stream-1",
+    });
+
+    controller.appendBlock("*first*", tail("item", 0));
+    controller.appendBlock("*first updated*", tail("item", 0));
+    assertEquals(await controller.flush(), true);
+    assertEquals(calls.at(-1)?.content, "*first updated*");
+
+    controller.appendBlock("*second*", tail("item", 1));
+    assertEquals(await controller.flush(), true);
+    assertEquals(
+      calls.at(-1)?.content,
+      `${COMPLETED_SUMMARY}\n*second*`,
+    );
+
+    controller.appendBlock("*third*", tail("item", 2));
+    assertEquals(await controller.finish(), true);
+    assertEquals(
+      calls.at(-1)?.content,
+      `${COMPLETED_SUMMARY}\n${COMPLETED_SUMMARY}\n*third*`,
+    );
+  });
+
+  it("freezes raw summary text when ordinary visible progress interrupts it", async () => {
+    const calls: SendCall[] = [];
+    const controller = new StreamController({
+      conversationKey: "single:alice",
+      frame: { key: "single:alice" },
+      sink: recordingSink(calls),
+      streamIdFactory: () => "stream-1",
+    });
+
+    controller.appendBlock("*first*", tail("item", 0));
+    controller.appendBlock("ordinary commentary");
+    controller.appendBlock("*first updated*", tail("item", 0));
+    assertEquals(await controller.finish(), true);
+
+    assertEquals(
+      calls.at(-1)?.content,
+      "*first*\nordinary commentary\n*first updated*",
+    );
+  });
+
+  it("appends and retracks a same-key summary after an exact-tail mismatch", async () => {
+    const calls: SendCall[] = [];
+    const controller = new StreamController({
+      conversationKey: "single:alice",
+      frame: { key: "single:alice" },
+      sink: recordingSink(calls),
+      maxBufferBytes: 32,
+      streamIdFactory: () => "stream-1",
+    });
+    const first = `${"x".repeat(40)}raw summary`;
+
+    controller.appendBlock(first, tail("item", 0));
+    controller.appendBlock("same-key update", tail("item", 0));
+    assertEquals(await controller.flush(), true);
+    assertMatch(calls.at(-1)?.content ?? "", /raw summary\nsame-key update$/);
+
+    controller.appendBlock("latest update", tail("item", 0));
+    assertEquals(await controller.finish(), true);
+    assertMatch(calls.at(-1)?.content ?? "", /raw summary\nlatest update$/);
+  });
+
+  it("does not invent a completion marker after a different-key tail mismatch", async () => {
+    const calls: SendCall[] = [];
+    const controller = new StreamController({
+      conversationKey: "single:alice",
+      frame: { key: "single:alice" },
+      sink: recordingSink(calls),
+      maxBufferBytes: 32,
+      streamIdFactory: () => "stream-1",
+    });
+    const first = `${"x".repeat(40)}raw summary`;
+
+    controller.appendBlock(first, tail("item", 0));
+    controller.appendBlock("second summary", tail("item", 1));
+    assertEquals(await controller.finish(), true);
+
+    assertMatch(calls.at(-1)?.content ?? "", /raw summary\nsecond summary$/);
+    assertEquals(calls.at(-1)?.content.includes(COMPLETED_SUMMARY), false);
+  });
+
+  it("seals a tracked summary before scheduled stream rotation", async () => {
+    const calls: SendCall[] = [];
+    const timers = new FakeTimers();
+    const ids = ["stream-1", "stream-2"];
+    const controller = new StreamController({
+      conversationKey: "single:alice",
+      frame: { key: "single:alice" },
+      sink: recordingSink(calls),
+      timers,
+      streamIdFactory: () => ids.shift() ?? "unexpected",
+    });
+
+    controller.appendBlock("*live summary*", tail("item", 0));
+    await timers.advance(9 * 60_000);
+
+    const oldFinal = calls.find(({ streamId, finish }) =>
+      streamId === "stream-1" && finish
+    );
+    assertEquals(oldFinal?.content, COMPLETED_SUMMARY);
+    assertEquals(await controller.finish(), true);
+  });
+
+  it("preserves a mismatched raw summary when scheduled rotation cannot seal it", async () => {
+    const calls: SendCall[] = [];
+    const timers = new FakeTimers();
+    const ids = ["stream-1", "stream-2"];
+    const controller = new StreamController({
+      conversationKey: "single:alice",
+      frame: { key: "single:alice" },
+      sink: recordingSink(calls),
+      maxBufferBytes: 32,
+      timers,
+      streamIdFactory: () => ids.shift() ?? "unexpected",
+    });
+    const rawSummary = `${"x".repeat(40)}raw summary`;
+
+    controller.appendBlock(rawSummary, tail("item", 0));
+    await timers.advance(9 * 60_000);
+
+    const oldFinal = calls.find(({ streamId, finish }) =>
+      streamId === "stream-1" && finish
+    );
+    assertEquals(oldFinal?.content, utf8Tail(rawSummary, 32));
+    assertEquals(await controller.finish(), true);
+  });
+
   it("replaces consecutive logical tail blocks and preserves their separator", async () => {
     const calls: SendCall[] = [];
     const controller = new StreamController({

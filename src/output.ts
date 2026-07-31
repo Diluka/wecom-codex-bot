@@ -1,3 +1,5 @@
+import type { ProgressTail } from "./progress-tail.ts";
+
 export const DEFAULT_TAIL_BYTES = 16 * 1024;
 export const DEFAULT_SPLIT_BYTES = 18 * 1024;
 export const DEFAULT_MAX_PARTS = 4;
@@ -15,6 +17,7 @@ export const CONTINUATION_MARKER = "[Progress continues in a new stream]";
 
 const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
+const LEGACY_PROGRESS_TAIL_KEY = "\0legacy-replaceable-tail";
 const encoder = new TextEncoder();
 
 function byteLength(value: string): number {
@@ -568,6 +571,23 @@ function appendProgressSnapshot(
   target.append(progressBlockSeparator(target.snapshot(), content) + content);
 }
 
+interface TrackedProgressTail extends ProgressTail {
+  content: string;
+}
+
+function normalizeProgressTail(
+  content: string,
+  progressTail: ProgressTail | boolean | undefined,
+): ProgressTail | undefined {
+  if (progressTail === true) {
+    return {
+      key: LEGACY_PROGRESS_TAIL_KEY,
+      completedText: content,
+    };
+  }
+  return progressTail || undefined;
+}
+
 export interface StreamControllerOptions {
   conversationKey: string;
   frame: unknown;
@@ -607,7 +627,7 @@ export class StreamController {
   #finished = false;
   #rotationAttempts = 0;
   #rotationDisabled = false;
-  #replaceableTail?: { content: string };
+  #replaceableTail?: TrackedProgressTail;
 
   constructor(options: StreamControllerOptions) {
     this.#conversationKey = options.conversationKey;
@@ -642,26 +662,39 @@ export class StreamController {
     return this;
   }
 
-  appendBlock(content: string, replaceTail = false): this {
+  appendBlock(
+    content: string,
+    progressTail?: ProgressTail | boolean,
+  ): this {
     if (this.#finished) throw new Error("stream is already finished");
 
+    const nextTail = normalizeProgressTail(content, progressTail);
     const previous = this.#replaceableTail;
-    if (replaceTail && previous) {
-      const replacement = this.#buffer.replaceTailBlock(
-        previous.content,
-        content,
-      );
-      if (replacement !== null) {
-        this.#replaceableTail = { content: replacement };
-        this.#afterWrite();
-        return this;
+    if (nextTail && previous) {
+      if (nextTail.key === previous.key) {
+        const replacement = this.#buffer.replaceTailBlock(
+          previous.content,
+          content,
+        );
+        if (replacement !== null) {
+          this.#replaceableTail = { ...nextTail, content: replacement };
+          this.#afterWrite();
+          return this;
+        }
+      } else {
+        this.#buffer.replaceTailBlock(
+          previous.content,
+          previous.completedText,
+        );
       }
     }
 
     const separator = progressBlockSeparator(this.#buffer.snapshot(), content);
     const block = separator + content;
     this.#buffer.append(block);
-    this.#replaceableTail = replaceTail ? { content: block } : undefined;
+    this.#replaceableTail = nextTail
+      ? { ...nextTail, content: block }
+      : undefined;
     this.#afterWrite();
     return this;
   }
@@ -743,6 +776,13 @@ export class StreamController {
     if (this.#finished) return;
     this.#clearFlushTimer();
     const previousBuffer = this.#buffer;
+    const previousTail = this.#replaceableTail;
+    if (previousTail) {
+      previousBuffer.replaceTailBlock(
+        previousTail.content,
+        previousTail.completedText,
+      );
+    }
     const nextBuffer = new ProgressBuffer(this.#bufferOptions);
     this.#buffer = nextBuffer;
     this.#replaceableTail = undefined;
