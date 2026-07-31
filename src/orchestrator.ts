@@ -1588,7 +1588,7 @@ export class ConversationOrchestrator {
         await this.#output.send(turnOutput.message, rendered);
       }
     } else {
-      turnOutput.progress.append(rendered, decision.replaceProgressTail);
+      turnOutput.progress.append(rendered, decision.progressTail !== undefined);
     }
     if (activity.tag === "SHUTDOWN") turnOutput.shutdownHandled = true;
   }

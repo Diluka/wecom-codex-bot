@@ -148,36 +148,50 @@ describe("TurnOutputPipeline", () => {
     });
   });
 
-  it("renders complete replaceable snapshots for reasoning summary deltas", () => {
+  it("renders keyed italic snapshots for reasoning summary deltas", () => {
     const pipeline = new TurnOutputPipeline(
       outputSettings({ toolFormat: "summary" }),
     );
 
     assertEquals(
-      pipeline.applyWithDecision(reasoningSummary("Checking ")),
+      pipeline.applyWithDecision(reasoningSummary("**Checking tests**", 0)),
       {
-        output: "[content] Checking ",
+        output: "[content] *Checking tests*",
         disposition: "rendered",
         reason: "full",
-        replaceProgressTail: true,
-      },
-    );
-    assertEquals(
-      pipeline.applyWithDecision(reasoningSummary("tests")),
-      {
-        output: "[content] Checking tests",
-        disposition: "rendered",
-        reason: "full",
-        replaceProgressTail: true,
+        progressTail: {
+          key: JSON.stringify(["reasoning-1", 0]),
+          completedText: "[content] *已完成上一阶段，继续处理中…*",
+        },
       },
     );
     assertEquals(
       pipeline.applyWithDecision(reasoningSummary("**Running**", 1)),
       {
-        output: "[content] **Running**",
+        output: "[content] *Running*",
         disposition: "rendered",
         reason: "full",
-        replaceProgressTail: true,
+        progressTail: {
+          key: JSON.stringify(["reasoning-1", 1]),
+          completedText: "[content] *已完成上一阶段，继续处理中…*",
+        },
+      },
+    );
+    assertEquals(
+      new TurnOutputPipeline(
+        outputSettings({
+          labels: { CONTENT: "hide" },
+          toolFormat: "summary",
+        }),
+      ).applyWithDecision(reasoningSummary("**Hidden label**")),
+      {
+        output: "*Hidden label*",
+        disposition: "rendered",
+        reason: "full",
+        progressTail: {
+          key: JSON.stringify(["reasoning-1", 0]),
+          completedText: "*已完成上一阶段，继续处理中…*",
+        },
       },
     );
     assertEquals(
@@ -189,6 +203,85 @@ describe("TurnOutputPipeline", () => {
         disposition: "rendered",
         reason: "full",
       },
+    );
+  });
+
+  it("waits for a complete outer bold pair before italicizing a snapshot", () => {
+    const pipeline = new TurnOutputPipeline(
+      outputSettings({ toolFormat: "summary" }),
+    );
+
+    assertEquals(
+      pipeline.applyWithDecision(reasoningSummary("**Checking ")),
+      {
+        output: "[content] **Checking ",
+        disposition: "rendered",
+        reason: "full",
+        progressTail: {
+          key: JSON.stringify(["reasoning-1", 0]),
+          completedText: "[content] *已完成上一阶段，继续处理中…*",
+        },
+      },
+    );
+    assertEquals(
+      pipeline.applyWithDecision(reasoningSummary("tests**")),
+      {
+        output: "[content] *Checking tests*",
+        disposition: "rendered",
+        reason: "full",
+        progressTail: {
+          key: JSON.stringify(["reasoning-1", 0]),
+          completedText: "[content] *已完成上一阶段，继续处理中…*",
+        },
+      },
+    );
+  });
+
+  it("only italicizes complete full-line bold reasoning summaries", () => {
+    const pipeline = new TurnOutputPipeline(
+      outputSettings({ toolFormat: "summary" }),
+    );
+
+    for (
+      const [summaryIndex, body] of [
+        "before **inline** after",
+        "`**code**`",
+        "\\**escaped**",
+        "**incomplete",
+      ].entries()
+    ) {
+      assertEquals(
+        pipeline.apply(reasoningSummary(body, summaryIndex)),
+        `[content] ${body}`,
+      );
+    }
+    assertEquals(
+      pipeline.apply(progress({ tag: "CONTENT", body: "**ordinary**" })),
+      "[content] **ordinary**",
+    );
+  });
+
+  it("italicizes summary lines before line and excerpt projection", () => {
+    const line = new TurnOutputPipeline(
+      outputSettings({
+        levels: { CONTENT: "line" },
+        toolFormat: "summary",
+      }),
+    );
+    assertEquals(
+      line.apply(reasoningSummary("**First**\n**Second**")),
+      "[content] *First*...",
+    );
+
+    const excerpt = new TurnOutputPipeline(
+      outputSettings({
+        levels: { CONTENT: "excerpt" },
+        toolFormat: "summary",
+      }),
+    );
+    assertEquals(
+      excerpt.apply(reasoningSummary("**Excerpt**")),
+      "[content] *Excerpt*",
     );
   });
 

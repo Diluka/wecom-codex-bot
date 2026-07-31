@@ -1,9 +1,11 @@
 import type { ActivityEvent } from "./activity-event.ts";
 import type { OutputSettings } from "./output-settings.ts";
+import type { ProgressTail } from "./progress-tail.ts";
 
 const EXCERPT_LIMIT = 800;
 const LINE_LIMIT = 160;
 const FALLBACK_ITEM = Symbol("fallback item");
+const COMPLETED_REASONING_SUMMARY = "*已完成上一阶段，继续处理中…*";
 
 type StreamItemKey = string | typeof FALLBACK_ITEM;
 type StreamStates<T> = Map<string, Map<StreamItemKey, T>>;
@@ -35,7 +37,7 @@ export interface OutputPipelineDecision {
   output: string | null;
   disposition: "rendered" | "suppressed";
   reason: OutputDecisionReason;
-  replaceProgressTail?: true;
+  progressTail?: ProgressTail;
 }
 
 /** Applies per-turn detail filtering and label rendering to activity events. */
@@ -72,8 +74,11 @@ export class TurnOutputPipeline {
     const level = this.#settings.levels[renderable.tag];
     if (level === "off") return suppressed("level_off");
 
-    const source = sourceText(renderable);
-    if (source === null) return suppressed("no_source");
+    const rawSource = sourceText(renderable);
+    if (rawSource === null) return suppressed("no_source");
+    const source = summarySnapshot === null
+      ? rawSource
+      : italicizeFullLineBold(rawSource);
 
     let visible: string | null;
     let reason: OutputDecisionReason;
@@ -95,10 +100,21 @@ export class TurnOutputPipeline {
       return suppressed(visible === null ? reason : "no_visible_text");
     }
 
-    const output = this.#settings.labels[renderable.tag] === "show"
-      ? `[${renderable.tag.toLowerCase()}] ${visible}`
-      : visible;
-    return rendered(output, reason, summarySnapshot !== null);
+    const output = renderLabel(this.#settings, renderable.tag, visible);
+    const progressTail = summarySnapshot && event.reasoningSummary
+      ? {
+        key: JSON.stringify([
+          event.reasoningSummary.itemId,
+          event.reasoningSummary.summaryIndex,
+        ]),
+        completedText: renderLabel(
+          this.#settings,
+          "CONTENT",
+          COMPLETED_REASONING_SUMMARY,
+        ),
+      }
+      : undefined;
+    return rendered(output, reason, progressTail);
   }
 
   clear(): void {
@@ -191,13 +207,13 @@ export class TurnOutputPipeline {
 function rendered(
   output: string,
   reason: OutputDecisionReason,
-  replaceProgressTail = false,
+  progressTail?: ProgressTail,
 ): OutputPipelineDecision {
   return {
     output,
     disposition: "rendered",
     reason,
-    ...(replaceProgressTail ? { replaceProgressTail: true as const } : {}),
+    ...(progressTail ? { progressTail } : {}),
   };
 }
 
@@ -210,6 +226,48 @@ function sourceText(event: ActivityEvent): string | null {
     value !== undefined
   );
   return parts.length === 0 ? null : parts.join("\n");
+}
+
+function renderLabel(
+  settings: OutputSettings,
+  tag: ActivityEvent["tag"],
+  text: string,
+): string {
+  return settings.labels[tag] === "show"
+    ? `[${tag.toLowerCase()}] ${text}`
+    : text;
+}
+
+function italicizeFullLineBold(source: string): string {
+  return source.split(/(\r?\n)/).map((part, index) =>
+    index % 2 === 0 ? italicizeBoldLine(part) : part
+  ).join("");
+}
+
+function italicizeBoldLine(line: string): string {
+  const trimmed = line.trim();
+  if (
+    !trimmed.startsWith("**") || !trimmed.endsWith("**") ||
+    trimmed.includes("`") || countBoldMarkers(trimmed) !== 2
+  ) {
+    return line;
+  }
+
+  const content = trimmed.slice(2, -2);
+  if (!content.trim()) return line;
+
+  const start = line.indexOf(trimmed);
+  return `${line.slice(0, start)}*${content}*${
+    line.slice(start + trimmed.length)
+  }`;
+}
+
+function countBoldMarkers(value: string): number {
+  let count = 0;
+  for (let index = 0; index < value.length - 1; index += 1) {
+    if (value[index] === "*" && value[index + 1] === "*") count += 1;
+  }
+  return count;
 }
 
 function summaryExcerpt(source: string): string {
