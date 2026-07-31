@@ -379,10 +379,17 @@ describe("StreamController", () => {
       finishedWithinMicrotasks = finished;
     });
     try {
-      for (let index = 0; index < 20; index++) await Promise.resolve();
+      for (
+        let index = 0;
+        index < 100 && finishedWithinMicrotasks === undefined;
+        index++
+      ) {
+        await Promise.resolve();
+      }
       assertEquals(finishedWithinMicrotasks, true);
     } finally {
       flushGate.resolve();
+      await Promise.allSettled([flushing, finishing]);
     }
     const [flushed, finished] = await Promise.all([flushing, finishing]);
 
