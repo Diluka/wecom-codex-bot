@@ -5,8 +5,11 @@ const UNSAFE_OWNER_USER_ID = /[\p{Cc}\p{Zl}\p{Zp}]/u;
 export function normalizeOwnerUserId(
   value: string | undefined,
 ): string | undefined {
-  const normalized = value?.trim();
-  if (!normalized || UNSAFE_OWNER_USER_ID.test(normalized)) return undefined;
+  if (value === undefined || UNSAFE_OWNER_USER_ID.test(value)) {
+    return undefined;
+  }
+  const normalized = value.trim();
+  if (!normalized) return undefined;
   return normalized;
 }
 

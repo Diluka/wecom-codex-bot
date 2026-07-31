@@ -34,7 +34,7 @@ export async function loadConfig(
 ): Promise<BotConfig> {
   const botId = required(env, "BOT_ID");
   const botSecret = required(env, "BOT_SECRET");
-  const ownerUserId = normalizeOwnerUserId(env.OWNER_USER_ID);
+  const ownerUserId = normalizeOwnerUserId(env.WECOM_OWNER_USER_ID);
   const workspaceValue = required(env, "CODEX_WORKSPACE");
   const outputSettings = parseOutputSettings(env);
   const groupOutputSettings = parseGroupOutputSettings(env, outputSettings);

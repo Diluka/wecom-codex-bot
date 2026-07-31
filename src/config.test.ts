@@ -101,7 +101,7 @@ describe("loadConfig", () => {
 
   it("leaves the owner user ID undefined when it is blank", async () => {
     const config = await loadConfig(
-      configEnv({ OWNER_USER_ID: " \t\n " }),
+      configEnv({ WECOM_OWNER_USER_ID: "   " }),
       Deno.cwd(),
     );
 
@@ -115,10 +115,14 @@ describe("loadConfig", () => {
         "owner\u0085id",
         "owner\u2028id",
         "owner\u2029id",
+        "\towner",
+        "owner\r",
+        "\u2028owner",
+        "owner\u2029",
       ]
     ) {
       const config = await loadConfig(
-        configEnv({ OWNER_USER_ID: ownerUserId }),
+        configEnv({ WECOM_OWNER_USER_ID: ownerUserId }),
         Deno.cwd(),
       );
 
@@ -128,7 +132,7 @@ describe("loadConfig", () => {
 
   it("trims the owner user ID", async () => {
     const config = await loadConfig(
-      configEnv({ OWNER_USER_ID: "  owner.team  " }),
+      configEnv({ WECOM_OWNER_USER_ID: "  owner.team  " }),
       Deno.cwd(),
     );
 
@@ -137,11 +141,20 @@ describe("loadConfig", () => {
 
   it("preserves owner user ID case", async () => {
     const config = await loadConfig(
-      configEnv({ OWNER_USER_ID: "OwNeR.Team" }),
+      configEnv({ WECOM_OWNER_USER_ID: "OwNeR.Team" }),
       Deno.cwd(),
     );
 
     assertEquals(config.ownerUserId, "OwNeR.Team");
+  });
+
+  it("ignores the similarly named OWNER_USER_ID variable", async () => {
+    const config = await loadConfig(
+      configEnv({ OWNER_USER_ID: "legacy-owner" }),
+      Deno.cwd(),
+    );
+
+    assertEquals(config.ownerUserId, undefined);
   });
 
   it("uses output-only defaults for every tag", async () => {

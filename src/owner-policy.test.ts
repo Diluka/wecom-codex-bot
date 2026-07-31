@@ -13,10 +13,10 @@ describe("normalizeOwnerUserId", () => {
   });
 
   it("returns undefined for a blank owner user ID", () => {
-    assertEquals(normalizeOwnerUserId(" \t\n "), undefined);
+    assertEquals(normalizeOwnerUserId("   "), undefined);
   });
 
-  it("returns undefined for Unicode controls and line separators", () => {
+  it("returns undefined for Unicode controls and separators within an ID", () => {
     for (
       const value of [
         "owner\u0000id",
@@ -24,6 +24,25 @@ describe("normalizeOwnerUserId", () => {
         "owner\u0085id",
         "owner\u2028id",
         "owner\u2029id",
+      ]
+    ) {
+      assertEquals(normalizeOwnerUserId(value), undefined);
+    }
+  });
+
+  it("rejects trimmable Unicode controls and separators at either edge", () => {
+    for (
+      const value of [
+        "\towner",
+        "owner\t",
+        "\rowner",
+        "owner\r",
+        "\nowner",
+        "owner\n",
+        "\u2028owner",
+        "owner\u2028",
+        "\u2029owner",
+        "owner\u2029",
       ]
     ) {
       assertEquals(normalizeOwnerUserId(value), undefined);
