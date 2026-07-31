@@ -203,11 +203,13 @@ interface PendingRequest {
   message: RoutedText;
   messages: RoutedText[];
   traces: RequestTrace[];
+  settingsBarrier: Promise<void>;
 }
 
 interface DebounceBatch {
   messages: RoutedText[];
   traces: RequestTrace[];
+  settingsBarrier: Promise<void>;
   timer?: unknown;
   completion: Promise<void>;
   resolve: () => void;
@@ -396,6 +398,8 @@ export class ConversationOrchestrator {
   readonly #slots = new Map<ConversationKey, ConversationSlot>();
   readonly #loadedThreads = new Map<string, number>();
   readonly #settingsCommandTails = new Map<ConversationKey, Promise<void>>();
+  readonly #settingsMutationTails = new Map<ConversationKey, Promise<void>>();
+  readonly #shutdownSignal = Promise.withResolvers<void>();
   #shuttingDown = false;
 
   constructor(options: ConversationOrchestratorOptions) {
@@ -459,11 +463,11 @@ export class ConversationOrchestrator {
       if (command === "/status") {
         await this.#enqueueSettingsCommand(
           message.conversationKey,
-          async () =>
-            this.#output.send(
-              message,
-              await this.#status(message.conversationKey),
-            ),
+          async () => {
+            const status = await this.#status(message.conversationKey);
+            if (status === undefined || this.#shuttingDown) return;
+            await this.#output.send(message, status);
+          },
         );
         return;
       }
@@ -471,6 +475,8 @@ export class ConversationOrchestrator {
         await this.#enqueueSettingsCommand(
           message.conversationKey,
           () => this.#handleSettingsCommand(message, parsedSettingsCommand),
+          parsedSettingsCommand.valid && parsedSettingsCommand.value !==
+              undefined,
         );
         return;
       }
@@ -528,10 +534,14 @@ export class ConversationOrchestrator {
       return;
     }
 
+    const settingsBarrier = this.#settingsMutationTails.get(
+      message.conversationKey,
+    ) ?? Promise.resolve();
     const request: PendingRequest = {
       message,
       messages: [message],
       traces: [trace],
+      settingsBarrier,
     };
     if (!this.#codex.ready) {
       this.#emitRequestStatuses(request, "runtime_unavailable");
@@ -556,6 +566,7 @@ export class ConversationOrchestrator {
         slot,
         message,
         trace,
+        settingsBarrier,
       );
     } else {
       await this.#enqueueRequest(message.conversationKey, slot, request);
@@ -566,6 +577,7 @@ export class ConversationOrchestrator {
     message: RoutedText,
     command: SettingsCommand,
   ): Promise<void> {
+    if (this.#shuttingDown) return;
     if (!command.valid) {
       await this.#output.send(
         message,
@@ -583,37 +595,53 @@ export class ConversationOrchestrator {
         const result = command.kind === "model"
           ? await this.#codex.setModel(record?.threadId, command.value)
           : await this.#codex.setEffort(record?.threadId, command.value);
+        if (this.#shuttingDown) return;
         reply = settingsUpdateReply(
           result,
           Boolean(this.#slots.get(message.conversationKey)?.active),
         );
       } else {
         const snapshot = await this.#codex.getModelSettings(record?.threadId);
+        if (this.#shuttingDown) return;
         reply = command.kind === "model"
           ? modelHelp(snapshot)
           : effortHelp(snapshot);
       }
     } catch (error) {
+      if (this.#shuttingDown) return;
       this.#report(error);
       reply = `${command.value ? "修改" : "读取"}模型设置失败：${
         errorMessage(error)
       }`;
     }
+    if (this.#shuttingDown) return;
     await this.#output.send(message, reply);
   }
 
   #enqueueSettingsCommand(
     conversationKey: ConversationKey,
     operation: () => Promise<void>,
+    mutation = false,
   ): Promise<void> {
     const previous = this.#settingsCommandTails.get(conversationKey) ??
       Promise.resolve();
-    const result = previous.then(operation);
+    const result = (async () => {
+      const ready = await Promise.race([
+        previous.then(() => true as const),
+        this.#shutdownSignal.promise.then(() => false as const),
+      ]);
+      if (!ready || this.#shuttingDown) return;
+      await operation();
+    })();
     const tail = result.then(() => {}, () => {});
     this.#settingsCommandTails.set(conversationKey, tail);
+    if (mutation) this.#settingsMutationTails.set(conversationKey, tail);
     return result.finally(() => {
       if (this.#settingsCommandTails.get(conversationKey) === tail) {
         this.#settingsCommandTails.delete(conversationKey);
+      }
+      if (this.#settingsMutationTails.get(conversationKey) === tail) {
+        this.#settingsMutationTails.delete(conversationKey);
       }
     });
   }
@@ -679,6 +707,7 @@ export class ConversationOrchestrator {
   async interruptAll(): Promise<void> {
     const drains: Promise<void>[] = [];
     this.#shuttingDown = true;
+    this.#shutdownSignal.resolve();
     for (const slot of this.#slots.values()) {
       this.#clearInterruptRetry(slot);
       const debounce = this.#cancelDebounce(slot);
@@ -756,6 +785,7 @@ export class ConversationOrchestrator {
     slot: ConversationSlot,
     message: RoutedText,
     trace: RequestTrace,
+    settingsBarrier: Promise<void>,
   ): Promise<void> {
     let batch = slot.debounce;
     if (!batch) {
@@ -763,6 +793,7 @@ export class ConversationOrchestrator {
       batch = {
         messages: [],
         traces: [],
+        settingsBarrier,
         completion: completion.promise,
         resolve: completion.resolve,
         reject: completion.reject,
@@ -771,6 +802,7 @@ export class ConversationOrchestrator {
     }
     batch.messages.push(message);
     batch.traces.push(trace);
+    batch.settingsBarrier = settingsBarrier;
     if (batch.timer !== undefined) {
       this.#messageDebounceTimers.clearTimeout(batch.timer);
     }
@@ -948,6 +980,19 @@ export class ConversationOrchestrator {
     control: TurnControl,
   ): Promise<void> {
     const message = request.message;
+    const settingsReady = await this.#raceWithForce(
+      () =>
+        Promise.race([
+          request.settingsBarrier.then(() => true as const),
+          this.#shutdownSignal.promise.then(() => false as const),
+        ]),
+      control,
+    );
+    if (
+      settingsReady.type === "forced" ||
+      (settingsReady.type === "value" && !settingsReady.value)
+    ) return;
+    if (settingsReady.type === "error") throw settingsReady.error;
     const threadId = await this.#ensureThread(request, control);
     if (threadId === undefined) return;
 
@@ -1635,6 +1680,7 @@ export class ConversationOrchestrator {
       message: batch.messages[batch.messages.length - 1],
       messages: batch.messages,
       traces: batch.traces,
+      settingsBarrier: batch.settingsBarrier,
     };
   }
 
@@ -1851,7 +1897,9 @@ export class ConversationOrchestrator {
     }
   }
 
-  async #status(conversationKey: ConversationKey): Promise<string> {
+  async #status(
+    conversationKey: ConversationKey,
+  ): Promise<string | undefined> {
     const record = this.#state.getConversation(conversationKey);
     const slot = this.#slots.get(conversationKey);
     let model = "unknown";
@@ -1860,10 +1908,12 @@ export class ConversationOrchestrator {
     if (this.#codex.ready) {
       try {
         const snapshot = await this.#codex.getModelSettings(record?.threadId);
+        if (this.#shuttingDown) return undefined;
         model = snapshot.settings.model;
         effort = snapshot.settings.effort ?? "default";
         source = snapshot.source;
       } catch (error) {
+        if (this.#shuttingDown) return undefined;
         this.#report(error);
       }
     }

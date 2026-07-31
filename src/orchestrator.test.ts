@@ -58,6 +58,7 @@ function outputSettings(
 
 class FakeState implements OrchestratorState {
   readonly claimed = new Set<string>();
+  readonly conversationLookups: string[] = [];
   failNextBegin = false;
   failNextFinish = false;
   readonly records = new Map<string, {
@@ -76,6 +77,7 @@ class FakeState implements OrchestratorState {
   }
 
   getConversation(key: string) {
+    this.conversationLookups.push(key);
     return this.records.get(key) ?? null;
   }
 
@@ -187,6 +189,9 @@ class FakeCodex implements CodexPort {
   readonly effortChanges: Array<{ threadId?: string; effort: string }> = [];
   readonly settingsLookups: Array<string | undefined> = [];
   readonly settingsErrors: Error[] = [];
+  readonly settingsLookupGates: Promise<void>[] = [];
+  readonly modelChangeGates: Promise<void>[] = [];
+  readonly effortChangeGates: Promise<void>[] = [];
   threadSequence = 0;
   turnSequence = 0;
   startThreadAttempts = 0;
@@ -209,21 +214,27 @@ class FakeCodex implements CodexPort {
     if (error) throw error;
   }
 
-  getModelSettings(threadId?: string): Promise<ModelSettingsSnapshot> {
+  async getModelSettings(threadId?: string): Promise<ModelSettingsSnapshot> {
     this.settingsLookups.push(threadId);
+    const gate = this.settingsLookupGates.shift();
+    if (gate) await gate;
     const error = this.settingsErrors.shift();
-    if (error) return Promise.reject(error);
-    return Promise.resolve(this.settingsSnapshot);
+    if (error) throw error;
+    return this.settingsSnapshot;
   }
 
-  setModel(threadId: string | undefined, model: string) {
+  async setModel(threadId: string | undefined, model: string) {
     this.modelChanges.push({ threadId, model });
-    return Promise.resolve(this.nextSettingsResult);
+    const gate = this.modelChangeGates.shift();
+    if (gate) await gate;
+    return this.nextSettingsResult;
   }
 
-  setEffort(threadId: string | undefined, effort: string) {
+  async setEffort(threadId: string | undefined, effort: string) {
     this.effortChanges.push({ threadId, effort });
-    return Promise.resolve(this.nextSettingsResult);
+    const gate = this.effortChangeGates.shift();
+    if (gate) await gate;
+    return this.nextSettingsResult;
   }
 
   async startTurn(
@@ -3834,5 +3845,174 @@ describe("ConversationOrchestrator", () => {
     assertEquals(states.at(-1), "interrupted");
     assertEquals(states.includes("completed"), false);
     assertEquals(states.includes("failed"), false);
+  });
+});
+
+describe("ConversationOrchestrator settings barriers", () => {
+  it("waits for an earlier model mutation before a later debounced turn", async () => {
+    const timers = new FakeTimers();
+    const modelGate = Promise.withResolvers<void>();
+    const { codex, orchestrator } = setup({
+      messageDebounceMs: 3_000,
+      messageDebounceTimers: timers,
+    });
+    codex.modelChangeGates.push(modelGate.promise);
+    const switching = orchestrator.handleText(
+      message("single:alice", "model", "/model gpt-b"),
+    );
+    await waitFor(() => codex.modelChanges.length === 1);
+
+    const running = orchestrator.handleText(
+      message("single:alice", "work", "work"),
+    );
+    await timers.advance(3_000);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const startThreadAttemptsBeforeMutation = codex.startThreadAttempts;
+    const startTurnAttemptsBeforeMutation = codex.startTurnAttempts;
+
+    modelGate.resolve();
+    await switching;
+    await waitFor(() => codex.starts.length === 1);
+    codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
+    await running;
+
+    assertEquals(startThreadAttemptsBeforeMutation, 0);
+    assertEquals(startTurnAttemptsBeforeMutation, 0);
+  });
+
+  it("does not let a later mutation block an earlier debounced request", async () => {
+    const timers = new FakeTimers();
+    const modelGate = Promise.withResolvers<void>();
+    const { codex, orchestrator } = setup({
+      messageDebounceMs: 3_000,
+      messageDebounceTimers: timers,
+    });
+    const running = orchestrator.handleText(
+      message("single:alice", "work", "work"),
+    );
+
+    codex.modelChangeGates.push(modelGate.promise);
+    const switching = orchestrator.handleText(
+      message("single:alice", "model", "/model gpt-b"),
+    );
+    await waitFor(() => codex.modelChanges.length === 1);
+    await timers.advance(3_000);
+
+    await waitFor(() => codex.starts.length === 1);
+    codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
+    await running;
+    modelGate.resolve();
+    await switching;
+  });
+});
+
+describe("ConversationOrchestrator settings shutdown", () => {
+  it("discards a queued mutation behind a hanging status lookup", async () => {
+    const lookupGate = Promise.withResolvers<void>();
+    const reported: Error[] = [];
+    const { codex, orchestrator, output, state } = setup({
+      onError: (error: Error) => reported.push(error),
+    });
+    codex.settingsLookupGates.push(lookupGate.promise);
+    const status = orchestrator.handleText(
+      message("single:alice", "status", "/status"),
+    );
+    await waitFor(() => codex.settingsLookups.length === 1);
+    const lookupsBeforeShutdown = state.conversationLookups.length;
+
+    const queued = orchestrator.handleText(
+      message("single:alice", "model", "/model gpt-b"),
+    );
+    const stopping = orchestrator.interruptAll();
+    const [stoppedWithinDeadline, queuedSettledWithinDeadline] = await Promise
+      .all([
+        Promise.race([
+          stopping.then(() => true),
+          new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
+        ]),
+        Promise.race([
+          queued.then(() => true, () => true),
+          new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
+        ]),
+      ]);
+
+    lookupGate.reject(new Error("late settings lookup failure"));
+    await Promise.all([status, queued, stopping]);
+
+    assertEquals(stoppedWithinDeadline, true);
+    assertEquals(queuedSettledWithinDeadline, true);
+    assertEquals(state.conversationLookups.length, lookupsBeforeShutdown);
+    assertEquals(codex.modelChanges, []);
+    assertEquals(output.sent, []);
+    assertEquals(reported, []);
+  });
+
+  it("discards a queued effort change behind a hanging model change", async () => {
+    const modelGate = Promise.withResolvers<void>();
+    const { codex, orchestrator, output, state } = setup();
+    codex.modelChangeGates.push(modelGate.promise);
+    const model = orchestrator.handleText(
+      message("single:alice", "model", "/model gpt-b"),
+    );
+    await waitFor(() => codex.modelChanges.length === 1);
+    const lookupsBeforeShutdown = state.conversationLookups.length;
+
+    const queued = orchestrator.handleText(
+      message("single:alice", "effort", "/effort low"),
+    );
+    const stopping = orchestrator.interruptAll();
+    const [stoppedWithinDeadline, queuedSettledWithinDeadline] = await Promise
+      .all([
+        Promise.race([
+          stopping.then(() => true),
+          new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
+        ]),
+        Promise.race([
+          queued.then(() => true, () => true),
+          new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
+        ]),
+      ]);
+
+    modelGate.resolve();
+    await Promise.all([model, queued, stopping]);
+
+    assertEquals(stoppedWithinDeadline, true);
+    assertEquals(queuedSettledWithinDeadline, true);
+    assertEquals(state.conversationLookups.length, lookupsBeforeShutdown);
+    assertEquals(codex.effortChanges, []);
+    assertEquals(output.sent, []);
+  });
+
+  it("releases a turn waiting on a hanging mutation when shutdown begins", async () => {
+    const modelGate = Promise.withResolvers<void>();
+    const { codex, orchestrator, output, state } = setup({
+      shutdownGraceMs: 10_000,
+    });
+    codex.modelChangeGates.push(modelGate.promise);
+    const switching = orchestrator.handleText(
+      message("single:alice", "model", "/model gpt-b"),
+    );
+    await waitFor(() => codex.modelChanges.length === 1);
+    const lookupsBeforeRequest = state.conversationLookups.length;
+    const running = orchestrator.handleText(
+      message("single:alice", "work", "work"),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const stopping = orchestrator.interruptAll();
+    const requestSettledWithinDeadline = await Promise.race([
+      Promise.all([running, stopping]).then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
+    ]);
+
+    modelGate.resolve();
+    await Promise.all([switching, running, stopping]);
+
+    assertEquals(requestSettledWithinDeadline, true);
+    assertEquals(state.conversationLookups.length, lookupsBeforeRequest);
+    assertEquals(codex.startThreadAttempts, 0);
+    assertEquals(codex.startTurnAttempts, 0);
+    assertEquals(output.sent, []);
   });
 });
