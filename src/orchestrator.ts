@@ -92,8 +92,15 @@ export interface ConversationOrchestratorOptions {
   outputSettings?: OutputSettings;
   groupOutputSettings?: OutputSettings;
   onError?: (error: Error) => void;
+  messageDebounceMs?: number;
+  messageDebounceTimers?: OrchestratorTimerApi;
   shutdownGraceMs?: number;
   interruptRetryDelaysMs?: readonly number[];
+}
+
+export interface OrchestratorTimerApi {
+  setTimeout(callback: () => void, delayMs: number): unknown;
+  clearTimeout(handle: unknown): void;
 }
 
 interface TurnControl {
@@ -113,8 +120,22 @@ interface ActiveTurn {
   turnOutput: TurnOutput;
   control: TurnControl;
   shutdownRequested: boolean;
+  stopRequested: boolean;
   interruptWhenReady: boolean;
   lateInterruptRequested: boolean;
+}
+
+interface PendingRequest {
+  message: RoutedText;
+  messages: RoutedText[];
+}
+
+interface DebounceBatch {
+  messages: RoutedText[];
+  timer?: unknown;
+  completion: Promise<void>;
+  resolve: () => void;
+  reject: (error: unknown) => void;
 }
 
 interface TurnOutput {
@@ -131,7 +152,9 @@ interface TurnOutput {
 }
 
 interface ConversationSlot {
-  pending?: RoutedText;
+  debounce?: DebounceBatch;
+  pending?: PendingRequest;
+  current?: PendingRequest;
   resetPending?: RoutedText;
   active?: ActiveTurn;
   control?: TurnControl;
@@ -144,9 +167,15 @@ interface ConversationSlot {
 const HELP = [
   "可用命令：",
   "- `/new`：中断当前任务并新建 Codex 会话",
+  "- `/stop`：立即停止当前聊天中正在执行或等待的任务",
   "- `/status`：查看当前聊天的绑定与运行状态",
   "- `/help`：显示本帮助",
 ].join("\n");
+
+const systemMessageDebounceTimers: OrchestratorTimerApi = {
+  setTimeout: (callback, delayMs) => globalThis.setTimeout(callback, delayMs),
+  clearTimeout: (handle) => globalThis.clearTimeout(handle as number),
+};
 
 /** Serializes each conversation's Codex turns, state changes, and output. */
 export class ConversationOrchestrator {
@@ -157,6 +186,8 @@ export class ConversationOrchestrator {
   readonly #outputSettings: OutputSettings;
   readonly #groupOutputSettings: OutputSettings;
   readonly #onError?: (error: Error) => void;
+  readonly #messageDebounceMs: number;
+  readonly #messageDebounceTimers: OrchestratorTimerApi;
   readonly #shutdownGraceMs: number;
   readonly #interruptRetryDelaysMs: readonly number[];
   readonly #slots = new Map<ConversationKey, ConversationSlot>();
@@ -172,12 +203,21 @@ export class ConversationOrchestrator {
     this.#groupOutputSettings = options.groupOutputSettings ??
       this.#outputSettings;
     this.#onError = options.onError;
+    this.#messageDebounceMs = options.messageDebounceMs ?? 3_000;
+    this.#messageDebounceTimers = options.messageDebounceTimers ??
+      systemMessageDebounceTimers;
     this.#shutdownGraceMs = options.shutdownGraceMs ?? 30_000;
     this.#interruptRetryDelaysMs = options.interruptRetryDelaysMs ?? [
       1_000,
       2_000,
       4_000,
     ];
+    if (
+      !Number.isFinite(this.#messageDebounceMs) ||
+      this.#messageDebounceMs < 0
+    ) {
+      throw new RangeError("messageDebounceMs must be a non-negative number");
+    }
     if (
       !Number.isFinite(this.#shutdownGraceMs) || this.#shutdownGraceMs < 0
     ) {
@@ -209,6 +249,34 @@ export class ConversationOrchestrator {
       await this.#output.send(message, this.#status(message.conversationKey));
       return;
     }
+    if (command === "/stop") {
+      await this.#stopConversation(message);
+      return;
+    }
+
+    if (command === "/new") {
+      const slot = this.#slot(message.conversationKey);
+      this.#cancelDebounce(slot);
+      if (!this.#codex.ready) {
+        this.#deleteSlotIfIdle(message.conversationKey, slot);
+        await this.#output.send(
+          message,
+          "Codex App Server 暂不可用，请稍后重试。",
+        );
+        return;
+      }
+      slot.pending = undefined;
+      slot.resetPending = message;
+      if (slot.active) this.#requestInterrupt(slot);
+      if (!slot.drain) {
+        slot.drain = this.#drain(message.conversationKey, slot).finally(() => {
+          slot.drain = undefined;
+        });
+      }
+      await slot.drain;
+      return;
+    }
+
     if (!this.#codex.ready) {
       await this.#output.send(
         message,
@@ -218,22 +286,40 @@ export class ConversationOrchestrator {
     }
 
     const slot = this.#slot(message.conversationKey);
-    if (command === "/new") {
-      slot.pending = undefined;
-      slot.resetPending = message;
-    } else if (slot.resetPending) {
-      slot.pending = message;
+    const request = { message, messages: [message] };
+    if (this.#messageDebounceMs > 0) {
+      await this.#debounceMessage(message.conversationKey, slot, message);
     } else {
-      slot.pending = message;
+      await this.#enqueueRequest(message.conversationKey, slot, request);
+    }
+  }
+
+  async #stopConversation(message: RoutedText): Promise<void> {
+    const slot = this.#slots.get(message.conversationKey);
+    const hasWork = Boolean(
+      slot?.debounce || slot?.pending || slot?.resetPending || slot?.current ||
+        slot?.active || slot?.control,
+    );
+
+    if (slot) {
+      this.#cancelDebounce(slot);
+      slot.pending = undefined;
+      slot.resetPending = undefined;
+
+      if (slot.active) {
+        slot.active.stopRequested = true;
+        this.#requestInterrupt(slot);
+      } else if (slot.control) {
+        slot.control.forceComplete({ status: "interrupted" });
+      }
+
+      this.#deleteSlotIfIdle(message.conversationKey, slot);
     }
 
-    if (slot.active) this.#requestInterrupt(slot);
-    if (!slot.drain) {
-      slot.drain = this.#drain(message.conversationKey, slot).finally(() => {
-        slot.drain = undefined;
-      });
-    }
-    await slot.drain;
+    await this.#output.send(
+      message,
+      hasWork ? "已停止当前任务。" : "当前没有正在执行或等待的任务。",
+    );
   }
 
   async handleUnsupported(
@@ -255,6 +341,7 @@ export class ConversationOrchestrator {
     this.#shuttingDown = true;
     for (const slot of this.#slots.values()) {
       this.#clearInterruptRetry(slot);
+      this.#cancelDebounce(slot);
       slot.pending = undefined;
       slot.resetPending = undefined;
       if (slot.drain) drains.push(slot.drain);
@@ -292,6 +379,106 @@ export class ConversationOrchestrator {
     return slot;
   }
 
+  #deleteSlotIfIdle(
+    conversationKey: ConversationKey,
+    slot: ConversationSlot,
+  ): void {
+    if (
+      this.#slots.get(conversationKey) === slot && !slot.active &&
+      !slot.control && !slot.current && !slot.pending && !slot.resetPending &&
+      !slot.debounce
+    ) {
+      this.#slots.delete(conversationKey);
+    }
+  }
+
+  async #debounceMessage(
+    conversationKey: ConversationKey,
+    slot: ConversationSlot,
+    message: RoutedText,
+  ): Promise<void> {
+    let batch = slot.debounce;
+    if (!batch) {
+      const completion = Promise.withResolvers<void>();
+      batch = {
+        messages: [],
+        completion: completion.promise,
+        resolve: completion.resolve,
+        reject: completion.reject,
+      };
+      slot.debounce = batch;
+    }
+    batch.messages.push(message);
+    if (batch.timer !== undefined) {
+      this.#messageDebounceTimers.clearTimeout(batch.timer);
+    }
+    const timer = this.#messageDebounceTimers.setTimeout(() => {
+      if (slot.debounce !== batch || batch.timer !== timer) return;
+      void this.#flushDebounce(conversationKey, slot, batch!).then(
+        batch!.resolve,
+        batch!.reject,
+      );
+    }, this.#messageDebounceMs);
+    batch.timer = timer;
+    await batch.completion;
+  }
+
+  async #flushDebounce(
+    conversationKey: ConversationKey,
+    slot: ConversationSlot,
+    batch: DebounceBatch,
+  ): Promise<void> {
+    if (slot.debounce !== batch) return;
+    slot.debounce = undefined;
+    batch.timer = undefined;
+    const message = batch.messages.at(-1);
+    if (!message || this.#shuttingDown) {
+      this.#deleteSlotIfIdle(conversationKey, slot);
+      return;
+    }
+    if (!this.#codex.ready) {
+      try {
+        await this.#output.send(
+          message,
+          "Codex App Server 暂不可用，请稍后重试。",
+        );
+      } finally {
+        this.#deleteSlotIfIdle(conversationKey, slot);
+      }
+      return;
+    }
+    await this.#enqueueRequest(conversationKey, slot, {
+      message,
+      messages: batch.messages,
+    });
+  }
+
+  #cancelDebounce(slot: ConversationSlot): void {
+    const batch = slot.debounce;
+    if (!batch) return;
+    slot.debounce = undefined;
+    if (batch.timer !== undefined) {
+      this.#messageDebounceTimers.clearTimeout(batch.timer);
+      batch.timer = undefined;
+    }
+    batch.resolve();
+  }
+
+  async #enqueueRequest(
+    conversationKey: ConversationKey,
+    slot: ConversationSlot,
+    request: PendingRequest,
+  ): Promise<void> {
+    slot.pending = request;
+    if (slot.active) this.#requestInterrupt(slot);
+    if (!slot.drain) {
+      slot.drain = this.#drain(conversationKey, slot).finally(() => {
+        slot.drain = undefined;
+      });
+    }
+    await slot.drain;
+  }
+
   async #drain(
     conversationKey: ConversationKey,
     slot: ConversationSlot,
@@ -312,17 +499,18 @@ export class ConversationOrchestrator {
         continue;
       }
 
-      const message = slot.pending!;
+      const request = slot.pending!;
       slot.pending = undefined;
+      slot.current = request;
       const control = this.#createTurnControl();
       slot.control = control;
       try {
-        await this.#runTurn(message, slot, control);
+        await this.#runTurn(request, slot, control);
       } catch (error) {
         try {
           await this.#sendWithForce(
             control,
-            message,
+            request.message,
             `任务启动失败：${errorMessage(error)}`,
             true,
           );
@@ -334,12 +522,11 @@ export class ConversationOrchestrator {
           this.#clearActive(slot, slot.active);
         }
         if (slot.control === control) slot.control = undefined;
+        if (slot.current === request) slot.current = undefined;
       }
     }
 
-    if (!slot.active && !slot.control && !slot.pending && !slot.resetPending) {
-      this.#slots.delete(conversationKey);
-    }
+    this.#deleteSlotIfIdle(conversationKey, slot);
   }
 
   async #resetConversation(
@@ -367,10 +554,11 @@ export class ConversationOrchestrator {
   }
 
   async #runTurn(
-    message: RoutedText,
+    request: PendingRequest,
     slot: ConversationSlot,
     control: TurnControl,
   ): Promise<void> {
+    const message = request.message;
     const threadId = await this.#ensureThread(message, control);
     if (threadId === undefined) return;
 
@@ -381,13 +569,22 @@ export class ConversationOrchestrator {
     const prompt = buildCodexPrompt({
       chatType: message.chatType,
       conversationKey: message.conversationKey,
-      senderUserId: message.senderUserId,
-      msgId: message.msgId,
-      content: message.text,
-      quote: message.quote,
+      messages: request.messages.map((item) => ({
+        senderUserId: item.senderUserId,
+        msgId: item.msgId,
+        content: item.text,
+        quote: item.quote,
+      })),
     });
-    const progress = await this.#output.startProgress(message);
+    const progress = await this.#startProgressWithForce(message, control);
+    if (progress === undefined) return;
     const turnOutput = this.#createTurnOutput(message, progress);
+    if (
+      control.forced || this.#shuttingDown || slot.resetPending || slot.pending
+    ) {
+      await this.#finishTurnOutput(turnOutput, undefined, control);
+      return;
+    }
     try {
       await this.#enqueueActivity(turnOutput, {
         tag: "QUEUE",
@@ -398,12 +595,19 @@ export class ConversationOrchestrator {
       await this.#finishTurnOutput(turnOutput, undefined, control);
       throw error;
     }
+    if (
+      control.forced || this.#shuttingDown || slot.resetPending || slot.pending
+    ) {
+      await this.#finishTurnOutput(turnOutput, undefined, control);
+      return;
+    }
 
     const active: ActiveTurn = {
       threadId,
       turnOutput,
       control,
       shutdownRequested: false,
+      stopRequested: false,
       interruptWhenReady: false,
       lateInterruptRequested: false,
     };
@@ -459,6 +663,7 @@ export class ConversationOrchestrator {
       } finally {
         this.#clearActive(slot, active);
       }
+      if (active.stopRequested) return;
       throw startResult.error;
     }
 
@@ -513,6 +718,7 @@ export class ConversationOrchestrator {
         this.#clearActive(slot, active);
       }
       void handle.completion.catch(() => undefined);
+      if (active.stopRequested) return;
       throw error;
     }
     if (slot.resetPending || slot.pending) this.#requestInterrupt(slot);
@@ -524,42 +730,50 @@ export class ConversationOrchestrator {
       outcome = { status: "failed", error: errorMessage(error) };
     }
 
+    let replyFailed = false;
+    let replyError: unknown;
     try {
       await this.#finishTurnOutput(turnOutput, {
         tag: "TURN",
-        body: outcome.status,
+        body: active.stopRequested ? "interrupted" : outcome.status,
         delivery: "progress",
       }, control);
+
+      const superseded = Boolean(slot.resetPending || slot.pending);
+      if (
+        outcome.status === "completed" && outcome.finalAnswer &&
+        !superseded && !active.stopRequested && !this.#shuttingDown
+      ) {
+        await this.#sendWithForce(control, message, outcome.finalAnswer, true);
+      } else if (
+        outcome.status === "failed" && !superseded &&
+        !active.stopRequested && !this.#shuttingDown
+      ) {
+        await this.#sendWithForce(
+          control,
+          message,
+          `Codex 执行失败：${outcome.error ?? "unknown error"}`,
+          true,
+        );
+      }
+    } catch (error) {
+      replyFailed = true;
+      replyError = error;
+    } finally {
+      const stopped = active.stopRequested;
       try {
         this.#state.finishTurn(
           message.conversationKey,
           handle.turnId,
-          outcome.status,
-          outcome.error ?? null,
+          stopped ? "interrupted" : outcome.status,
+          stopped ? null : outcome.error ?? null,
         );
       } catch (error) {
         this.#report(error);
       }
-    } finally {
       this.#clearActive(slot, active);
     }
-
-    const superseded = Boolean(slot.resetPending || slot.pending);
-    if (
-      outcome.status === "completed" && outcome.finalAnswer && !superseded &&
-      !this.#shuttingDown
-    ) {
-      await this.#sendWithForce(control, message, outcome.finalAnswer, true);
-    } else if (
-      outcome.status === "failed" && !superseded && !this.#shuttingDown
-    ) {
-      await this.#sendWithForce(
-        control,
-        message,
-        `Codex 执行失败：${outcome.error ?? "unknown error"}`,
-        true,
-      );
-    }
+    if (replyFailed && !active.stopRequested) throw replyError;
   }
 
   #createTurnOutput(
@@ -615,6 +829,36 @@ export class ConversationOrchestrator {
       ),
       control.forceSignal.then(() => ({ type: "forced" as const })),
     ]);
+  }
+
+  async #startProgressWithForce(
+    message: RoutedText,
+    control: TurnControl,
+  ): Promise<ProgressHandle | undefined> {
+    let pending: Promise<ProgressHandle>;
+    try {
+      pending = Promise.resolve(this.#output.startProgress(message));
+    } catch (error) {
+      pending = Promise.reject(error);
+    }
+    const result = await Promise.race([
+      pending.then(
+        (value) => ({ type: "value" as const, value }),
+        (error) => ({ type: "error" as const, error }),
+      ),
+      control.forceSignal.then(() => ({ type: "forced" as const })),
+    ]);
+    if (result.type === "error") throw result.error;
+    if (result.type === "value") return result.value;
+
+    void pending.then(async (progress) => {
+      await this.#finishTurnOutput(
+        this.#createTurnOutput(message, progress),
+        undefined,
+        control,
+      );
+    }, () => undefined).catch((error) => this.#report(error));
+    return undefined;
   }
 
   async #sendWithForce(
@@ -882,7 +1126,10 @@ export class ConversationOrchestrator {
         );
         if (slot.active !== active) return;
         slot.interruptRequested = false;
-        if (this.#shuttingDown || (!slot.pending && !slot.resetPending)) return;
+        if (
+          this.#shuttingDown ||
+          (!active.stopRequested && !slot.pending && !slot.resetPending)
+        ) return;
 
         const delay = this.#interruptRetryDelaysMs[slot.interruptFailures++];
         if (delay === undefined) return;
@@ -917,7 +1164,9 @@ export class ConversationOrchestrator {
       `thread: \`${record?.threadId ?? "not bound"}\``,
       `codex: ${this.#codex.ready ? "ready" : "unavailable"}`,
       `turn: ${slot?.active ? "in_progress" : record?.lastStatus ?? "idle"}`,
-      `queued: ${slot?.pending || slot?.resetPending ? "yes" : "no"}`,
+      `queued: ${
+        slot?.debounce || slot?.pending || slot?.resetPending ? "yes" : "no"
+      }`,
       record?.lastError ? `last_error: ${record.lastError}` : "",
     ].filter(Boolean).join("\n");
   }
