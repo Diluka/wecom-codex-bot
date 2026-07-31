@@ -970,6 +970,68 @@ describe("ConversationOrchestrator", () => {
     assertEquals(interruption[0].triggerMsgId, "m2");
   });
 
+  it("does not retry an interrupt after the turn enters reply phase", async () => {
+    const interruptGate = Promise.withResolvers<void>();
+    const output = new PendingProgressFinishOutput();
+    const { codex, orchestrator, requestEvents } = setup({
+      output,
+      interruptRetryDelaysMs: [0],
+    });
+    codex.interruptGates.push(interruptGate.promise);
+    const first = orchestrator.handleText(
+      message("single:alice", "m1", "first"),
+    );
+    await waitFor(() => codex.starts.length === 1);
+    const second = orchestrator.handleText(
+      message("single:alice", "m2", "second"),
+    );
+    await waitFor(() => codex.interrupts.length === 1);
+
+    codex.starts[0].resolve({ status: "completed", finalAnswer: "first done" });
+    await output.finishStarted.promise;
+
+    const retryScheduled = Promise.withResolvers<() => void>();
+    const originalSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = ((callback: () => void) => {
+      retryScheduled.resolve(callback);
+      return 0;
+    }) as unknown as typeof setTimeout;
+    let runRetry: (() => void) | undefined;
+    try {
+      interruptGate.reject(new Error("interrupt failed after completion"));
+      runRetry = await Promise.race([
+        retryScheduled.promise,
+        new Promise<undefined>((resolve) => {
+          originalSetTimeout(() => resolve(undefined), 0);
+        }),
+      ]);
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+    }
+    runRetry?.();
+    const interruptCallsAfterRetry = codex.interrupts.length;
+
+    output.finishGate.resolve();
+    await waitFor(() => codex.starts.length === 2);
+    codex.starts[1].resolve({ status: "completed" });
+    await Promise.all([first, second]);
+
+    assertEquals(interruptCallsAfterRetry, 1);
+    assertEquals(runRetry, undefined);
+    assertEquals(
+      requestEvents.filter(({ msgId, state }) =>
+        msgId === "m1" && state === "interrupt_requested"
+      ).length,
+      1,
+    );
+    assertEquals(
+      output.progress[0].chunks.some((chunk) =>
+        chunk.includes("interrupt failed")
+      ),
+      false,
+    );
+  });
+
   it("terminalizes a runtime-unavailable reply send failure", async () => {
     const { codex, orchestrator, output, requestEvents } = setup();
     codex.ready = false;

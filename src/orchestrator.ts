@@ -1216,7 +1216,7 @@ export class ConversationOrchestrator {
 
   #requestInterrupt(slot: ConversationSlot, triggerMsgId?: string): void {
     const active = slot.active;
-    if (!active) return;
+    if (!isInterruptible(active)) return;
     if (!active.interruptStatusEmitted) {
       active.interruptStatusEmitted = true;
       this.#emitRequestStatus(active.trace, "interrupt_requested", {
@@ -1233,6 +1233,7 @@ export class ConversationOrchestrator {
     const turnId = active.turnId;
     void this.#codex.interruptTurn(active.threadId, turnId).catch(
       (error) => {
+        if (slot.active !== active || !isInterruptible(active)) return;
         void this.#enqueueActivity(active.turnOutput, {
           tag: "ERROR",
           body: `interrupt failed: ${errorMessage(error)}`,
@@ -1240,7 +1241,6 @@ export class ConversationOrchestrator {
         }, active.control).catch((activityError) =>
           this.#report(activityError)
         );
-        if (slot.active !== active) return;
         slot.interruptRequested = false;
         if (this.#shuttingDown || (!slot.pending && !slot.resetPending)) return;
 
