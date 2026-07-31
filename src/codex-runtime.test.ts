@@ -15,6 +15,7 @@ import {
   CodexRuntime,
   type CodexRuntimeClient,
   type CodexRuntimeClientFactory,
+  type CodexRuntimeTrace,
 } from "./codex-runtime.ts";
 import type { ActivityEvent } from "./activity-event.ts";
 import type { RequestAuthority } from "./owner-policy.ts";
@@ -123,6 +124,96 @@ function runtimeWith(
 }
 
 describe("CodexRuntime", () => {
+  it("reports safe notification routing metadata without payload content", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    client.turnIds.push("turn-trace");
+    factory.queue.push(client);
+    const traces: CodexRuntimeTrace[] = [];
+    const runtime = runtimeWith(factory, {
+      onTrace: (trace) => {
+        traces.push(trace);
+      },
+    });
+    await runtime.start();
+    const handle = await runtime.startTurn(
+      "thread-trace",
+      "prompt",
+      "owner",
+      () => {},
+    );
+
+    client.callbacks.onNotification?.({
+      method: "item/reasoning/summaryTextDelta",
+      params: {
+        threadId: "thread-trace",
+        turnId: "turn-trace",
+        delta: "forbidden-private-body",
+      },
+    });
+    client.callbacks.onNotification?.({
+      method: "item/reasoning/textDelta",
+      params: {
+        threadId: "thread-trace",
+        turnId: "turn-trace",
+        delta: "forbidden-private-reasoning",
+      },
+    });
+    client.callbacks.onNotification?.({
+      method: "warning",
+      params: { message: "forbidden-without-scope" },
+    });
+    client.callbacks.onNotification?.({
+      method: "turn/started",
+      params: { threadId: "thread-trace", turnId: "turn-trace" },
+    });
+
+    assertEquals(traces, [
+      {
+        method: "item/reasoning/summaryTextDelta",
+        decision: "routed",
+        reason: "delivered",
+        generation: 1,
+        threadId: "thread-trace",
+        turnId: "turn-trace",
+        tag: "CONTENT",
+      },
+      {
+        method: "item/reasoning/textDelta",
+        decision: "ignored",
+        reason: "adapter_ignored",
+        generation: 1,
+        threadId: "thread-trace",
+        turnId: "turn-trace",
+      },
+      {
+        method: "warning",
+        decision: "ignored",
+        reason: "missing_turn_ids",
+        generation: 1,
+      },
+      {
+        method: "turn/started",
+        decision: "ignored",
+        reason: "turn_owned_by_orchestrator",
+        generation: 1,
+        threadId: "thread-trace",
+        turnId: "turn-trace",
+        tag: "TURN",
+      },
+    ]);
+    assertEquals(JSON.stringify(traces).includes("forbidden"), false);
+
+    client.callbacks.onTurnCompleted?.({
+      threadId: "thread-trace",
+      turnId: "turn-trace",
+      status: "completed",
+      error: null,
+    });
+    await handle.completion;
+    await runtime.stop();
+  });
+
   it("starts one client and implements the Codex port operations", async () => {
     const factory = new FakeFactory();
     const client = new FakeClient();

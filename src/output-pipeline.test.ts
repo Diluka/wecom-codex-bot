@@ -122,6 +122,28 @@ describe("TurnOutputPipeline", () => {
     assertEquals(pipeline.apply(toolCompleted("tool-1")), null);
   });
 
+  it("reports why summary content is rendered and tool detail is hidden", () => {
+    const pipeline = new TurnOutputPipeline(
+      outputSettings({ toolFormat: "summary" }),
+    );
+
+    assertEquals(
+      pipeline.applyWithDecision(
+        progress({ tag: "CONTENT", body: "safe summary" }),
+      ),
+      {
+        output: "[content] safe summary",
+        disposition: "rendered",
+        reason: "full",
+      },
+    );
+    assertEquals(pipeline.applyWithDecision(toolStarted("tool-1")), {
+      output: null,
+      disposition: "suppressed",
+      reason: "tool_format_summary",
+    });
+  });
+
   it("preserves non-tool progress in summary format", () => {
     const pipeline = new TurnOutputPipeline(
       outputSettings({ toolFormat: "summary" }),

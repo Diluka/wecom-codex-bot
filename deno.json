@@ -19,7 +19,7 @@
       "env": true,
       "net": true,
       "read": true,
-      "write": [".data"],
+      "write": [".data", "logs"],
       "run": ["codex"],
       "sys": ["hostname"]
     }

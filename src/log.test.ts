@@ -2,7 +2,14 @@ import { assertEquals, assertMatch } from "@std/assert";
 import { describe, it } from "@std/testing/bdd";
 import { Writable } from "node:stream";
 import type { Logger } from "pino";
-import { createLogger, logRequestStatus, summarizeRequest } from "./log.ts";
+import {
+  closeLogTransport,
+  createLogger,
+  createLogTransport,
+  logRequestStatus,
+  summarizeRequest,
+  waitForLogTransport,
+} from "./log.ts";
 
 function captureLogs(): {
   destination: Writable;
@@ -18,7 +25,81 @@ function captureLogs(): {
   return { destination, output: () => chunks.join("") };
 }
 
+async function withDeadline<T>(
+  promise: Promise<T>,
+  operation: string,
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error(`${operation} timed out`)),
+          2_000,
+        );
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+}
+
 describe("createLogger", () => {
+  it("keeps terminal logging active after the file transport fails", async () => {
+    const terminal = captureLogs();
+    const directory = await Deno.makeTempDir();
+    const filePath = `${directory}/process.log`;
+    let fileErrors = 0;
+    const transport = createLogTransport({
+      level: "info",
+      filePath,
+      terminalDestination: terminal.destination,
+      onFileError: () => fileErrors++,
+    });
+
+    try {
+      await withDeadline(waitForLogTransport(transport), "transport startup");
+      const logger = createLogger({ stream: transport.stream }).child({
+        scope: "lifecycle",
+      });
+      logger.info("before_failure");
+      transport.file.emit("error", new Error("disk full"));
+      logger.info("after_failure");
+      logger.flush();
+
+      assertEquals(fileErrors, 1);
+      assertMatch(terminal.output(), /INFO: \[lifecycle\] before_failure/);
+      assertMatch(terminal.output(), /INFO: \[lifecycle\] after_failure/);
+    } finally {
+      await withDeadline(closeLogTransport(transport), "transport shutdown");
+      await Deno.remove(directory, { recursive: true });
+    }
+  });
+
+  it("uses one configured threshold for scoped loggers", () => {
+    const infoCapture = captureLogs();
+    const infoLogger = createLogger({
+      level: "info",
+      destination: infoCapture.destination,
+    }).child({ scope: "codex" });
+    infoLogger.debug({ method: "safe/method" }, "notification");
+    infoLogger.info("ready");
+
+    const debugCapture = captureLogs();
+    const debugLogger = createLogger({
+      level: "debug",
+      destination: debugCapture.destination,
+    }).child({ scope: "codex" });
+    debugLogger.debug({ method: "safe/method" }, "notification");
+    debugLogger.info("ready");
+
+    assertEquals(infoCapture.output().includes("notification"), false);
+    assertMatch(infoCapture.output(), /INFO: \[codex\] ready/);
+    assertMatch(debugCapture.output(), /DEBUG: \[codex\] notification/);
+    assertMatch(debugCapture.output(), /INFO: \[codex\] ready/);
+  });
+
   it("formats scoped structured logs and recursively redacts secrets", () => {
     const capture = captureLogs();
     const logger: Logger = createLogger({

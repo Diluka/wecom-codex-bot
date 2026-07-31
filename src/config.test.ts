@@ -47,6 +47,31 @@ function expectedSettings(
 }
 
 describe("loadConfig", () => {
+  it("defaults LOG_LEVEL to info and accepts trimmed debug", async () => {
+    assertEquals((await loadConfig(configEnv(), Deno.cwd())).logLevel, "info");
+    assertEquals(
+      (await loadConfig(configEnv({ LOG_LEVEL: " debug " }), Deno.cwd()))
+        .logLevel,
+      "debug",
+    );
+    assertEquals(
+      (await loadConfig(configEnv({ LOG_LEVEL: "  " }), Deno.cwd())).logLevel,
+      "info",
+    );
+  });
+
+  it("rejects an invalid LOG_LEVEL without echoing it or secrets", async () => {
+    const error = await assertRejects(() =>
+      loadConfig(
+        configEnv({ LOG_LEVEL: "trace-secret", BOT_SECRET: "do-not-print" }),
+        Deno.cwd(),
+      )
+    );
+    assertInstanceOf(error, Error);
+    assertEquals(error.message, "Invalid environment variable: LOG_LEVEL");
+    assertNotMatch(error.message, /trace-secret|do-not-print/);
+  });
+
   it("resolves a relative Codex workspace from the bot directory", async () => {
     const root = await Deno.makeTempDir();
 
