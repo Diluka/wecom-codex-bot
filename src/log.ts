@@ -1,5 +1,12 @@
-import pino, { type LogFn, type Logger, type SerializerFn } from "pino";
+import { once } from "node:events";
+import pino, {
+  type DestinationStream,
+  type LogFn,
+  type Logger,
+  type SerializerFn,
+} from "pino";
 import pretty, { type PrettyOptions } from "pino-pretty";
+import type { LogLevel } from "./config.ts";
 import { redactSecrets } from "./output.ts";
 
 const REQUEST_WARN = new Set(["runtime_unavailable", "shutdown_discarded"]);
@@ -26,6 +33,31 @@ type LogFields = Record<string, unknown>;
 export interface LoggerOptions {
   secrets?: Iterable<string>;
   destination?: PrettyOptions["destination"];
+  stream?: DestinationStream;
+  level?: LogLevel;
+}
+
+export interface LogTransportOptions {
+  level: LogLevel;
+  filePath: string;
+  terminalDestination?: PrettyOptions["destination"];
+  onFileError?: (error: Error) => void;
+}
+
+type FileTransport = ReturnType<typeof pino.transport> & {
+  readonly ready: boolean;
+  readonly destroyed: boolean;
+  readonly closed: boolean;
+};
+
+type RemovableMultiStream = ReturnType<typeof pino.multistream> & {
+  readonly lastId: number;
+  remove(id: number): RemovableMultiStream;
+};
+
+export interface LogTransport {
+  stream: DestinationStream;
+  file: FileTransport;
 }
 
 // Structural by design: the orchestrator's later event type needs no import here.
@@ -49,18 +81,20 @@ export interface RequestStatusEventLike {
 
 export function createLogger(options: LoggerOptions = {}): Logger {
   const secrets = [...(options.secrets ?? [])];
-  const stream = pretty({
-    colorize: false,
-    destination: options.destination,
-    errorLikeObjectKeys: [],
-    ignore: "pid,hostname,scope",
-    messageFormat: (log, messageKey) =>
-      `[${String(log.scope)}] ${String(log[messageKey])}`,
-    singleLine: true,
-    translateTime: "SYS:yyyy-mm-dd'T'HH:MM:ss.l o",
-    sync: true,
-  });
+  const stream = options.stream ??
+    pretty({
+      colorize: false,
+      destination: options.destination,
+      errorLikeObjectKeys: [],
+      ignore: "pid,hostname,scope",
+      messageFormat: (log, messageKey) =>
+        `[${String(log.scope)}] ${String(log[messageKey])}`,
+      singleLine: true,
+      translateTime: "SYS:yyyy-mm-dd'T'HH:MM:ss.l o",
+      sync: true,
+    });
   const root = pino({
+    level: options.level ?? "info",
     base: null,
     redact: {
       // Explicit paths preserve the actual key; Pino reports wildcard keys as
@@ -93,6 +127,62 @@ export function createLogger(options: LoggerOptions = {}): Logger {
 
   protectChildBindingKeys(root, secrets);
   return root;
+}
+
+export function createLogTransport(
+  options: LogTransportOptions,
+): LogTransport {
+  const terminal = pretty({
+    colorize: false,
+    destination: options.terminalDestination,
+    errorLikeObjectKeys: [],
+    ignore: "pid,hostname,scope",
+    messageFormat: (log, messageKey) =>
+      `[${String(log.scope)}] ${String(log[messageKey])}`,
+    singleLine: true,
+    translateTime: "SYS:yyyy-mm-dd'T'HH:MM:ss.l o",
+    sync: true,
+  });
+  const file = pino.transport({
+    target: "pino/file",
+    options: {
+      destination: options.filePath,
+      mkdir: true,
+      append: true,
+      mode: 0o600,
+    },
+  }) as FileTransport;
+  const stream = pino.multistream([
+    { level: options.level, stream: terminal },
+  ]) as RemovableMultiStream;
+  stream.add({ level: options.level, stream: file });
+  const fileStreamId = stream.lastId;
+  let fileAttached = true;
+
+  file.on("error", (error: Error) => {
+    if (!fileAttached) return;
+    fileAttached = false;
+    stream.remove(fileStreamId);
+    options.onFileError?.(error);
+  });
+
+  return { stream, file };
+}
+
+export async function waitForLogTransport(
+  transport: LogTransport,
+): Promise<void> {
+  if (transport.file.ready) return;
+  await once(transport.file, "ready");
+}
+
+export async function closeLogTransport(
+  transport: LogTransport,
+): Promise<void> {
+  if (transport.file.closed) return;
+  const closed = once(transport.file, "close");
+  if (!transport.file.destroyed) transport.file.end();
+  await closed;
 }
 
 export function summarizeRequest(

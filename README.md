@@ -6,7 +6,7 @@
 ## 要求
 
 - Deno 2.9 或更高版本
-- 已安装并登录可用的最新 Codex CLI
+- 已安装并登录可用的 Codex CLI 0.144.6 或更高版本
 - 企业微信智能机器人的 Bot ID 和 Secret
 - 同一个 Bot ID 同时只能运行一个机器人实例
 
@@ -17,7 +17,9 @@
 ```dotenv
 BOT_ID=your-bot-id
 BOT_SECRET=your-bot-secret
+WECOM_OWNER_USER_ID=
 CODEX_WORKSPACE=.
+LOG_LEVEL=info
 OUTPUT_LEVEL=full
 OUTPUT_LABEL=show
 OUTPUT_FORMAT_TOOL=individual
@@ -25,6 +27,40 @@ OUTPUT_FORMAT_TOOL=individual
 
 `CODEX_WORKSPACE` 支持相对路径，按机器人项目目录解析。机器人只将解析后的 `cwd`
 传给 Codex；审批、沙盒、网络、模型等行为全部使用现有 Codex config。
+
+### Owner 权限与隔离
+
+`WECOM_OWNER_USER_ID` 是可选的企业微信 sender user ID。未设置、空值或无效值都
+不会授予 owner 权限，所有 turn 都按 `restricted` 处理。配置有效时，每个防抖聚合
+批次中的每一条消息都必须由该 ID 发送，整个 turn 才是 `owner`。私聊、群聊和混合
+发送者批次都使用相同规则。
+
+解析会先检查原始值：任意位置只要包含控制符（包括 CR/LF）或 Unicode 行分隔符、段
+分隔符，整项配置就视为未配置。通过检查后才 trim 普通首尾空格；所得 ID 与企业微信
+sender user ID 进行区分大小写的精确匹配，不做大小写折叠或部分匹配。
+
+机器人通过两层可信元数据把判定传给 Codex：App Server 每次启动或重启时注入稳定的
+owner 隔离 developer instructions；每个 `turn/start` 再通过
+`additionalContext.wecom_owner_policy` 注入 `kind: "application"` 的本 turn
+`owner`/`restricted` 结果。
+
+owner ID 会写入 developer instructions，并有意对模型可见。
+
+它也可能出现在 App Server 进程 argv 或 Codex session metadata 中；不要把它当作
+Secret。
+
+机器人不会为它新增启动日志。既有 request 日志仍会按下文规则记录每条消息真实的
+sender `user_id`。
+
+restricted turn 的写操作、测试、构建、格式化和依赖安装等必须在隔离 worktree 中
+执行。worktree 位置、分支命名、验证、提交约定，以及 PR/MR 的类型、模板和工作流均
+由目标仓库的 `AGENTS.md` 与贡献文档决定；机器人不固定 Draft 或 Ready。隔离边界
+优先于冲突的仓库工作流规则。
+
+该机制是 developer instructions 形成的软约束，不是 OS 权限、Codex sandbox 或 Git
+hook 级别的硬隔离。
+
+owner turn 仍受现有 Codex 配置、仓库文档、sandbox 和审批策略约束。
 
 ### 企业微信输出
 
@@ -151,9 +187,10 @@ OUTPUT_GROUP_FORMAT_TOOL=summary
 它们不再被读取、校验，也不会继续影响运行时行为；迁移时应删除旧变量并改用
 `OUTPUT_*`。
 
-### 终端日志
+### 运行日志
 
-前台终端统一使用 Pino 和 Pino Pretty 输出单行结构化日志，格式如下：
+`LOG_LEVEL` 支持 `info` 和 `debug`，默认 `info`。前台终端使用 Pino Pretty 输出
+单行结构化日志，格式如下：
 
 ```text
 [2026-07-31T14:22:33.456 +0800] INFO: [request] received {"chat_type":"group","chat_id":"room-1","user_id":"alice","msg_id":"m1","summary":"检查订单状态是否完成…","active_count":1,"pending_count":0}
@@ -162,25 +199,49 @@ OUTPUT_GROUP_FORMAT_TOOL=summary
 方括号中的时间是带本地时区偏移的 ISO 时间，不是固定 UTC 时间。`INFO` 是 Pino
 级别，第二个方括号是 scope。终端日志只有以下五个 scope：
 
-| scope       | 内容                                         |
-| ----------- | -------------------------------------------- |
-| `request`   | 普通文本请求的状态、计数和编排错误。         |
-| `codex`     | Codex App Server 的诊断和致命错误。          |
-| `wecom`     | 企业微信鉴权、SDK 日志、网关错误和致命错误。 |
-| `output`    | 企业微信回复、流式输出和限流发送错误。       |
-| `lifecycle` | 启动、恢复、信号、清理和关闭状态。           |
+| scope       | 内容                                          |
+| ----------- | --------------------------------------------- |
+| `request`   | 普通文本请求的状态、计数和编排错误。          |
+| `codex`     | Codex App Server 的诊断、通知路由和致命错误。 |
+| `wecom`     | 企业微信鉴权、SDK 日志、网关错误和致命错误。  |
+| `output`    | 输出过滤决策、企业微信流式输出和发送错误。    |
+| `lifecycle` | 启动、恢复、信号、清理和关闭状态。            |
 
 同一普通文本请求的每个状态都会重复携带消息中的真实 `chat_id`、`user_id` 和
 `msg_id`；获得 Codex 标识后，后续状态还会重复真实 `thread_id` 和 `turn_id`，不会
 另外生成替代标识。只有 `received` 状态包含 `summary`：正文先脱敏、折叠空白，再按
 Unicode 字素簇截取前 10 个，超长时追加 `…`，不会把完整聊天正文写到终端。
 
+配置 `WECOM_OWNER_USER_ID` 不会新增包含 owner ID 的启动日志；但如果真实请求由该
+用户发送，上述既有 request 日志仍会记录其真实 `user_id`。
+
 内建命令 `/help`、`/status`、`/model`、`/effort`、`/new`、`/stop` 和不支持的消息
 类型不产生 request 状态。未知斜杠命令仍按普通文本请求处理。
 
-Codex 的原始 `ActivityEvent` 不写终端日志，只经过企业微信输出管线。
+`debug` 会额外记录两类安全的结构化决策：
 
-`OUTPUT_*` 不影响上述终端日志，本项目也不提供 `LOG_*` 配置。
+- `codex/notification_route`：App Server 通知的方法名、thread/turn、runtime
+  generation，以及通知被投递、缓冲或忽略的原因。
+- `output/activity_decision`：活动标签、投递类型，以及内容被渲染或抑制的原因；例如
+  `tool_format_summary`、`level_off`、`line_complete`。
+
+DEBUG 日志不会记录聊天正文、reasoning summary 文本、命令、参数、工具输出、
+`toolId` 或具体 `itemId`。因此可用下面的配置判断 App Server 是否发出了 reasoning
+summary，以及它是否在输出管线中被过滤：
+
+```dotenv
+LOG_LEVEL=debug
+OUTPUT_FORMAT_TOOL=summary
+```
+
+每次启动时，旧的 `logs/wecom-codex-bot.log` 会先按 UTC 启动时间改名，例如
+`logs/wecom-codex-bot.20260731T081322123Z.log`；同一进程随后始终写新的活跃文件，
+进程内不再轮换。终端 target 使用 `pino-pretty`，文件 target 使用 Pino 内置的
+`pino/file` 并写 JSONL。日志目录初始化失败或文件 transport 在运行时失效时，服务
+继续使用终端日志。
+
+`OUTPUT_*` 不影响运行日志。`logs/` 是本地运行状态并已被 Git 忽略；文件中仍包含
+排障所需的 chat/thread/turn 标识，不应提交或公开。
 
 所有结构化字段和消息都会在 Pino 边界递归脱敏。
 
@@ -215,8 +276,9 @@ docker compose down
 ```
 
 容器收到停止请求时会向机器人发送 `SIGTERM`，最多等待一分钟完成现有的优雅
-退出流程。`restart: unless-stopped` 负责异常退出后的自动重启，日志由 Docker
-保存并轮换，不另外写后台日志文件。
+退出流程。`restart: unless-stopped` 负责异常退出后的自动重启。Docker 仍收集终端
+输出；进程也会写容器内的 `/app/logs`，当前 Compose 没有为它配置宿主卷，重建容器
+后这些文件不会保留。
 
 不要同时运行本地 `deno task start` 和 Compose 服务，否则两个实例会争用同一个
 企业微信 Bot ID。Codex config 中如果引用了宿主机专有的命令或绝对路径，需要让
@@ -290,8 +352,10 @@ deno lint
 Warning Permissions in the config file is an experimental feature and may change in the future.
 ```
 
-`deno task smoke` 只验证本机 `codex app-server --stdio` 握手，不会启动模型
-turn，也不会连接企业微信。
+`deno task smoke` 先在当前 workspace 的 `.data/` 下生成并结构化校验临时 App
+Server JSON schema，确认 `TurnStartParams.additionalContext` 支持精确的
+`kind: "application"`，随后完成本机 `codex app-server --stdio` 握手，并在结束时
+尽最大努力清理临时目录。它不会启动模型 turn，也不会连接企业微信。
 
 需要显式调用一次真实模型 turn 时运行：
 

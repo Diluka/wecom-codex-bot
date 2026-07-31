@@ -2,8 +2,9 @@
 
 ## 项目定位
 
-这是一个 Deno 2.9+ 前台服务，通过企业微信智能机器人的 WebSocket 长连接，
-把单聊或群聊消息转发给 `codex app-server --stdio`。每个聊天持久绑定一个 Codex
+这是一个前台服务，要求 Deno 2.9+ 和 Codex CLI 0.144.6+。它通过企业微信智能
+机器人的 WebSocket 长连接，把单聊或群聊消息转发给
+`codex app-server --stdio`。每个聊天持久绑定一个 Codex
 thread；机器人负责消息路由、状态恢复、增量输出、限流和优雅关闭，Codex CLI
 继续使用用户已有的登录信息、配置、沙盒和审批策略。
 
@@ -24,7 +25,8 @@ Codex notifications
   -> WeCom reply/stream
 ```
 
-- 程序入口是 `main.ts`，这里只组装依赖、安装信号处理并统一做终端日志脱敏。
+- 程序入口是 `main.ts`，这里只组装依赖、安装信号处理并统一配置 Pino 日志脱敏、
+  终端输出和 `logs/` 文件 transport。
 - `CODEX_WORKSPACE` 是 Codex 实际工作的目录；它相对进程工作目录解析，标准
   `deno task start` 从仓库根启动时才等同于相对项目根解析。
 - `.data/bot.sqlite` 只保存聊天/thread 绑定、消息去重和 turn
@@ -36,7 +38,8 @@ Codex notifications
 | 文件                         | 职责                                                              |
 | ---------------------------- | ----------------------------------------------------------------- |
 | `main.ts`                    | 加载配置并组装状态库、Codex、企业微信、输出、编排器和生命周期     |
-| `src/config.ts`              | 校验环境变量，解析工作目录和 `OUTPUT_*` 配置                      |
+| `src/config.ts`              | 校验环境变量，解析工作目录、`LOG_LEVEL` 和 `OUTPUT_*` 配置        |
+| `src/owner-policy.ts`        | 规范化 owner ID，判定 turn 权限并生成稳定的隔离 instructions      |
 | `src/wecom.ts`               | 适配企业微信 SDK，规范化单聊/群聊消息，处理连接与回复             |
 | `src/state.ts`               | 使用 `node:sqlite` 同步 API 管理持久状态和消息去重                |
 | `src/codex-app-server.ts`    | 管理 App Server 子进程、JSONL/JSON-RPC、超时和服务端请求          |
@@ -49,7 +52,8 @@ Codex notifications
 | `src/chat-output.ts`         | 把通用输出能力接到企业微信回复与流式消息                          |
 | `src/lifecycle.ts`           | 固定启动、恢复和优雅关闭顺序                                      |
 | `src/prompt.ts`              | 把不可伪造的聊天/发送者元数据加入 Codex prompt                    |
-| `src/jsonl.ts`、`src/log.ts` | JSONL 读取和脱敏终端日志等小型边界工具                            |
+| `src/process-log.ts`         | 每次启动前轮换旧的 Pino 活跃日志文件                              |
+| `src/jsonl.ts`、`src/log.ts` | JSONL 读取、Pino transport 和脱敏日志等小型边界工具               |
 
 测试与实现共置为 `src/*.test.ts`。修改某个模块时，先读同名测试；这里大量行为
 依赖并发时序，测试往往比类型签名更完整地描述契约。
@@ -73,6 +77,14 @@ Codex notifications
   pending，并请求中断活动 turn；它保留 thread 绑定。停止后的新普通文本可以重新
   开始防抖窗口，且停止范围不能影响其他 conversation。
 - 所有普通文本、命令和不支持的消息都必须先通过 `msgid` 去重。
+- `WECOM_OWNER_USER_ID` 缺失、空白或无效时，所有 turn 都必须按 `restricted`
+  处理。必须先检查原始值；任意位置含控制符（包括 CR/LF）或 Unicode 行/段分隔符
+  即无效，不能先 trim 后绕过。其余值 trim 普通首尾空格后，与每条消息的 sender
+  user ID 做区分大小写的精确匹配；聚合批次只有所有 sender 都匹配才是 `owner`，
+  任何混合或不一致都必须 fail closed 为 `restricted`。
+- owner 隔离 developer instructions 必须在 App Server 每次启动和重启时注入；每个
+  turn 的实际判定必须另外通过 `TurnStartParams.additionalContext` 的
+  `kind: "application"` 传递。不能依赖聊天正文、历史 turn 或模型自行推断 owner。
 - App Server 重启后，持久 thread 必须按新的 runtime generation 重新 resume；崩溃
   时活动 turn 结束为 `runtime_lost`，旧 generation 的晚到事件不能泄漏到新 turn。
 - 最终回答由 `TurnOutcome` 直发，不属于过程事件流。原始 `TURN` 通知由 runtime
@@ -97,6 +109,24 @@ Codex notifications
   顺序必须保持：停止接收新工作并中断 turn、停止常规输出、完成活动流、断开企业
   微信、关闭 App Server、最后关闭 SQLite。每一步失败都不能阻止后续清理。
 
+## Owner 权限与软隔离
+
+- owner ID 被写入启动期 developer instructions，属于有意对模型可见的数据，并且
+  可能出现在 App Server argv 或 Codex session metadata；不得把它当作 Secret。
+- 不要新增输出 owner ID 的启动日志。既有 request 日志仍按真实消息记录 sender
+  `user_id`；owner 配置不会替换、匿名化或隐藏该字段。
+- restricted turn 可在 main checkout 中执行无副作用的读取、搜索和状态检查，但
+  写操作、测试、构建、格式化、依赖安装及其他潜在写操作必须进入隔离 worktree。
+  不得修改 main checkout、index、stash、未提交内容或嵌套仓库状态。
+- worktree 位置、分支命名、验证、提交约定，以及 PR/MR 的类型、模板和工作流由目标
+  仓库的 `AGENTS.md` 和贡献文档决定；不要在机器人策略中固定 Draft 或 Ready。
+  owner 隔离边界优先于冲突的仓库工作流说明，无法安全确定时必须停止并解释。
+- restricted turn 只能在非默认 worktree 分支提交和推送，不能提交或推送默认分支、
+  不能合并，只能通过 PR/MR 交付；规则同样约束子代理。
+- 这是 developer instructions 形成的软边界，不是 OS 权限、Codex sandbox 或 Git
+  hook 级别的硬隔离。owner turn 不受这层新增隔离策略限制，但仍受现有 Codex
+  配置、仓库文档、sandbox 和审批规则约束。
+
 ## 修改时从哪里落手
 
 - 企业微信帧、conversation key 或 SDK 生命周期：改 `src/wecom.ts` 和
@@ -120,6 +150,9 @@ Codex notifications
   `PRAGMA user_version`，保留旧文件升级路径；不得把聊天正文、prompt 或 Codex
   输出加入状态库。
 - 新增配置或命令时，代码、`.env.example`、README 和相应测试必须一起更新。
+- 修改 owner 解析、权限判定或注入时，同步检查 `src/config.ts`、
+  `src/owner-policy.ts`、`src/orchestrator.ts`、`src/codex-app-server.ts`
+  及对应测试；`README.md` 和 `.env.example` 中的安全边界也必须保持一致。
 
 ## 开发与测试约定
 
@@ -163,8 +196,11 @@ deno task smoke
 git ls-files -co --exclude-standard -z -- '*.ts' '*.json' '*.md' | xargs -0 deno fmt --check
 ```
 
-- `deno task smoke` 只验证本机 `codex app-server --stdio`
-  握手，不调用模型，也不连接企业微信，可作为默认集成烟测。
+- `deno task smoke` 先在当前 workspace 的 `.data/` 下生成临时 App Server JSON
+  schema，结构化验证 `TurnStartParams.additionalContext` 支持精确的
+  `kind: "application"`，再验证本机 `codex app-server --stdio` 握手，并在成功或
+  失败后尽最大努力清理临时目录。它不调用模型，也不连接企业微信，可作为默认集成
+  烟测。
 - `RUN_CODEX_TURN=1 deno task smoke-turn`
   会产生一次真实模型调用。只有用户明确要求真实集成验证时才运行，并在结果中说明它消耗了模型调用。
 - 涉及 Dockerfile 或 Compose 时，另外运行 `docker compose config`；只有确实需要
@@ -172,10 +208,13 @@ git ls-files -co --exclude-standard -z -- '*.ts' '*.json' '*.md' | xargs -0 deno
 
 ## 敏感数据与本地状态
 
-- `.env`、`.data/`、`.codegraph/` 都是本地内容，不得提交。不要回显真实
-  `BOT_ID`、`BOT_SECRET`、Codex 登录信息、聊天标识或 SQLite 内容。
-- App Server 子进程环境会显式移除 `BOT_ID` 和 `BOT_SECRET`，但如果 `.env` 位于
-  `CODEX_WORKSPACE` 内，Codex 仍可直接读取该文件。输出脱敏不是 Secret 隔离边界。
+- `.env`、`.data/`、`.codegraph/`、`.superpowers/` 和 `logs/` 都是本地内容，
+  不得提交。不要回显真实 `BOT_ID`、`BOT_SECRET`、Codex 登录信息、聊天标识或
+  SQLite 内容。
+- App Server 子进程环境会显式移除 `BOT_ID`、`BOT_SECRET` 和
+  `WECOM_OWNER_USER_ID`，但 owner ID 仍通过 developer instructions 对模型可见，
+  也可能出现在 argv 或 session metadata；如果 `.env` 位于 `CODEX_WORKSPACE` 内，
+  Codex 仍可直接读取该文件。输出脱敏不是 Secret 隔离边界。
 - `~/.codex` 和 `~/.agents` 包含高敏配置与凭据。Compose 会把它们挂进容器；不要在
   测试、日志或提交中复制其内容。
 - 同一个 Bot ID 同时只能运行一个实例。不要并行启动 `deno task start` 与
@@ -188,8 +227,9 @@ git ls-files -co --exclude-standard -z -- '*.ts' '*.json' '*.md' | xargs -0 deno
 不要只根据 README 假定宿主工作区和 SQLite 已被正确持久化。当前 `compose.yml`
 的容器工作目录是 `/app`，默认 `CODEX_WORKSPACE=.` 也解析到
 `/app`，但宿主仓库挂载在 `/home/bot/workspace`；状态库则写到
-`/app/.data/bot.sqlite`，没有独立宿主卷。修改或宣称 Compose
-的工作区编辑、状态持久化行为之前，必须先用实际容器路径验证。
+`/app/.data/bot.sqlite`，没有独立宿主卷。运行日志同样写到未挂载的
+`/app/logs`。修改或宣称 Compose 的工作区编辑、状态或日志持久化行为之前，必须先用
+实际容器路径验证。
 
 容器由 Compose 保持前台运行，使用 `restart: unless-stopped` 和一分钟停止宽限期；
 不要增加后台守护、PID 文件或额外日志包装层。宿主 Codex 配置引用的绝对路径或外部

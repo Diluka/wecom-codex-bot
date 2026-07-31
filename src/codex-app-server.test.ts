@@ -7,6 +7,7 @@ import {
   type AppServerProcessStatus,
   classifyAppServerMessage,
   CodexAppServerClient,
+  CodexRpcError,
   selectFinalAgentMessage,
   type SpawnAppServer,
 } from "./codex-app-server.ts";
@@ -182,11 +183,13 @@ describe("CodexAppServerClient", () => {
     equal(classifyAppServerMessage({ value: true }), "unknown");
   });
 
-  it("spawns stdio App Server, strips bot secrets, and handshakes", async () => {
+  it("spawns stdio App Server with process-only instructions and no bot secrets", async () => {
     const oldBotId = Deno.env.get("BOT_ID");
     const oldBotSecret = Deno.env.get("BOT_SECRET");
+    const oldOwnerUserId = Deno.env.get("WECOM_OWNER_USER_ID");
     Deno.env.set("BOT_ID", "bot-id-secret");
     Deno.env.set("BOT_SECRET", "bot-secret-value");
+    Deno.env.set("WECOM_OWNER_USER_ID", "owner-id-secret");
 
     const fake = new FakeAppServerProcess();
     const calls: Array<{ command: string; options: Deno.CommandOptions }> = [];
@@ -194,6 +197,7 @@ describe("CodexAppServerClient", () => {
     try {
       client = await CodexAppServerClient.start({
         cwd: "/workspace/project",
+        developerInstructions: 'Owner "policy"\npath \\ workspace',
         spawn: createSpawn(fake, calls),
       });
       await waitFor(
@@ -203,11 +207,17 @@ describe("CodexAppServerClient", () => {
 
       equal(calls.length, 1);
       equal(calls[0].command, "codex");
-      deepStrictEqual(calls[0].options.args, ["app-server", "--stdio"]);
+      deepStrictEqual(calls[0].options.args, [
+        "-c",
+        'developer_instructions="Owner \\"policy\\"\\npath \\\\ workspace"',
+        "app-server",
+        "--stdio",
+      ]);
       equal(calls[0].options.cwd, "/workspace/project");
       equal(calls[0].options.clearEnv, true);
       equal(calls[0].options.env?.BOT_ID, undefined);
       equal(calls[0].options.env?.BOT_SECRET, undefined);
+      equal(calls[0].options.env?.WECOM_OWNER_USER_ID, undefined);
       deepStrictEqual(fake.received[0], {
         method: "initialize",
         id: 1,
@@ -227,13 +237,14 @@ describe("CodexAppServerClient", () => {
     } finally {
       restoreEnv("BOT_ID", oldBotId);
       restoreEnv("BOT_SECRET", oldBotSecret);
+      restoreEnv("WECOM_OWNER_USER_ID", oldOwnerUserId);
       await client?.close();
     }
   });
 });
 
 describe("CodexAppServerClient thread settings", () => {
-  it("parses thread settings while using only the allowed RPC overrides", async () => {
+  it("parses thread settings and sends exact owner authority context", async () => {
     const fake = new FakeAppServerProcess();
     const client = await CodexAppServerClient.start({
       cwd: "/workspace/project",
@@ -275,11 +286,21 @@ describe("CodexAppServerClient thread settings", () => {
         threadId: "thread-existing",
         settings: { model: "gpt-test", effort: "high" },
       });
-      equal(await client.startTurn("thread-existing", "Run tests"), "turn-new");
+      equal(
+        await client.startTurn("thread-existing", "Run tests", "restricted"),
+        "turn-new",
+      );
+      equal(
+        await client.startTurn("thread-existing", "Ship changes", "owner"),
+        "turn-new",
+      );
       await client.interrupt("thread-existing", "turn-new");
 
       const requests = fake.received.filter((message) => "id" in message);
-      deepStrictEqual(requests.map((request) => request.id), [1, 2, 3, 4, 5]);
+      deepStrictEqual(
+        requests.map((request) => request.id),
+        [1, 2, 3, 4, 5, 6],
+      );
       deepStrictEqual(requests[1], {
         method: "thread/start",
         id: 2,
@@ -297,11 +318,32 @@ describe("CodexAppServerClient thread settings", () => {
           threadId: "thread-existing",
           input: [{ type: "text", text: "Run tests", text_elements: [] }],
           cwd: "/workspace/project",
+          additionalContext: {
+            wecom_owner_policy: {
+              kind: "application",
+              value: "Bot verified authority for the current turn: restricted",
+            },
+          },
         },
       });
       deepStrictEqual(requests[4], {
-        method: "turn/interrupt",
+        method: "turn/start",
         id: 5,
+        params: {
+          threadId: "thread-existing",
+          input: [{ type: "text", text: "Ship changes", text_elements: [] }],
+          cwd: "/workspace/project",
+          additionalContext: {
+            wecom_owner_policy: {
+              kind: "application",
+              value: "Bot verified authority for the current turn: owner",
+            },
+          },
+        },
+      });
+      deepStrictEqual(requests[5], {
+        method: "turn/interrupt",
+        id: 6,
         params: { threadId: "thread-existing", turnId: "turn-new" },
       });
     } finally {
@@ -340,6 +382,47 @@ describe("CodexAppServerClient thread settings", () => {
       deepStrictEqual(await client.resumeThread("thread-existing"), {
         threadId: "thread-existing",
         settings: { model: "gpt-test", effort: null },
+      });
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("propagates a rejected contextual turn RPC without retrying", async () => {
+    const fake = new FakeAppServerProcess();
+    const client = await CodexAppServerClient.start({
+      cwd: "/workspace/project",
+      spawn: createSpawn(fake, [], (message) => {
+        if (message.method === "turn/start") {
+          fake.send({
+            id: message.id,
+            error: { code: -32602, message: "context rejected" },
+          });
+        }
+      }),
+    });
+
+    try {
+      const error = await assertRejects(
+        () => client.startTurn("thread-existing", "Run tests", "restricted"),
+        CodexRpcError,
+        "context rejected",
+      );
+      assertEquals(error.code, -32602);
+      const requests = fake.received.filter((message) =>
+        message.method === "turn/start"
+      );
+      assertEquals(requests.length, 1);
+      deepStrictEqual(requests[0].params, {
+        threadId: "thread-existing",
+        input: [{ type: "text", text: "Run tests", text_elements: [] }],
+        cwd: "/workspace/project",
+        additionalContext: {
+          wecom_owner_policy: {
+            kind: "application",
+            value: "Bot verified authority for the current turn: restricted",
+          },
+        },
       });
     } finally {
       await client.close();

@@ -15,6 +15,7 @@ import {
   CodexRuntime,
   type CodexRuntimeClient,
   type CodexRuntimeClientFactory,
+  type CodexRuntimeTrace,
 } from "./codex-runtime.ts";
 import type { ActivityEvent } from "./activity-event.ts";
 import type {
@@ -24,6 +25,7 @@ import type {
   ConfigDefaults,
   SettingsPatch,
 } from "./model-settings.ts";
+import type { RequestAuthority } from "./owner-policy.ts";
 
 const EXITED: AppServerProcessStatus = {
   success: false,
@@ -60,7 +62,11 @@ class FakeClient implements CodexRuntimeClient {
   readonly threadSettings = new Map<string, CodexSettings>();
   readonly startedThreads: string[] = [];
   readonly resumedThreads: string[] = [];
-  readonly startedTurns: Array<{ threadId: string; prompt: string }> = [];
+  readonly startedTurns: Array<{
+    threadId: string;
+    prompt: string;
+    authority: RequestAuthority;
+  }> = [];
   readonly interruptedTurns: Array<{ threadId: string; turnId: string }> = [];
   readonly threadUpdates: Array<{ threadId: string; patch: SettingsPatch }> =
     [];
@@ -122,8 +128,12 @@ class FakeClient implements CodexRuntimeClient {
     return this.configWriteBehaviors.shift()?.() ?? Promise.resolve();
   }
 
-  async startTurn(threadId: string, prompt: string): Promise<string> {
-    this.startedTurns.push({ threadId, prompt });
+  async startTurn(
+    threadId: string,
+    prompt: string,
+    authority: RequestAuthority,
+  ): Promise<string> {
+    this.startedTurns.push({ threadId, prompt, authority });
     const next = this.turnIds.shift();
     return await (next ?? `turn-${this.startedTurns.length}`);
   }
@@ -779,6 +789,96 @@ describe("CodexRuntime serializes model settings operations", () => {
 });
 
 describe("CodexRuntime", () => {
+  it("reports safe notification routing metadata without payload content", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    client.turnIds.push("turn-trace");
+    factory.queue.push(client);
+    const traces: CodexRuntimeTrace[] = [];
+    const runtime = runtimeWith(factory, {
+      onTrace: (trace) => {
+        traces.push(trace);
+      },
+    });
+    await runtime.start();
+    const handle = await runtime.startTurn(
+      "thread-trace",
+      "prompt",
+      "owner",
+      () => {},
+    );
+
+    client.callbacks.onNotification?.({
+      method: "item/reasoning/summaryTextDelta",
+      params: {
+        threadId: "thread-trace",
+        turnId: "turn-trace",
+        delta: "forbidden-private-body",
+      },
+    });
+    client.callbacks.onNotification?.({
+      method: "item/reasoning/textDelta",
+      params: {
+        threadId: "thread-trace",
+        turnId: "turn-trace",
+        delta: "forbidden-private-reasoning",
+      },
+    });
+    client.callbacks.onNotification?.({
+      method: "warning",
+      params: { message: "forbidden-without-scope" },
+    });
+    client.callbacks.onNotification?.({
+      method: "turn/started",
+      params: { threadId: "thread-trace", turnId: "turn-trace" },
+    });
+
+    assertEquals(traces, [
+      {
+        method: "item/reasoning/summaryTextDelta",
+        decision: "routed",
+        reason: "delivered",
+        generation: 1,
+        threadId: "thread-trace",
+        turnId: "turn-trace",
+        tag: "CONTENT",
+      },
+      {
+        method: "item/reasoning/textDelta",
+        decision: "ignored",
+        reason: "adapter_ignored",
+        generation: 1,
+        threadId: "thread-trace",
+        turnId: "turn-trace",
+      },
+      {
+        method: "warning",
+        decision: "ignored",
+        reason: "missing_turn_ids",
+        generation: 1,
+      },
+      {
+        method: "turn/started",
+        decision: "ignored",
+        reason: "turn_owned_by_orchestrator",
+        generation: 1,
+        threadId: "thread-trace",
+        turnId: "turn-trace",
+        tag: "TURN",
+      },
+    ]);
+    assertEquals(JSON.stringify(traces).includes("forbidden"), false);
+
+    client.callbacks.onTurnCompleted?.({
+      threadId: "thread-trace",
+      turnId: "turn-trace",
+      status: "completed",
+      error: null,
+    });
+    await handle.completion;
+    await runtime.stop();
+  });
+
   it("starts one client and implements the Codex port operations", async () => {
     const factory = new FakeFactory();
     const client = new FakeClient();
@@ -798,6 +898,7 @@ describe("CodexRuntime", () => {
     const handle = await runtime.startTurn(
       "thread-existing",
       "检查测试",
+      "owner",
       () => {},
     );
     assertEquals(handle.turnId, "turn-9");
@@ -806,6 +907,7 @@ describe("CodexRuntime", () => {
     assertEquals(client.startedTurns, [{
       threadId: "thread-existing",
       prompt: "检查测试",
+      authority: "owner",
     }]);
     assertEquals(client.interruptedTurns, [{
       threadId: "thread-existing",
@@ -840,6 +942,7 @@ describe("CodexRuntime", () => {
     const first = await runtime.startTurn(
       "thread-a",
       "first",
+      "restricted",
       (activity) => {
         firstProgress.push(activity);
       },
@@ -847,6 +950,7 @@ describe("CodexRuntime", () => {
     const second = await runtime.startTurn(
       "thread-b",
       "second",
+      "restricted",
       (activity) => {
         secondProgress.push(activity);
       },
@@ -922,6 +1026,7 @@ describe("CodexRuntime", () => {
     const starting = runtime.startTurn(
       "thread-early",
       "work",
+      "restricted",
       (activity) => {
         progress.push(activity);
       },
@@ -972,7 +1077,12 @@ describe("CodexRuntime", () => {
     const runtime = runtimeWith(factory);
     await runtime.start();
 
-    const failedStart = runtime.startTurn("parent-retry", "first", () => {});
+    const failedStart = runtime.startTurn(
+      "parent-retry",
+      "first",
+      "restricted",
+      () => {},
+    );
     await waitFor(() => client.startedTurns.length === 1, "first turn RPC");
     client.callbacks.onNotification?.({
       method: "item/started",
@@ -992,6 +1102,7 @@ describe("CodexRuntime", () => {
     const retry = await runtime.startTurn(
       "parent-retry",
       "retry",
+      "restricted",
       (activity) => {
         activities.push(activity);
       },
@@ -1033,6 +1144,7 @@ describe("CodexRuntime", () => {
     const active = await runtime.startTurn(
       "parent-active",
       "active",
+      "restricted",
       (activity) => {
         activities.push(activity);
       },
@@ -1049,7 +1161,12 @@ describe("CodexRuntime", () => {
       },
     });
 
-    const failedStart = runtime.startTurn("parent-active", "failed", () => {});
+    const failedStart = runtime.startTurn(
+      "parent-active",
+      "failed",
+      "restricted",
+      () => {},
+    );
     await waitFor(() => client.startedTurns.length === 2, "failed turn RPC");
     client.callbacks.onNotification?.({
       method: "item/started",
@@ -1115,6 +1232,7 @@ describe("CodexRuntime", () => {
     const failedStart = runtime.startTurn(
       "parent-concurrent",
       "first",
+      "restricted",
       () => {},
     );
     await waitFor(() => client.startedTurns.length === 1, "first turn RPC");
@@ -1122,6 +1240,7 @@ describe("CodexRuntime", () => {
     const pendingStart = runtime.startTurn(
       "parent-concurrent",
       "second",
+      "restricted",
       (activity) => {
         pendingActivities.push(activity);
       },
@@ -1206,6 +1325,7 @@ describe("CodexRuntime", () => {
     const starting = runtime.startTurn(
       "thread-early",
       "work",
+      "restricted",
       (activity) => {
         activities.push(activity);
       },
@@ -1281,6 +1401,7 @@ describe("CodexRuntime", () => {
     const handle = await runtime.startTurn(
       "thread-filter",
       "work",
+      "restricted",
       (activity) => {
         activities.push(activity);
       },
@@ -1352,6 +1473,7 @@ describe("CodexRuntime", () => {
     const handle = await runtime.startTurn(
       "parent-1",
       "work",
+      "restricted",
       (activity) => {
         activities.push(activity);
       },
@@ -1485,6 +1607,7 @@ describe("CodexRuntime", () => {
     const handle = await runtime.startTurn(
       "parent-pending",
       "work",
+      "restricted",
       (activity) => {
         activities.push(activity);
       },
@@ -1569,6 +1692,7 @@ describe("CodexRuntime", () => {
     const handle = await runtime.startTurn(
       "parent-terminal-pending",
       "work",
+      "restricted",
       (activity) => {
         activities.push(activity);
       },
@@ -1650,6 +1774,7 @@ describe("CodexRuntime", () => {
     const handle = await runtime.startTurn(
       "parent-no",
       "work",
+      "restricted",
       (activity) => {
         activities.push(activity);
       },
@@ -1701,6 +1826,7 @@ describe("CodexRuntime", () => {
     const handle = await runtime.startTurn(
       "parent-role",
       "work",
+      "restricted",
       (activity) => {
         activities.push(activity);
       },
@@ -1757,6 +1883,7 @@ describe("CodexRuntime", () => {
     const handle = await runtime.startTurn(
       "parent-name",
       "work",
+      "restricted",
       (activity) => {
         activities.push(activity);
       },
@@ -1814,6 +1941,7 @@ describe("CodexRuntime", () => {
     const handle = await runtime.startTurn(
       "parent-equal-name",
       "work",
+      "restricted",
       (activity) => {
         activities.push(activity);
       },
@@ -1871,6 +1999,7 @@ describe("CodexRuntime", () => {
     const completed = await runtime.startTurn(
       "parent-clean",
       "first",
+      "restricted",
       (activity) => {
         completedActivities.push(activity);
       },
@@ -1903,6 +2032,7 @@ describe("CodexRuntime", () => {
     const next = await runtime.startTurn(
       "parent-clean",
       "second",
+      "restricted",
       (activity) => {
         nextActivities.push(activity);
       },
@@ -1953,7 +2083,12 @@ describe("CodexRuntime", () => {
     const runtime = runtimeWith(factory, { delay: async () => {} });
     await runtime.start();
 
-    const lost = await runtime.startTurn("parent-lost", "first", () => {});
+    const lost = await runtime.startTurn(
+      "parent-lost",
+      "first",
+      "restricted",
+      () => {},
+    );
     crashed.callbacks.onNotification?.({
       method: "item/started",
       params: {
@@ -1978,6 +2113,7 @@ describe("CodexRuntime", () => {
     const recovered = await runtime.startTurn(
       "parent-lost",
       "second",
+      "restricted",
       (activity) => {
         recoveredActivities.push(activity);
       },
@@ -2014,7 +2150,12 @@ describe("CodexRuntime", () => {
     const runtime = runtimeWith(factory);
     await runtime.start();
 
-    const first = await runtime.startTurn("parent-reused", "first", () => {});
+    const first = await runtime.startTurn(
+      "parent-reused",
+      "first",
+      "restricted",
+      () => {},
+    );
     client.callbacks.onTurnCompleted?.({
       threadId: "parent-reused",
       turnId: "turn-reused",
@@ -2038,6 +2179,7 @@ describe("CodexRuntime", () => {
     const second = await runtime.startTurn(
       "parent-reused",
       "second",
+      "restricted",
       (activity) => {
         activities.push(activity);
       },
@@ -2071,6 +2213,7 @@ describe("CodexRuntime", () => {
     const first = await runtime.startTurn(
       "parent-reused-active",
       "first",
+      "restricted",
       () => {},
     );
     client.callbacks.onTurnCompleted?.({
@@ -2085,6 +2228,7 @@ describe("CodexRuntime", () => {
     const second = await runtime.startTurn(
       "parent-reused-active",
       "second",
+      "restricted",
       (activity) => {
         activities.push(activity);
       },
@@ -2133,6 +2277,7 @@ describe("CodexRuntime", () => {
     const handle = await runtime.startTurn(
       "thread-terminal",
       "work",
+      "restricted",
       (activity) => {
         activities.push(activity);
       },
@@ -2183,6 +2328,7 @@ describe("CodexRuntime", () => {
     const handle = await runtime.startTurn(
       "thread-diagnostic",
       "work",
+      "restricted",
       () => Promise.reject(new Error("activity callback rejected")),
     );
 
@@ -2221,7 +2367,12 @@ describe("CodexRuntime", () => {
     const runtime = runtimeWith(factory);
     await runtime.start();
 
-    const first = await runtime.startTurn("thread-reused", "first", () => {});
+    const first = await runtime.startTurn(
+      "thread-reused",
+      "first",
+      "restricted",
+      () => {},
+    );
     client.callbacks.onTurnCompleted?.({
       threadId: "thread-reused",
       turnId: "turn-reused",
@@ -2242,6 +2393,7 @@ describe("CodexRuntime", () => {
     const second = await runtime.startTurn(
       "thread-reused",
       "second",
+      "restricted",
       (activity) => {
         replayed.push(activity);
       },
@@ -2266,7 +2418,12 @@ describe("CodexRuntime", () => {
     const runtime = runtimeWith(factory);
     await runtime.start();
 
-    const first = await runtime.startTurn("thread-reused", "first", () => {});
+    const first = await runtime.startTurn(
+      "thread-reused",
+      "first",
+      "restricted",
+      () => {},
+    );
     client.callbacks.onTurnCompleted?.({
       threadId: "thread-reused",
       turnId: "turn-reused",
@@ -2279,6 +2436,7 @@ describe("CodexRuntime", () => {
     const starting = runtime.startTurn(
       "thread-reused",
       "second",
+      "restricted",
       (activity) => {
         activities.push(activity);
       },
@@ -2317,7 +2475,12 @@ describe("CodexRuntime", () => {
     const runtime = runtimeWith(factory, { delay: async () => {} });
     await runtime.start();
 
-    const starting = runtime.startTurn("thread-pending", "first", () => {});
+    const starting = runtime.startTurn(
+      "thread-pending",
+      "first",
+      "restricted",
+      () => {},
+    );
     await waitFor(() => crashed.startedTurns.length === 1, "pending turn RPC");
     crashed.exit();
     await waitFor(() => runtime.ready && runtime.generation === 2, "restart");
@@ -2334,6 +2497,7 @@ describe("CodexRuntime", () => {
     const recovered = await runtime.startTurn(
       "thread-pending",
       "second",
+      "restricted",
       (activity) => {
         activities.push(activity);
       },
@@ -2369,6 +2533,7 @@ describe("CodexRuntime", () => {
     const originalStarting = runtime.startTurn(
       "thread-generation-race",
       "original",
+      "restricted",
       () => {},
     );
     await waitFor(() => crashed.startedTurns.length === 1, "original turn RPC");
@@ -2379,6 +2544,7 @@ describe("CodexRuntime", () => {
     const replacementStarting = runtime.startTurn(
       "thread-generation-race",
       "replacement",
+      "restricted",
       (activity) => {
         activities.push(activity);
       },
@@ -2441,7 +2607,12 @@ describe("CodexRuntime", () => {
     const runtime = runtimeWith(factory, { delay: async () => {} });
     await runtime.start();
 
-    const first = await runtime.startTurn("thread-reused", "first", () => {});
+    const first = await runtime.startTurn(
+      "thread-reused",
+      "first",
+      "restricted",
+      () => {},
+    );
     crashed.exit();
     assertEquals(await first.completion, { status: "runtime_lost" });
     await waitFor(() => runtime.ready && runtime.generation === 2, "restart");
@@ -2450,6 +2621,7 @@ describe("CodexRuntime", () => {
     const starting = runtime.startTurn(
       "thread-reused",
       "second",
+      "restricted",
       (activity) => {
         activities.push(activity);
       },
@@ -2486,6 +2658,28 @@ describe("CodexRuntime", () => {
     await runtime.stop();
   });
 
+  it("passes developer instructions unchanged to every client generation", async () => {
+    const factory = new FakeFactory();
+    const crashed = new FakeClient();
+    const replacement = new FakeClient();
+    factory.queue.push(crashed, replacement);
+    const developerInstructions = "stable owner isolation policy";
+    const runtime = runtimeWith(factory, {
+      developerInstructions,
+      delay: async () => {},
+    });
+    await runtime.start();
+
+    crashed.exit();
+    await waitFor(() => runtime.ready && runtime.generation === 2, "restart");
+
+    assertEquals(
+      factory.calls.map((options) => options.developerInstructions),
+      [developerInstructions, developerInstructions],
+    );
+    await runtime.stop();
+  });
+
   it("marks active turns runtime_lost after a crash and never replays them", async () => {
     const factory = new FakeFactory();
     const crashed = new FakeClient();
@@ -2503,6 +2697,7 @@ describe("CodexRuntime", () => {
     const handle = await runtime.startTurn(
       "thread-lost",
       "do not replay",
+      "restricted",
       () => {},
     );
 
