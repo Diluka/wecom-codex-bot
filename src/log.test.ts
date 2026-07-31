@@ -6,6 +6,8 @@ import {
   closeLogTransport,
   createLogger,
   createLogTransport,
+  logAppServerLifecycle,
+  logAppServerStderr,
   logRequestStatus,
   summarizeRequest,
   waitForLogTransport,
@@ -131,7 +133,7 @@ describe("createLogger", () => {
     assertMatch(lines[0], /"chat_id":"room-1"/);
     assertMatch(
       lines[1],
-      / ERROR: \[codex\] failed .*"error":\{"type":"Error","message":"failed \[REDACTED\]","stack":"Error: failed \[REDACTED\]\\n/,
+      / ERROR: \[codex\] failed .*"error":\{"type":"Error","message":"failed \[REDACTED\]","stack":"at Object\.<anonymous> \(.*src\/log\.test\.ts:\d+:\d+\)"/,
     );
     assertEquals(output.includes("actual-secret"), false);
     assertEquals(output.includes("[REDACTED]"), true);
@@ -347,6 +349,25 @@ describe("createLogger", () => {
     assertMatch(output, /first line\\nsecond line\\nthird line/);
   });
 
+  it("truncates log messages and string fields to 100 graphemes", () => {
+    const capture = captureLogs();
+    const logger: Logger = createLogger({
+      level: "debug",
+      destination: capture.destination,
+    });
+
+    logger.child({ scope: "codex" }).debug({
+      payload: `${"p".repeat(101)}field-tail`,
+    }, `${"m".repeat(101)}message-tail`);
+    logger.flush();
+
+    const output = capture.output();
+    assertEquals(output.includes("m".repeat(99) + "…"), true);
+    assertEquals(output.includes("p".repeat(99) + "…"), true);
+    assertEquals(output.includes("message-tail"), false);
+    assertEquals(output.includes("field-tail"), false);
+  });
+
   it("preserves secret-safe structured error diagnostics", () => {
     const capture = captureLogs();
     const logger: Logger = createLogger({
@@ -356,6 +377,9 @@ describe("createLogger", () => {
     const error = new Error("failed actual-secret", {
       cause: new Error("caused by actual-secret"),
     });
+    error.stack = `Error: failed actual-secret\n    at ${
+      "veryLongFunctionName".repeat(8)
+    } (/workspace/src/example.ts:42:7)`;
 
     logger.child({ scope: "lifecycle" }).error({ error }, "failed");
     logger.flush();
@@ -365,7 +389,8 @@ describe("createLogger", () => {
     assertEquals(output.includes("actual-secret"), false);
     assertMatch(output, /"error":\{"type":"Error"/);
     assertMatch(output, /"message":"failed \[REDACTED\]"/);
-    assertMatch(output, /"stack":"Error: failed \[REDACTED\]\\n/);
+    assertMatch(output, /"stack":"at veryLongFunctionName/);
+    assertMatch(output, /\/workspace\/src\/example\.ts:42:7\)"/);
     assertMatch(output, /"cause":\{"type":"Error"/);
   });
 });
@@ -456,6 +481,65 @@ describe("logRequestStatus", () => {
     assertMatch(lines[2], /"thread_id":"thread-1"/);
     assertMatch(lines[2], /"turn_id":"turn-1"/);
     assertMatch(lines[2], /"elapsed_ms":12/);
+    assertEquals(output.includes("actual-secret"), false);
+  });
+});
+
+describe("logAppServerLifecycle", () => {
+  it("uses the event level and maps safe lifecycle metadata", () => {
+    const capture = captureLogs();
+    const logger = createLogger({
+      level: "debug",
+      destination: capture.destination,
+    }).child({ scope: "codex" });
+
+    logAppServerLifecycle(logger, {
+      level: "debug",
+      event: "item_delta",
+      method: "item/reasoning/summaryTextDelta",
+      threadId: "thread-1",
+      turnId: "turn-1",
+      itemId: "reasoning-1",
+      deltaLength: 17,
+      deltaChunks: 4,
+    });
+    logAppServerLifecycle(logger, {
+      level: "warn",
+      event: "rpc_failed",
+      method: "turn/start",
+      requestId: 4,
+      elapsedMs: 30_000,
+      failure: "timeout",
+    });
+    logger.flush();
+
+    const lines = capture.output().trimEnd().split("\n");
+    assertMatch(lines[0], / DEBUG: \[codex\] item_delta /);
+    assertMatch(lines[0], /"item_id":"reasoning-1"/);
+    assertMatch(lines[0], /"delta_length":17/);
+    assertMatch(lines[0], /"delta_chunks":4/);
+    assertMatch(lines[1], / WARN: \[codex\] rpc_failed /);
+    assertMatch(lines[1], /"request_id":4/);
+    assertMatch(lines[1], /"failure":"timeout"/);
+  });
+});
+
+describe("logAppServerStderr", () => {
+  it("records only the chunk length", () => {
+    const capture = captureLogs();
+    const logger = createLogger({
+      level: "debug",
+      destination: capture.destination,
+    }).child({ scope: "codex" });
+    const message = "private command --token actual-secret";
+
+    logAppServerStderr(logger, message);
+    logger.flush();
+
+    const output = capture.output();
+    assertMatch(output, / DEBUG: \[codex\] app_server_stderr /);
+    assertMatch(output, new RegExp(`"chunk_length":${message.length}`));
+    assertEquals(output.includes(message), false);
     assertEquals(output.includes("actual-secret"), false);
   });
 });

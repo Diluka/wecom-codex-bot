@@ -1,12 +1,18 @@
 import { CodexAppServerClient } from "../src/codex-app-server.ts";
-import { createLogger } from "../src/log.ts";
+import {
+  createLogger,
+  logAppServerLifecycle,
+  logAppServerStderr,
+} from "../src/log.ts";
 import {
   assertGeneratedSchemaSupportsApplicationContext,
   finishSmoke,
 } from "../src/smoke-cleanup.ts";
 import { join } from "node:path";
 
-const logger = createLogger();
+const logger = createLogger({
+  level: Deno.env.get("LOG_LEVEL") === "debug" ? "debug" : "info",
+});
 const codexLogger = logger.child({ scope: "codex" });
 const workspace = Deno.args[0] ?? Deno.cwd();
 let client: CodexAppServerClient | undefined;
@@ -46,8 +52,10 @@ try {
   client = await CodexAppServerClient.start({
     cwd: workspace,
     callbacks: {
+      onLifecycle: (event) => logAppServerLifecycle(codexLogger, event),
+      onStderr: (message) => logAppServerStderr(codexLogger, message),
       onDiagnostic: (message) =>
-        codexLogger.info({ source: "app_server" }, message.trimEnd()),
+        codexLogger.warn({ source: "client" }, message.trimEnd()),
     },
   });
   codexLogger.info({ workspace }, "handshake_succeeded");

@@ -6,6 +6,7 @@ import pino, {
   type SerializerFn,
 } from "pino";
 import pretty, { type PrettyOptions } from "pino-pretty";
+import type { CodexAppServerLifecycleEvent } from "./codex-app-server.ts";
 import type { LogLevel } from "./config.ts";
 import { redactSecrets } from "./output.ts";
 
@@ -23,7 +24,8 @@ const RESERVED_LOG_FIELDS = new Set([
 ]);
 const REDACT_PATHS = [...RESERVED_LOG_FIELDS, "*"];
 const OMIT_LOG_VALUE = Symbol("omit-log-value");
-const REQUEST_SEGMENTER = new Intl.Segmenter(undefined, {
+const MAX_LOG_TEXT_LENGTH = 100;
+const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, {
   granularity: "grapheme",
 });
 const OMIT_BINDING: SerializerFn = () => undefined;
@@ -190,7 +192,7 @@ export function summarizeRequest(
   secrets: Iterable<string> = [],
 ): string {
   const normalized = redactSecrets(text, secrets).replace(/\s+/gu, " ").trim();
-  const graphemes = [...REQUEST_SEGMENTER.segment(normalized)];
+  const graphemes = [...GRAPHEME_SEGMENTER.segment(normalized)];
   const summary = graphemes.slice(0, 10).map(({ segment }) => segment).join("");
   return graphemes.length > 10 ? `${summary}…` : summary;
 }
@@ -223,6 +225,39 @@ export function logRequestStatus(
   logger[level](fields, event.state);
 }
 
+export function logAppServerLifecycle(
+  logger: Logger,
+  event: CodexAppServerLifecycleEvent,
+): void {
+  logger[event.level]({
+    method: event.method,
+    request_id: event.requestId,
+    thread_id: event.threadId,
+    turn_id: event.turnId,
+    item_id: event.itemId,
+    item_type: event.itemType,
+    status: event.status,
+    elapsed_ms: event.elapsedMs,
+    delta_length: event.deltaLength,
+    delta_chunks: event.deltaChunks,
+    summary_parts: event.summaryParts,
+    content_parts: event.contentParts,
+    question_count: event.questionCount,
+    error_code: event.errorCode,
+    failure: event.failure,
+    policy: event.policy,
+    exit_code: event.exitCode,
+    signal: event.signal,
+    success: event.success,
+    expected: event.expected,
+    pending_requests: event.pendingRequests,
+  }, event.event);
+}
+
+export function logAppServerStderr(logger: Logger, message: string): void {
+  logger.debug({ chunk_length: message.length }, "app_server_stderr");
+}
+
 function sanitizeLogArgument(
   value: unknown,
   isFirst: boolean,
@@ -230,7 +265,7 @@ function sanitizeLogArgument(
 ): unknown {
   if (isFirst && isLogFields(value)) return redactFields(value, secrets);
   if (typeof value === "string") {
-    return singleLine(redactSecrets(value, secrets));
+    return sanitizeText(value, secrets);
   }
   const redacted = redactValue(value, secrets);
   return redacted === OMIT_LOG_VALUE ? null : redacted;
@@ -256,7 +291,7 @@ function redactFields(
       seen,
     );
     if (redacted === OMIT_LOG_VALUE) continue;
-    result[redactSecrets(key, secrets)] = redacted;
+    result[sanitizeText(key, secrets)] = redacted;
   }
   return result;
 }
@@ -301,15 +336,15 @@ function redactValue(
   ) {
     return OMIT_LOG_VALUE;
   }
-  if (typeof value === "string") return redactSecrets(value, secrets);
+  if (typeof value === "string") return sanitizeText(value, secrets);
   if (value instanceof Error) {
     const previous = seen.get(value);
     if (previous !== undefined) return previous;
     const result: LogFields = Object.create(null);
     seen.set(value, result);
-    result.type = redactSecrets(value.name, secrets);
-    result.message = redactSecrets(value.message, secrets);
-    if (value.stack) result.stack = redactSecrets(value.stack, secrets);
+    result.type = sanitizeText(value.name, secrets);
+    result.message = sanitizeText(value.message, secrets);
+    if (value.stack) result.stack = sanitizeStackFrame(value.stack, secrets);
     if (value.cause !== undefined) {
       const cause = redactValue(value.cause, secrets, seen);
       if (cause !== OMIT_LOG_VALUE) result.cause = cause;
@@ -318,7 +353,7 @@ function redactValue(
       if (key === "cause") continue;
       const redacted = redactValue(entry, secrets, seen);
       if (redacted === OMIT_LOG_VALUE) continue;
-      result[redactSecrets(key, secrets)] = redacted;
+      result[sanitizeText(key, secrets)] = redacted;
     }
     return result;
   }
@@ -341,11 +376,37 @@ function redactValue(
   for (const [key, entry] of Object.entries(value)) {
     const redacted = redactValue(entry, secrets, seen);
     if (redacted === OMIT_LOG_VALUE) continue;
-    result[redactSecrets(key, secrets)] = redacted;
+    result[sanitizeText(key, secrets)] = redacted;
   }
   return result;
 }
 
 function singleLine(value: string): string {
   return value.replace(/\r\n|\r|\n/gu, "\\n");
+}
+
+function sanitizeText(value: string, secrets: readonly string[]): string {
+  return truncateText(singleLine(redactSecrets(value, secrets)));
+}
+
+function truncateText(value: string): string {
+  const graphemes = [...GRAPHEME_SEGMENTER.segment(value)];
+  if (graphemes.length <= MAX_LOG_TEXT_LENGTH) return value;
+  return graphemes.slice(0, MAX_LOG_TEXT_LENGTH - 1).map(({ segment }) =>
+    segment
+  ).join("") + "…";
+}
+
+function sanitizeStackFrame(
+  stack: string,
+  secrets: readonly string[],
+): string {
+  const lines = redactSecrets(stack, secrets).split(/\r\n|\r|\n/gu);
+  const frame = lines.slice(1).find((line) => line.trim()) ?? lines[0] ?? "";
+  const value = singleLine(frame.trim());
+  const graphemes = [...GRAPHEME_SEGMENTER.segment(value)];
+  if (graphemes.length <= MAX_LOG_TEXT_LENGTH) return value;
+  const head = graphemes.slice(0, 49).map(({ segment }) => segment).join("");
+  const tail = graphemes.slice(-50).map(({ segment }) => segment).join("");
+  return `${head}…${tail}`;
 }

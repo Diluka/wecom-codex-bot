@@ -3,7 +3,11 @@ import {
   CodexAppServerClient,
   type TurnCompletedEvent,
 } from "../src/codex-app-server.ts";
-import { createLogger } from "../src/log.ts";
+import {
+  createLogger,
+  logAppServerLifecycle,
+  logAppServerStderr,
+} from "../src/log.ts";
 import { finishSmoke } from "../src/smoke-cleanup.ts";
 
 if (Deno.env.get("RUN_CODEX_TURN") !== "1") {
@@ -16,7 +20,10 @@ const workspace = await Deno.realPath(
   resolve(Deno.cwd(), Deno.env.get("CODEX_WORKSPACE") ?? "."),
 );
 const secret = Deno.env.get("BOT_SECRET") ?? "";
-const logger = createLogger({ secrets: [secret] });
+const logger = createLogger({
+  secrets: [secret],
+  level: Deno.env.get("LOG_LEVEL") === "debug" ? "debug" : "info",
+});
 const codexLogger = logger.child({ scope: "codex" });
 const completed = Promise.withResolvers<TurnCompletedEvent>();
 let client: CodexAppServerClient | undefined;
@@ -26,9 +33,11 @@ try {
   client = await CodexAppServerClient.start({
     cwd: workspace,
     callbacks: {
+      onLifecycle: (event) => logAppServerLifecycle(codexLogger, event),
       onTurnCompleted: completed.resolve,
+      onStderr: (message) => logAppServerStderr(codexLogger, message),
       onDiagnostic: (message) =>
-        codexLogger.info({ source: "app_server" }, message.trimEnd()),
+        codexLogger.warn({ source: "client" }, message.trimEnd()),
     },
   });
   const threadId = await client.startThread();

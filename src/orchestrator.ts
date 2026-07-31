@@ -1,4 +1,5 @@
 import type { ActivityEvent } from "./activity-event.ts";
+import type { CodexTurnOptions } from "./codex-turn.ts";
 import {
   classifyRequestAuthority,
   normalizeOwnerUserId,
@@ -79,6 +80,7 @@ export interface CodexPort {
     prompt: string,
     authority: RequestAuthority,
     onActivity: (event: ActivityEvent) => void | Promise<void>,
+    options?: CodexTurnOptions,
   ): Promise<CodexTurnHandle>;
   interruptTurn(threadId: string, turnId: string): Promise<void>;
 }
@@ -885,6 +887,9 @@ export class ConversationOrchestrator {
         prompt,
         authority,
         (activity) => this.#enqueueActivity(turnOutput, activity, control),
+        this.#effectiveOutputSettings(request.message).toolFormat === "summary"
+          ? { summary: "auto" }
+          : undefined,
       );
     } catch (error) {
       start = Promise.reject(error);
@@ -1113,16 +1118,18 @@ export class ConversationOrchestrator {
       progress,
       progressWritten: false,
       progressEndsWithLineBreak: false,
-      pipeline: new TurnOutputPipeline(
-        message.chatType === "group"
-          ? this.#groupOutputSettings
-          : this.#outputSettings,
-      ),
+      pipeline: new TurnOutputPipeline(this.#effectiveOutputSettings(message)),
       activityTail: Promise.resolve(),
       acceptingActivities: true,
       finished: false,
       shutdownHandled: false,
     };
+  }
+
+  #effectiveOutputSettings(message: RoutedText): OutputSettings {
+    return message.chatType === "group"
+      ? this.#groupOutputSettings
+      : this.#outputSettings;
   }
 
   #createTurnControl(): TurnControl {

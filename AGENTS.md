@@ -53,7 +53,7 @@ Codex notifications
 | `src/lifecycle.ts`           | 固定启动、恢复和优雅关闭顺序                                      |
 | `src/prompt.ts`              | 把不可伪造的聊天/发送者元数据加入 Codex prompt                    |
 | `src/process-log.ts`         | 每次启动前轮换旧的 Pino 活跃日志文件                              |
-| `src/jsonl.ts`、`src/log.ts` | JSONL 读取、Pino transport 和脱敏日志等小型边界工具               |
+| `src/jsonl.ts`、`src/log.ts` | JSONL 读取、Pino transport、脱敏和日志字符串截断等边界工具        |
 
 测试与实现共置为 `src/*.test.ts`。修改某个模块时，先读同名测试；这里大量行为
 依赖并发时序，测试往往比类型签名更完整地描述契约。
@@ -96,7 +96,9 @@ Codex notifications
   `merge_all` 只处理生命周期格式。
 - `summary` 保留 App Server reasoning summary 对应的 `CONTENT`，并抑制普通
   `TOOL`、`TOOL_RESULT` 详情。摘要仍服从 `CONTENT` 的级别和标签规则；没有摘要时
-  不得回退或伪造工具摘要。
+  不得回退或伪造工具摘要。最终生效的工具格式为 `summary` 时，对应 `turn/start`
+  必须显式传 `summary: "auto"`。其他工具格式必须省略该字段，并继续使用现有 Codex
+  配置和模型默认值。
 - 聚合状态必须在 turn 完成、runtime 重启和关闭时清空。
 - 企业微信发送按 conversation 保序，并为最终回复、流关闭等关键帧保留额度。修改
   限流、分段或流轮换时，必须保留“常规发送不能饿死关键发送”这一性质。`/stop`
@@ -211,6 +213,12 @@ git ls-files -co --exclude-standard -z -- '*.ts' '*.json' '*.md' | xargs -0 deno
 - `.env`、`.data/`、`.codegraph/`、`.superpowers/` 和 `logs/` 都是本地内容，
   不得提交。不要回显真实 `BOT_ID`、`BOT_SECRET`、Codex 登录信息、聊天标识或
   SQLite 内容。
+- Codex 生命周期日志只记录方法、标识、类型、状态、耗时、长度和路由结果，不得写入
+  聊天正文、reasoning summary、命令、参数或工具输出。所有 Pino
+  字符串先脱敏并限制为最多 100 个 Unicode 字素簇。高频 delta 按
+  method/thread/turn/item 聚合，在 item、turn 完成或进程退出时记录累计 chunk
+  数和长度；不得逐块重复打印生命周期、路由或工具结果决策日志。App Server 原始
+  stderr 只记录 chunk 长度，不记录原文。
 - App Server 子进程环境会显式移除 `BOT_ID`、`BOT_SECRET` 和
   `WECOM_OWNER_USER_ID`，但 owner ID 仍通过 developer instructions 对模型可见，
   也可能出现在 argv 或 session metadata；如果 `.env` 位于 `CODEX_WORKSPACE` 内，

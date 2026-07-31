@@ -18,6 +18,7 @@ import {
   type CodexRuntimeTrace,
 } from "./codex-runtime.ts";
 import type { ActivityEvent } from "./activity-event.ts";
+import type { CodexTurnOptions } from "./codex-turn.ts";
 import type { RequestAuthority } from "./owner-policy.ts";
 
 const EXITED: AppServerProcessStatus = {
@@ -34,6 +35,7 @@ class FakeClient implements CodexRuntimeClient {
     threadId: string;
     prompt: string;
     authority: RequestAuthority;
+    options?: CodexTurnOptions;
   }> = [];
   readonly interruptedTurns: Array<{ threadId: string; turnId: string }> = [];
   readonly turnIds: Array<string | Promise<string>> = [];
@@ -54,8 +56,14 @@ class FakeClient implements CodexRuntimeClient {
     threadId: string,
     prompt: string,
     authority: RequestAuthority,
+    options?: CodexTurnOptions,
   ): Promise<string> {
-    this.startedTurns.push({ threadId, prompt, authority });
+    this.startedTurns.push({
+      threadId,
+      prompt,
+      authority,
+      ...(options ? { options } : {}),
+    });
     const next = this.turnIds.shift();
     return await (next ?? `turn-${this.startedTurns.length}`);
   }
@@ -124,6 +132,54 @@ function runtimeWith(
 }
 
 describe("CodexRuntime", () => {
+  it("routes App Server stderr separately from internal diagnostics", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    factory.queue.push(client);
+    const stderr: string[] = [];
+    const diagnostics: string[] = [];
+    const runtime = runtimeWith(factory, {
+      onAppServerStderr: (message) => {
+        stderr.push(message);
+      },
+      onDiagnostic: (message) => {
+        diagnostics.push(message);
+      },
+    });
+    await runtime.start();
+
+    client.callbacks.onStderr?.("raw stderr");
+    client.callbacks.onDiagnostic?.("internal failure");
+
+    assertEquals(stderr, ["raw stderr"]);
+    assertEquals(diagnostics, ["internal failure"]);
+    await runtime.stop();
+  });
+
+  it("forwards per-turn reasoning summary options to App Server", async () => {
+    const factory = new FakeFactory();
+    const client = new FakeClient();
+    factory.queue.push(client);
+    const runtime = runtimeWith(factory);
+    await runtime.start();
+
+    await runtime.startTurn(
+      "thread-summary",
+      "prompt",
+      "owner",
+      () => {},
+      { summary: "auto" },
+    );
+
+    assertEquals(client.startedTurns, [{
+      threadId: "thread-summary",
+      prompt: "prompt",
+      authority: "owner",
+      options: { summary: "auto" },
+    }]);
+    await runtime.stop();
+  });
+
   it("reports safe notification routing metadata without payload content", async () => {
     const factory = new FakeFactory();
     const client = new FakeClient();
