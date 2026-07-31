@@ -1,27 +1,11 @@
 import { once } from "node:events";
-import pino, {
-  type Bindings,
-  type ChildLoggerOptions,
-  type DestinationStream,
-  type LogFn,
-  type Logger,
-} from "pino";
+import pino, { type DestinationStream, type LogFn, type Logger } from "pino";
 import pretty, { type PrettyOptions } from "pino-pretty";
 import type { CodexAppServerLifecycleEvent } from "./codex-app-server.ts";
 import type { LogLevel } from "./config.ts";
 
 const REQUEST_WARN = new Set(["runtime_unavailable", "shutdown_discarded"]);
 const REQUEST_ERROR = new Set(["failed", "runtime_lost"]);
-const RESERVED_LOG_FIELDS = new Set([
-  "scope",
-  "time",
-  "level",
-  "pid",
-  "hostname",
-  "msg",
-  "name",
-  "v",
-]);
 const OMIT_LOG_VALUE = Symbol("omit-log-value");
 const MAX_LOG_TEXT_LENGTH = 100;
 const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, {
@@ -90,7 +74,7 @@ export function createLogger(options: LoggerOptions = {}): Logger {
       translateTime: "SYS:yyyy-mm-dd'T'HH:MM:ss.l o",
       sync: true,
     });
-  const root = pino({
+  return pino({
     level: options.level ?? "info",
     base: null,
     hooks: {
@@ -102,8 +86,6 @@ export function createLogger(options: LoggerOptions = {}): Logger {
       },
     },
   }, stream);
-
-  return normalizeChildLogger(root);
 }
 
 export function createLogTransport(
@@ -252,38 +234,7 @@ function normalizeFields(fields: LogFields): LogFields {
   const seen = new WeakMap<object, unknown>();
   seen.set(fields, result);
   for (const key of Object.keys(fields)) {
-    if (RESERVED_LOG_FIELDS.has(key)) continue;
     const normalized = normalizeValue(fields[key], seen);
-    if (normalized === OMIT_LOG_VALUE) continue;
-    result[normalizeText(key)] = normalized;
-  }
-  return result;
-}
-
-function normalizeChildLogger(logger: Logger): Logger {
-  const child = logger.child as unknown as (
-    this: Logger,
-    bindings: Bindings,
-    options?: ChildLoggerOptions,
-  ) => Logger;
-  logger.child = (function (
-    this: Logger,
-    bindings: Bindings,
-    options?: ChildLoggerOptions,
-  ): Logger {
-    return child.call(this, normalizeChildBindings(bindings), options);
-  }) as unknown as Logger["child"];
-  return logger;
-}
-
-function normalizeChildBindings(bindings: Bindings): Bindings {
-  // Pino calls hasOwnProperty while serializing child bindings.
-  const result: Bindings = {};
-  const seen = new WeakMap<object, unknown>();
-  seen.set(bindings, result);
-  for (const key of Object.keys(bindings)) {
-    if (key !== "scope" && RESERVED_LOG_FIELDS.has(key)) continue;
-    const normalized = normalizeValue(bindings[key], seen);
     if (normalized === OMIT_LOG_VALUE) continue;
     result[normalizeText(key)] = normalized;
   }

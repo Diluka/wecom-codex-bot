@@ -170,58 +170,6 @@ describe("createLogger", () => {
     }
   });
 
-  it("prevents top-level fields from overriding logger metadata", () => {
-    const capture = captureLogs();
-    const logger: Logger = createLogger({ destination: capture.destination });
-    const requestLogger = logger.child({ scope: "request" });
-
-    requestLogger.info({
-      scope: "spoofed-scope",
-      time: 0,
-      level: 60,
-      pid: 991_001,
-      hostname: "spoofed-host",
-      msg: "spoofed-msg",
-      name: "spoofed-name",
-      v: 991_002,
-      regular: "kept",
-      nested: {
-        scope: "nested-scope",
-        time: 123,
-        level: 30,
-        pid: 992_001,
-        hostname: "nested-host",
-        msg: "nested-msg",
-        name: "nested-name",
-        v: 992_002,
-      },
-    }, "received");
-    logger.flush();
-
-    const line = capture.output().trimEnd();
-    assertMatch(
-      line,
-      /^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3} [+-]\d{4}\] INFO: \[request\] received /,
-    );
-    for (
-      const spoofed of [
-        "spoofed-scope",
-        "spoofed-host",
-        "spoofed-msg",
-        "spoofed-name",
-        "991001",
-        "991002",
-      ]
-    ) {
-      assertEquals(line.includes(spoofed), false);
-    }
-    assertMatch(line, /"regular":"kept"/);
-    assertMatch(
-      line,
-      /"nested":\{"scope":"nested-scope","time":123,"level":30,"pid":992001,"hostname":"nested-host","msg":"nested-msg","name":"nested-name","v":992002\}/,
-    );
-  });
-
   it("drops nested JSON hooks and other unsafe values", () => {
     const capture = captureLogs();
     const logger: Logger = createLogger({
@@ -248,57 +196,6 @@ describe("createLogger", () => {
     assertEquals(output.includes("actual-secret"), true);
     assertMatch(output, /"nested":\{"ordinary":"hello actual-secret"\}/);
     for (const omitted of ["forged", "callback", "symbolValue", "toJSON"]) {
-      assertEquals(output.includes(omitted), false);
-    }
-  });
-
-  it("normalizes child bindings without inspecting sensitive values", () => {
-    const capture = captureLogs();
-    const logger: Logger = createLogger({
-      destination: capture.destination,
-    });
-    const requestLogger = logger.child({
-      scope: "request",
-      marker: "actual-secret",
-      component: "c".repeat(101),
-      time: 991001,
-      level: 991004,
-      pid: 991002,
-      hostname: "spoofed-host",
-      msg: "spoofed-message",
-      name: "spoofed-name",
-      v: 991003,
-    });
-    const nestedLogger = requestLogger.child({
-      nested_marker: "nested-actual-secret",
-      nested_component: "n".repeat(101),
-      time: 991005,
-    });
-
-    nestedLogger.info("ready");
-    logger.flush();
-
-    const output = capture.output().trimEnd();
-    assertMatch(output, / INFO: \[request\] ready /);
-    assertMatch(output, /"marker":"actual-secret"/);
-    assertMatch(output, /"nested_marker":"nested-actual-secret"/);
-    assertMatch(output, new RegExp(`"component":"${"c".repeat(99)}…"`));
-    assertMatch(
-      output,
-      new RegExp(`"nested_component":"${"n".repeat(99)}…"`),
-    );
-    for (
-      const omitted of [
-        "spoofed-host",
-        "spoofed-message",
-        "spoofed-name",
-        "991001",
-        "991002",
-        "991003",
-        "991004",
-        "991005",
-      ]
-    ) {
       assertEquals(output.includes(omitted), false);
     }
   });
