@@ -1,5 +1,9 @@
 import type { ActivityEvent } from "./activity-event.ts";
-import type { RequestAuthority } from "./owner-policy.ts";
+import {
+  classifyRequestAuthority,
+  normalizeOwnerUserId,
+  type RequestAuthority,
+} from "./owner-policy.ts";
 import { summarizeRequest } from "./log.ts";
 import { TurnOutputPipeline } from "./output-pipeline.ts";
 import { buildCodexPrompt } from "./prompt.ts";
@@ -134,6 +138,7 @@ export interface ConversationOrchestratorOptions {
   codex: CodexPort;
   output: ChatOutput;
   workspace: string;
+  ownerUserId?: string;
   outputSettings?: OutputSettings;
   groupOutputSettings?: OutputSettings;
   onError?: (error: Error) => void;
@@ -287,6 +292,7 @@ export class ConversationOrchestrator {
   readonly #codex: CodexPort;
   readonly #output: ChatOutput;
   readonly #workspace: string;
+  readonly #ownerUserId?: string;
   readonly #outputSettings: OutputSettings;
   readonly #groupOutputSettings: OutputSettings;
   readonly #onError?: (error: Error) => void;
@@ -306,6 +312,7 @@ export class ConversationOrchestrator {
     this.#codex = options.codex;
     this.#output = options.output;
     this.#workspace = options.workspace;
+    this.#ownerUserId = normalizeOwnerUserId(options.ownerUserId);
     this.#outputSettings = options.outputSettings ?? DEFAULT_OUTPUT_SETTINGS;
     this.#groupOutputSettings = options.groupOutputSettings ??
       this.#outputSettings;
@@ -854,10 +861,14 @@ export class ConversationOrchestrator {
     let start: Promise<CodexTurnHandle>;
     this.#emitRequestStatuses(request, "turn_starting");
     try {
+      const authority = classifyRequestAuthority(
+        this.#ownerUserId,
+        request.messages.map((message) => message.senderUserId),
+      );
       start = this.#codex.startTurn(
         threadId,
         prompt,
-        "restricted",
+        authority,
         (activity) => this.#enqueueActivity(turnOutput, activity, control),
       );
     } catch (error) {
