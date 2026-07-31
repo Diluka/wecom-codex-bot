@@ -117,6 +117,31 @@ describe("WeCom message normalization", () => {
     });
   });
 
+  it("preserves complete quoted content without filtering fields", () => {
+    const quote = {
+      msgtype: "mixed",
+      mixed: {
+        msg_item: [
+          { msgtype: "text", text: { content: "quoted text" } },
+          {
+            msgtype: "image",
+            image: {
+              url: "https://example.invalid/image",
+              aeskey: "quote-key",
+            },
+          },
+        ],
+      },
+      future_field: { nested: true },
+    };
+
+    const normalized = normalizeTextFrame(
+      textFrame({ quote }),
+    ) as unknown as Record<string, unknown>;
+
+    assertEquals(normalized.quote, quote);
+  });
+
   it("derives the single target from sender userid", () => {
     assertEquals(
       normalizeTextFrame(textFrame({

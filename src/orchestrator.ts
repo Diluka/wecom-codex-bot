@@ -378,6 +378,14 @@ export class ConversationOrchestrator {
     // model work is started.
     if (this.#shuttingDown || slot.resetPending || slot.pending) return;
 
+    const prompt = buildCodexPrompt({
+      chatType: message.chatType,
+      conversationKey: message.conversationKey,
+      senderUserId: message.senderUserId,
+      msgId: message.msgId,
+      content: message.text,
+      quote: message.quote,
+    });
     const progress = await this.#output.startProgress(message);
     const turnOutput = this.#createTurnOutput(message, progress);
     try {
@@ -390,13 +398,6 @@ export class ConversationOrchestrator {
       await this.#finishTurnOutput(turnOutput, undefined, control);
       throw error;
     }
-    const prompt = buildCodexPrompt({
-      chatType: message.chatType,
-      conversationKey: message.conversationKey,
-      senderUserId: message.senderUserId,
-      msgId: message.msgId,
-      content: message.text,
-    });
 
     const active: ActiveTurn = {
       threadId,
