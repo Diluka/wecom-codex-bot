@@ -38,7 +38,10 @@ function message(
     conversationKey,
     senderUserId,
     msgId,
+    messageType: "text",
     text: content,
+    content: [{ type: "text", text: content }],
+    quoteImages: [],
     frame: { id: msgId },
   };
 }

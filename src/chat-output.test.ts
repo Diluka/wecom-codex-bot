@@ -22,7 +22,10 @@ function message(msgId = "m1"): RoutedText {
     chatId: "alice",
     senderUserId: "alice",
     msgId,
+    messageType: "text",
     text: "hello",
+    content: [{ type: "text", text: "hello" }],
+    quoteImages: [],
     frame: { req: msgId },
   };
 }

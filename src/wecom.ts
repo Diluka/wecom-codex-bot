@@ -17,10 +17,44 @@ export interface InboundMessage {
   msgId: string;
 }
 
-export interface InboundText extends InboundMessage {
-  text: string;
-  quote?: unknown;
+export interface ValidInboundImageReference {
+  readonly status: "valid";
+  readonly url: string;
+  readonly aesKey: string;
 }
+
+export interface InvalidInboundImageReference {
+  readonly status: "invalid";
+}
+
+export type InboundImageReference =
+  | ValidInboundImageReference
+  | InvalidInboundImageReference;
+
+export type InboundContentPart =
+  | { readonly type: "text"; readonly text: string }
+  | { readonly type: "image"; readonly image: InboundImageReference };
+
+interface InboundUserMessageBase extends InboundMessage {
+  readonly content: readonly InboundContentPart[];
+  readonly quote?: unknown;
+  readonly quoteImages: readonly InboundImageReference[];
+}
+
+export interface InboundText extends InboundUserMessageBase {
+  readonly messageType: "text";
+  readonly text: string;
+}
+
+export interface InboundImage extends InboundUserMessageBase {
+  readonly messageType: "image";
+}
+
+export interface InboundMixed extends InboundUserMessageBase {
+  readonly messageType: "mixed";
+}
+
+export type InboundUserMessage = InboundText | InboundImage | InboundMixed;
 
 type Listener = (...args: unknown[]) => void;
 type MaybePromise<T> = T | Promise<T>;
@@ -57,6 +91,10 @@ export interface WeComClientLike {
   on(event: string, listener: Listener): unknown;
   connect(): unknown;
   disconnect(): void;
+  downloadFile(url: string, aesKey: string): Promise<{
+    buffer: Uint8Array;
+    filename?: string;
+  }>;
   reply(frame: unknown, body: unknown, cmd?: string): Promise<unknown>;
   replyStream(
     frame: unknown,
@@ -70,7 +108,10 @@ export interface WeComGatewayOptions {
   botId: string;
   secret: string;
   client?: WeComClientLike;
-  onText: (message: InboundText, frame: unknown) => MaybePromise<void>;
+  onMessage: (
+    message: InboundUserMessage,
+    frame: unknown,
+  ) => MaybePromise<void>;
   onUnsupported: (
     message: InboundMessage,
     frame: unknown,
@@ -138,22 +179,127 @@ export function normalizeMessageFrame(frame: unknown): InboundMessage {
   };
 }
 
-export function normalizeTextFrame(frame: unknown): InboundText {
+function normalizeImageReference(value: unknown): InboundImageReference {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return { status: "invalid" };
+  }
+  const image = value as Record<string, unknown>;
+  if (
+    typeof image.url !== "string" || image.url.trim().length === 0 ||
+    typeof image.aeskey !== "string" || image.aeskey.trim().length === 0
+  ) {
+    return { status: "invalid" };
+  }
+  return { status: "valid", url: image.url, aesKey: image.aeskey };
+}
+
+function normalizeTextPart(
+  value: unknown,
+  label: string,
+): { readonly type: "text"; readonly text: string } {
+  const text = asRecord(value, label);
+  if (typeof text.content !== "string") {
+    throw new TypeError(`${label}.content must be a string`);
+  }
+  return { type: "text", text: text.content };
+}
+
+function normalizeMixedParts(value: unknown): readonly InboundContentPart[] {
+  const mixed = asRecord(value, "body.mixed");
+  if (!Array.isArray(mixed.msg_item)) {
+    throw new TypeError("body.mixed.msg_item must be an array");
+  }
+  return mixed.msg_item.map((value, index) => {
+    const item = asRecord(value, `body.mixed.msg_item[${index}]`);
+    if (item.msgtype === "text") {
+      return normalizeTextPart(
+        item.text,
+        `body.mixed.msg_item[${index}].text`,
+      );
+    }
+    if (item.msgtype === "image") {
+      return { type: "image", image: normalizeImageReference(item.image) };
+    }
+    throw new TypeError(
+      `body.mixed.msg_item[${index}].msgtype must be text or image`,
+    );
+  });
+}
+
+function extractQuoteImages(quote: unknown): readonly InboundImageReference[] {
+  if (typeof quote !== "object" || quote === null || Array.isArray(quote)) {
+    return [];
+  }
+  const record = quote as Record<string, unknown>;
+  if (record.msgtype === "image") {
+    return [normalizeImageReference(record.image)];
+  }
+  if (record.msgtype !== "mixed") return [];
+  if (
+    typeof record.mixed !== "object" || record.mixed === null ||
+    Array.isArray(record.mixed)
+  ) {
+    return [];
+  }
+  const items = (record.mixed as Record<string, unknown>).msg_item;
+  if (!Array.isArray(items)) return [];
+  return items.flatMap((value) => {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      return [];
+    }
+    const item = value as Record<string, unknown>;
+    return item.msgtype === "image"
+      ? [normalizeImageReference(item.image)]
+      : [];
+  });
+}
+
+export function normalizeUserMessageFrame(frame: unknown): InboundUserMessage {
+  const message = normalizeMessageFrame(frame);
   const root = asRecord(frame, "frame");
   const body = asRecord(root.body, "frame.body");
-  if (body.msgtype !== "text") {
+  const quoteFields = body.quote === undefined
+    ? { quoteImages: [] }
+    : { quote: body.quote, quoteImages: extractQuoteImages(body.quote) };
+
+  if (body.msgtype === "text") {
+    const part = normalizeTextPart(body.text, "body.text");
+    return {
+      ...message,
+      messageType: "text",
+      text: part.text,
+      content: [part],
+      ...quoteFields,
+    };
+  }
+  if (body.msgtype === "image") {
+    return {
+      ...message,
+      messageType: "image",
+      content: [{
+        type: "image",
+        image: normalizeImageReference(body.image),
+      }],
+      ...quoteFields,
+    };
+  }
+  if (body.msgtype === "mixed") {
+    return {
+      ...message,
+      messageType: "mixed",
+      content: normalizeMixedParts(body.mixed),
+      ...quoteFields,
+    };
+  }
+  throw new TypeError("frame must contain a text, image, or mixed message");
+}
+
+export function normalizeTextFrame(frame: unknown): InboundText {
+  const message = normalizeUserMessageFrame(frame);
+  if (message.messageType !== "text") {
     throw new TypeError("frame must contain a text message");
   }
-  const text = asRecord(body.text, "body.text");
-  if (typeof text.content !== "string") {
-    throw new TypeError("body.text.content must be a string");
-  }
-
-  return {
-    ...normalizeMessageFrame(frame),
-    text: text.content,
-    ...(body.quote !== undefined ? { quote: body.quote } : {}),
-  };
+  return message;
 }
 
 function toError(value: unknown): Error {
@@ -186,6 +332,19 @@ export class WeComGateway {
 
   disconnect(): void {
     this.#client.disconnect();
+  }
+
+  async downloadImage(
+    reference: InboundImageReference,
+  ): Promise<Uint8Array> {
+    if (reference.status !== "valid") {
+      throw new TypeError("downloadImage requires a valid image reference");
+    }
+    const { buffer } = await this.#client.downloadFile(
+      reference.url,
+      reference.aesKey,
+    );
+    return new Uint8Array(buffer);
   }
 
   async reply(
@@ -258,16 +417,20 @@ export class WeComGateway {
       if (typeof body.msgtype !== "string" || body.msgtype.length === 0) {
         throw new TypeError("body.msgtype must be a non-empty string");
       }
-      if (body.msgtype === "text") {
-        this.#dispatch(this.#options.onText, normalizeTextFrame(frame), frame);
-      } else {
+      if (["text", "image", "mixed"].includes(body.msgtype)) {
         this.#dispatch(
-          this.#options.onUnsupported,
-          normalizeMessageFrame(frame),
+          this.#options.onMessage,
+          normalizeUserMessageFrame(frame),
           frame,
-          body.msgtype,
         );
+        return;
       }
+      this.#dispatch(
+        this.#options.onUnsupported,
+        normalizeMessageFrame(frame),
+        frame,
+        body.msgtype,
+      );
     } catch (error) {
       this.#report(error);
     }

@@ -154,8 +154,13 @@ const runtime = new CodexRuntime({
 const gateway = new WeComGateway({
   botId: config.botId,
   secret: config.botSecret,
-  onText: (message, frame) =>
-    context.orchestrator!.handleText({ ...message, frame }),
+  onMessage: (message, frame) =>
+    message.messageType === "text"
+      ? context.orchestrator!.handleText({ ...message, frame })
+      : context.orchestrator!.handleUnsupported(
+        { ...message, frame },
+        message.messageType,
+      ),
   onUnsupported: (message, frame, messageType) =>
     context.orchestrator!.handleUnsupported(
       { ...message, frame },
