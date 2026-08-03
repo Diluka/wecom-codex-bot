@@ -1076,23 +1076,6 @@ describe("CodexRuntime", () => {
     await runtime.stop();
   });
 
-  it("passes structured turn input through without mutation", async () => {
-    const factory = new FakeFactory();
-    const client = new FakeClient();
-    factory.queue.push(client);
-    const runtime = runtimeWith(factory);
-    await runtime.start();
-    const input = {
-      text: "Inspect attachments",
-      localImagePaths: ["/tmp/one.png", "/tmp/two.jpg"],
-    } as const;
-
-    await runtime.startTurn("thread-1", input, "restricted", () => {});
-
-    assertStrictEquals(client.startedTurns[0].input, input);
-    await runtime.stop();
-  });
-
   it("reports safe notification routing metadata without payload content", async () => {
     const factory = new FakeFactory();
     const client = new FakeClient();

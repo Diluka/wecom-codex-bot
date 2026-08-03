@@ -11,6 +11,8 @@
 - 企业微信智能机器人的 Bot ID 和 Secret
 - 同一个 Bot ID 同时只能运行一个机器人实例
 
+本项目只按 Codex 最新稳定版协议开发；本机升级短暂滞后不构成旧版兼容要求。
+
 ## 配置
 
 复制 `.env.example` 的键到 `.env`：
@@ -243,10 +245,6 @@ OUTPUT_GROUP_FORMAT_TOOL=summary
 Unicode 字素簇截取前 10 个，超长时追加省略号。摘要不会把完整聊天正文写到终端，
 也不会检测或脱敏其中的敏感值。
 
-针对图片支持，request 状态在既有字段之外只增加受控的 `message_type` 和
-`image_count`：消息类型只会是 `text`、`image` 或 `mixed`，图片数量只记录计数。
-request 日志不会记录图片 URL、AES 字段、本地临时路径或图片字节。
-
 启动时的 `owner_configuration` lifecycle 日志会把规范化后的 owner ID 作为
 `owner_user_id`；该字段与其他 Pino 字符串一样，超过 100 个 Unicode 字素簇时会被
 截断。未配置、空值、无效时记录 `null`。如果真实请求由该用户发送，上述既有
@@ -383,9 +381,9 @@ Codex 自身优先级，可能覆盖这里保存的用户级默认值。`/status
 即使带有图片引用也只执行命令，不会下载引用图片。`mixed` 消息中形似命令的文本按
 普通用户请求进入防抖窗口。
 
-图片由企业微信 SDK 下载并解密，解密后只接受 JPEG 和 PNG；每张图片最大 10 MiB。
-一个聚合批次中任意图片处理失败，整个批次都不会提交给 Codex，并直接回复
-`图片处理失败，请重新发送图片。`。
+图片由企业微信 SDK 下载并解密；当前按 Codex 支持的 JPEG、PNG、GIF 和 WebP
+格式识别。一个聚合批次中任意图片处理失败，整个批次都不会提交给 Codex，并直接
+回复 `图片处理失败，请重新发送图片。`。
 
 下载并解密后的图片只写入 Linux 当前进程专属的随机目录
 `/tmp/wecom-codex-bot-*`。机器人通过 App Server `localImage` 输入把图片交给

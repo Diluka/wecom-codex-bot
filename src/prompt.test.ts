@@ -31,24 +31,6 @@ describe("buildCodexTurnInput", () => {
     assertEquals(input.localImagePaths, []);
   });
 
-  it("adds a neutral body for a pure image without exposing its path", () => {
-    const input = buildCodexTurnInput({
-      chatType: "single",
-      conversationKey: "single:alice",
-      messages: [{
-        senderUserId: "alice",
-        msgId: "image-1",
-        content: [{ type: "image", path: "/tmp/private-image.jpg" }],
-        quoteImages: [],
-      }],
-    });
-
-    assertStringIncludes(input.text, "[图片附件 #1]");
-    assertStringIncludes(input.text, "请根据用户发送的图片内容进行回应。");
-    assertEquals(input.text.includes("/tmp/private-image.jpg"), false);
-    assertEquals(input.localImagePaths, ["/tmp/private-image.jpg"]);
-  });
-
   it("keeps mixed and quote image numbers aligned with local image order", () => {
     const quote = {
       msgtype: "image",

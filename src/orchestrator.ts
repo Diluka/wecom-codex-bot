@@ -28,7 +28,6 @@ import type { ProgressTail } from "./progress-tail.ts";
 import type {
   ChatType,
   ConversationKey,
-  InboundContentPart,
   InboundImageReference,
   InboundMessage,
   InboundText,
@@ -116,7 +115,7 @@ export interface ProgressHandle {
 
 export interface ChatOutput {
   send(message: RoutedMessage, text: string, final?: boolean): Promise<void>;
-  startProgress(message: RoutedUserMessage): Promise<ProgressHandle>;
+  startProgress(message: RoutedMessage): Promise<ProgressHandle>;
 }
 
 export type RequestStatus =
@@ -149,8 +148,6 @@ export interface RequestStatusEvent {
   chatId: string;
   userId: string;
   msgId: string;
-  messageType: InboundUserMessage["messageType"];
-  imageCount: number;
   summary?: string;
   threadId?: string;
   turnId?: string;
@@ -320,24 +317,9 @@ class PendingImage {
   constructor(
     preparer: ImagePreparer,
     reference: InboundImageReference,
-    report: (error: unknown) => void,
   ) {
-    this.result = Promise.resolve()
-      .then(() => {
-        if (this.#released || this.#controller.signal.aborted) {
-          throw new ImagePreparationError("cancelled");
-        }
-        return preparer.prepare(reference, this.#controller.signal);
-      })
-      .then(async (lease) => {
-        if (this.#released) {
-          try {
-            await lease.release();
-          } catch (error) {
-            report(error);
-          }
-          throw new ImagePreparationError("cancelled");
-        }
+    this.result = preparer.prepare(reference, this.#controller.signal)
+      .then((lease) => {
         this.#lease = lease;
         return lease;
       });
@@ -354,26 +336,6 @@ class PendingImage {
     this.cancel();
     await this.#lease?.release();
   }
-}
-
-function requestImageCount(message: RoutedUserMessage): number {
-  return message.content.filter((part) => part.type === "image").length +
-    message.quoteImages.length;
-}
-
-function requestSummary(message: RoutedUserMessage): string {
-  const text = message.content
-    .filter((part): part is Extract<InboundContentPart, { type: "text" }> =>
-      part.type === "text"
-    )
-    .map((part) => part.text)
-    .join(" ");
-  const imageCount = requestImageCount(message);
-  const summary = summarizeRequest(text);
-  if (imageCount === 0) return summary;
-  return summary
-    ? `${summary}（${imageCount} 张图片）`
-    : `图片 × ${imageCount}`;
 }
 
 function hasLiveTraces(request?: PendingRequest): request is PendingRequest {
@@ -615,7 +577,6 @@ export class ConversationOrchestrator {
             "superseded",
             { reason: "reset" },
           );
-          this.#cancelRequestImages(debounce);
           void this.#releaseRequestImages(debounce);
         }
         const pending = slot.pending;
@@ -625,7 +586,6 @@ export class ConversationOrchestrator {
           this.#emitRequestStatuses(pending, "superseded", {
             reason: "reset",
           });
-          this.#cancelRequestImages(pending);
           void this.#releaseRequestImages(pending);
         }
         if (current) {
@@ -633,7 +593,6 @@ export class ConversationOrchestrator {
             reason: "reset",
           });
           this.#cancelRequestImages(current);
-          slot.control?.forceComplete({ status: "interrupted" });
         }
         if (!this.#codex.ready) {
           this.#deleteSlotIfIdle(message.conversationKey, slot);
@@ -806,7 +765,6 @@ export class ConversationOrchestrator {
           "interrupted",
           { reason: "stop" },
         );
-        this.#cancelRequestImages(debounce);
         void this.#releaseRequestImages(debounce);
       }
       const pending = slot.pending;
@@ -814,7 +772,6 @@ export class ConversationOrchestrator {
       slot.resetPending = undefined;
       if (pending) {
         this.#emitRequestStatuses(pending, "interrupted", { reason: "stop" });
-        this.#cancelRequestImages(pending);
         void this.#releaseRequestImages(pending);
       }
 
@@ -871,14 +828,12 @@ export class ConversationOrchestrator {
           "shutdown_discarded",
           { reason: "shutdown" },
         );
-        this.#cancelRequestImages(debounce);
         void this.#releaseRequestImages(debounce);
       }
       if (pending) {
         this.#emitRequestStatuses(pending, "shutdown_discarded", {
           reason: "shutdown",
         });
-        this.#cancelRequestImages(pending);
         void this.#releaseRequestImages(pending);
       }
       if (current) {
@@ -950,7 +905,6 @@ export class ConversationOrchestrator {
             new PendingImage(
               this.#imagePreparer,
               part.image,
-              (error) => this.#report(error),
             ),
           ]
           : []
@@ -959,7 +913,6 @@ export class ConversationOrchestrator {
         new PendingImage(
           this.#imagePreparer,
           reference,
-          (error) => this.#report(error),
         )
       ),
     };
@@ -1006,7 +959,6 @@ export class ConversationOrchestrator {
       this.#emitRequestStatuses(request, "shutdown_discarded", {
         reason: "shutdown",
       });
-      this.#cancelRequestImages(request);
       await this.#releaseRequestImages(request);
       this.#deleteSlotIfIdle(conversationKey, slot);
       return;
@@ -1060,14 +1012,12 @@ export class ConversationOrchestrator {
       this.#emitRequestStatuses(pending, "superseded", {
         replacedByMsgId: request.message.msgId,
       });
-      this.#cancelRequestImages(pending);
       void this.#releaseRequestImages(pending);
     } else if (current) {
       this.#emitRequestStatuses(current, "superseded", {
         replacedByMsgId: request.message.msgId,
       });
       this.#cancelRequestImages(current);
-      slot.control?.forceComplete({ status: "interrupted" });
     }
     this.#emitRequestStatuses(request, "queued");
     if (isInterruptible(slot.active)) {
@@ -2079,8 +2029,8 @@ export class ConversationOrchestrator {
     terminal: boolean,
   ): void {
     const counts = this.#requestCounts();
-    const summary = state === "received"
-      ? requestSummary(trace.message)
+    const summary = state === "received" && trace.message.messageType === "text"
+      ? summarizeRequest(trace.message.text)
       : undefined;
     const event: RequestStatusEvent = {
       state,
@@ -2088,8 +2038,6 @@ export class ConversationOrchestrator {
       chatId: trace.message.chatId,
       userId: trace.message.senderUserId,
       msgId: trace.message.msgId,
-      messageType: trace.message.messageType,
-      imageCount: requestImageCount(trace.message),
       ...(summary !== undefined ? { summary } : {}),
       ...(trace.threadId ? { threadId: trace.threadId } : {}),
       ...(trace.turnId ? { turnId: trace.turnId } : {}),

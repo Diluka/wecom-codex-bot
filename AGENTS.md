@@ -2,8 +2,9 @@
 
 ## 项目定位
 
-这是一个前台服务，要求 Deno 2.9+ 和 Codex CLI 0.144.6+。它通过企业微信智能
-机器人的 WebSocket 长连接，把单聊或群聊消息转发给
+这是一个前台服务，要求 Deno 2.9+ 和
+[Codex CLI 最新稳定版](https://github.com/openai/codex)，不维护旧版兼容。它通过
+企业微信智能机器人的 WebSocket 长连接，把单聊或群聊消息转发给
 `codex app-server --stdio`。每个聊天持久绑定一个 Codex
 thread；机器人负责消息路由、状态恢复、增量输出、限流和优雅关闭，Codex CLI
 继续使用用户已有的登录信息、配置、沙盒和审批策略。

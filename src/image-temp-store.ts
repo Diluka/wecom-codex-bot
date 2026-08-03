@@ -1,24 +1,10 @@
 import { join } from "node:path";
 
-import type {
-  InboundImageReference,
-  ValidInboundImageReference,
-} from "./wecom.ts";
-
-export type ImagePreparationFailure =
-  | "invalid_reference"
-  | "download_failed"
-  | "too_large"
-  | "unsupported_format"
-  | "write_failed"
-  | "cancelled"
-  | "store_not_ready"
-  | "cleanup_failed";
+import type { InboundImageReference } from "./wecom.ts";
 
 export class ImagePreparationError extends Error {
-  constructor(readonly failure: ImagePreparationFailure) {
-    super(`Image preparation failed: ${failure}`);
-    this.name = "ImagePreparationError";
+  constructor() {
+    super("Image preparation failed");
   }
 }
 
@@ -36,11 +22,9 @@ export interface ImagePreparer {
 }
 
 export type DownloadImage = (
-  reference: ValidInboundImageReference,
+  reference: InboundImageReference,
 ) => Promise<Uint8Array>;
 
-const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
-const IMAGE_CLOSE_GRACE_MS = 5_000;
 const PNG_SIGNATURE = new Uint8Array([
   0x89,
   0x50,
@@ -55,35 +39,24 @@ const PNG_SIGNATURE = new Uint8Array([
 interface ManagedImageFile {
   readonly path: string;
   references: number;
-  removed: boolean;
 }
 
 export class ImageTempStore implements ImagePreparer {
   readonly #downloadImage: DownloadImage;
-  readonly #controllers = new Set<AbortController>();
-  readonly #tasks = new Set<Promise<void>>();
-  readonly #files = new Map<string, ManagedImageFile>();
-  readonly #cleanupRoots = new Set<string>();
+  readonly #abort = new AbortController();
+  readonly #localWrites = new Set<Promise<void>>();
   #root?: string;
-  #startPromise?: Promise<void>;
-  #closePromise?: Promise<void>;
   #closed = false;
 
   constructor(downloadImage: DownloadImage) {
     this.#downloadImage = downloadImage;
   }
 
-  start(): Promise<void> {
+  async start(): Promise<void> {
     if (this.#closed) {
-      return Promise.reject(new ImagePreparationError("store_not_ready"));
+      throw new ImagePreparationError();
     }
-    if (this.#root) return Promise.resolve();
-    if (this.#startPromise) return this.#startPromise;
-    this.#startPromise = this.#start();
-    return this.#startPromise;
-  }
-
-  async #start(): Promise<void> {
+    if (this.#root) return;
     let createdRoot: string | undefined;
     try {
       createdRoot = await Deno.makeTempDir({
@@ -92,20 +65,16 @@ export class ImageTempStore implements ImagePreparer {
       });
       await Deno.chmod(createdRoot, 0o700);
       if (this.#closed) {
-        throw new ImagePreparationError("store_not_ready");
+        throw new ImagePreparationError();
       }
       this.#root = createdRoot;
       createdRoot = undefined;
     } catch (error) {
       if (createdRoot !== undefined) {
-        try {
-          await this.#removePath(createdRoot, true);
-        } catch {
-          this.#cleanupRoots.add(createdRoot);
-        }
+        await this.#removePathBestEffort(createdRoot, true);
       }
       if (error instanceof ImagePreparationError) throw error;
-      throw new ImagePreparationError("write_failed");
+      throw new ImagePreparationError();
     }
   }
 
@@ -113,109 +82,85 @@ export class ImageTempStore implements ImagePreparer {
     reference: InboundImageReference,
     signal: AbortSignal,
   ): Promise<ImageLease> {
-    if (reference.status !== "valid") {
-      return Promise.reject(
-        new ImagePreparationError("invalid_reference"),
-      );
-    }
     if (this.#closed || this.#root === undefined) {
-      return Promise.reject(new ImagePreparationError("store_not_ready"));
+      return Promise.reject(new ImagePreparationError());
     }
     if (signal.aborted) {
-      return Promise.reject(new ImagePreparationError("cancelled"));
+      return Promise.reject(new ImagePreparationError());
     }
 
-    const controller = new AbortController();
-    this.#controllers.add(controller);
-    const worker = this.#prepare(reference, signal, controller);
-    const trackedWorker = worker.then(
-      () => undefined,
-      () => undefined,
-    ).finally(() => {
-      this.#controllers.delete(controller);
-      this.#tasks.delete(trackedWorker);
-    });
-    this.#tasks.add(trackedWorker);
+    const combinedSignal = AbortSignal.any([signal, this.#abort.signal]);
+    const worker = this.#prepare(reference, combinedSignal);
 
-    let removeAbortListeners = () => {};
+    let removeAbortListener = () => {};
     const cancelled = new Promise<never>((_resolve, reject) => {
       const rejectCancelled = () => {
-        reject(new ImagePreparationError("cancelled"));
+        reject(new ImagePreparationError());
       };
-      signal.addEventListener("abort", rejectCancelled, { once: true });
-      controller.signal.addEventListener("abort", rejectCancelled, {
-        once: true,
-      });
-      removeAbortListeners = () => {
-        signal.removeEventListener("abort", rejectCancelled);
-        controller.signal.removeEventListener("abort", rejectCancelled);
-      };
+      combinedSignal.addEventListener("abort", rejectCancelled, { once: true });
+      removeAbortListener = () =>
+        combinedSignal.removeEventListener("abort", rejectCancelled);
     });
 
-    return Promise.race([worker, cancelled]).finally(removeAbortListeners);
+    return Promise.race([worker, cancelled]).finally(removeAbortListener);
   }
 
   async #prepare(
-    reference: ValidInboundImageReference,
-    callerSignal: AbortSignal,
-    controller: AbortController,
+    reference: InboundImageReference,
+    signal: AbortSignal,
   ): Promise<ImageLease> {
-    this.#throwIfCancelled(callerSignal, controller.signal);
-
     let bytes: Uint8Array;
     try {
       bytes = await this.#downloadImage(reference);
     } catch {
-      throw new ImagePreparationError("download_failed");
+      throw new ImagePreparationError();
     }
 
-    this.#throwIfCancelled(callerSignal, controller.signal);
-    if (bytes.byteLength > MAX_IMAGE_BYTES) {
-      throw new ImagePreparationError("too_large");
-    }
+    this.#throwIfCancelled(signal);
     const extension = imageExtension(bytes);
     if (extension === undefined) {
-      throw new ImagePreparationError("unsupported_format");
+      throw new ImagePreparationError();
     }
-    this.#throwIfCancelled(callerSignal, controller.signal);
 
     const root = this.#root;
     if (root === undefined) {
-      throw new ImagePreparationError("cancelled");
+      throw new ImagePreparationError();
     }
     const path = join(root, `${crypto.randomUUID()}${extension}`);
+    const writeFinished = Promise.withResolvers<void>();
+    this.#localWrites.add(writeFinished.promise);
     try {
-      await Deno.writeFile(path, bytes, {
-        createNew: true,
-        mode: 0o600,
-      });
-    } catch {
-      await this.#removePathBestEffort(path);
-      throw new ImagePreparationError("write_failed");
-    }
+      try {
+        await Deno.writeFile(path, bytes, {
+          createNew: true,
+          mode: 0o600,
+        });
+      } catch {
+        await this.#removePathBestEffort(path);
+        throw new ImagePreparationError();
+      }
 
-    try {
-      this.#throwIfCancelled(callerSignal, controller.signal);
-    } catch (error) {
-      await this.#removePathBestEffort(path);
-      throw error;
-    }
+      try {
+        this.#throwIfCancelled(signal);
+      } catch (error) {
+        await this.#removePathBestEffort(path);
+        throw error;
+      }
 
-    const file: ManagedImageFile = {
-      path,
-      references: 1,
-      removed: false,
-    };
-    this.#files.set(path, file);
-    return this.#lease(file);
+      const file: ManagedImageFile = {
+        path,
+        references: 1,
+      };
+      return this.#lease(file);
+    } finally {
+      this.#localWrites.delete(writeFinished.promise);
+      writeFinished.resolve();
+    }
   }
 
-  #throwIfCancelled(
-    callerSignal: AbortSignal,
-    storeSignal: AbortSignal,
-  ): void {
-    if (this.#closed || callerSignal.aborted || storeSignal.aborted) {
-      throw new ImagePreparationError("cancelled");
+  #throwIfCancelled(signal: AbortSignal): void {
+    if (signal.aborted) {
+      throw new ImagePreparationError();
     }
   }
 
@@ -225,10 +170,9 @@ export class ImageTempStore implements ImagePreparer {
       path: file.path,
       retain: (): ImageLease => {
         if (
-          released || this.#closed || file.removed ||
-          file.references <= 0 || this.#files.get(file.path) !== file
+          released || this.#closed || file.references <= 0
         ) {
-          throw new ImagePreparationError("store_not_ready");
+          throw new ImagePreparationError();
         }
         file.references++;
         return this.#lease(file);
@@ -236,107 +180,57 @@ export class ImageTempStore implements ImagePreparer {
       release: async (): Promise<void> => {
         if (released) return;
         released = true;
-        if (file.removed || file.references <= 0) return;
+        if (file.references <= 0) return;
         file.references--;
         if (file.references > 0) return;
-        await this.#removeManagedFile(file);
+        try {
+          await this.#removePath(file.path, false);
+        } catch {
+          throw new ImagePreparationError();
+        }
       },
     };
   }
 
-  async #removeManagedFile(file: ManagedImageFile): Promise<void> {
-    try {
-      await this.#removePath(file.path, false);
-    } catch {
-      throw new ImagePreparationError("cleanup_failed");
-    }
-    file.removed = true;
-    this.#files.delete(file.path);
-  }
-
   async #removePath(path: string, recursive: boolean): Promise<void> {
-    const removal = Deno.remove(path, { recursive });
-    const tracked = this.#trackTask(removal);
     try {
-      await removal;
+      await Deno.remove(path, { recursive });
     } catch (error) {
       if (!(error instanceof Deno.errors.NotFound)) throw error;
-    } finally {
-      await tracked;
     }
   }
 
-  async #removePathBestEffort(path: string): Promise<void> {
+  async #removePathBestEffort(
+    path: string,
+    recursive = false,
+  ): Promise<void> {
     try {
-      await this.#removePath(path, false);
+      await this.#removePath(path, recursive);
     } catch {
-      // The process-root cleanup is the final fallback for orphaned candidates.
+      // Cleanup is best-effort on an already failing path.
     }
   }
 
-  #trackTask<T>(task: Promise<T>): Promise<void> {
-    const tracked = task.then(
-      () => undefined,
-      () => undefined,
-    ).finally(() => this.#tasks.delete(tracked));
-    this.#tasks.add(tracked);
-    return tracked;
-  }
-
-  close(): Promise<void> {
-    if (this.#closePromise) return this.#closePromise;
+  async close(): Promise<void> {
+    if (this.#closed) return;
     this.#closed = true;
-    for (const controller of this.#controllers) controller.abort();
-    this.#closePromise = this.#close();
-    return this.#closePromise;
-  }
-
-  async #close(): Promise<void> {
-    if (this.#startPromise) {
-      try {
-        await this.#startPromise;
-      } catch {
-        // Startup owns cleanup of any directory it failed to publish.
-      }
-    }
-
-    const tasks = [...this.#tasks];
-    if (tasks.length > 0) {
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      try {
-        await Promise.race([
-          Promise.allSettled(tasks).then(() => undefined),
-          new Promise<void>((resolve) => {
-            timer = setTimeout(resolve, IMAGE_CLOSE_GRACE_MS);
-          }),
-        ]);
-      } finally {
-        if (timer !== undefined) clearTimeout(timer);
-      }
-    }
-
-    const roots = new Set(this.#cleanupRoots);
-    if (this.#root !== undefined) roots.add(this.#root);
+    this.#abort.abort();
+    const root = this.#root;
     this.#root = undefined;
-    let cleanupFailed = false;
-    for (const root of roots) {
+    await Promise.all(this.#localWrites);
+    if (root !== undefined) {
       try {
         await this.#removePath(root, true);
-        this.#cleanupRoots.delete(root);
       } catch {
-        cleanupFailed = true;
+        throw new ImagePreparationError();
       }
-    }
-
-    for (const file of this.#files.values()) file.removed = true;
-    this.#files.clear();
-    if (cleanupFailed) {
-      throw new ImagePreparationError("cleanup_failed");
     }
   }
 }
 
-function imageExtension(bytes: Uint8Array): ".jpg" | ".png" | undefined {
+function imageExtension(
+  bytes: Uint8Array,
+): ".jpg" | ".png" | ".gif" | ".webp" | undefined {
   if (
     bytes.byteLength >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 &&
     bytes[2] === 0xff
@@ -344,6 +238,20 @@ function imageExtension(bytes: Uint8Array): ".jpg" | ".png" | undefined {
     return ".jpg";
   }
   if (hasPrefix(bytes, PNG_SIGNATURE)) return ".png";
+  if (
+    bytes.byteLength >= 6 && bytes[0] === 0x47 && bytes[1] === 0x49 &&
+    bytes[2] === 0x46 && bytes[3] === 0x38 &&
+    (bytes[4] === 0x37 || bytes[4] === 0x39) && bytes[5] === 0x61
+  ) {
+    return ".gif";
+  }
+  if (
+    bytes.byteLength >= 12 && bytes[0] === 0x52 && bytes[1] === 0x49 &&
+    bytes[2] === 0x46 && bytes[3] === 0x46 && bytes[8] === 0x57 &&
+    bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50
+  ) {
+    return ".webp";
+  }
   return undefined;
 }
 

@@ -17,19 +17,10 @@ export interface InboundMessage {
   msgId: string;
 }
 
-export interface ValidInboundImageReference {
-  readonly status: "valid";
+export interface InboundImageReference {
   readonly url: string;
-  readonly aesKey: string;
+  readonly aesKey?: string;
 }
-
-export interface InvalidInboundImageReference {
-  readonly status: "invalid";
-}
-
-export type InboundImageReference =
-  | ValidInboundImageReference
-  | InvalidInboundImageReference;
 
 export type InboundContentPart =
   | { readonly type: "text"; readonly text: string }
@@ -91,7 +82,7 @@ export interface WeComClientLike {
   on(event: string, listener: Listener): unknown;
   connect(): unknown;
   disconnect(): void;
-  downloadFile(url: string, aesKey: string): Promise<{
+  downloadFile(url: string, aesKey?: string): Promise<{
     buffer: Uint8Array;
     filename?: string;
   }>;
@@ -180,17 +171,13 @@ export function normalizeMessageFrame(frame: unknown): InboundMessage {
 }
 
 function normalizeImageReference(value: unknown): InboundImageReference {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return { status: "invalid" };
+  const image = asRecord(value, "image");
+  const url = requiredId(image, "url", "image.url");
+  if (image.aeskey === undefined) return { url };
+  if (typeof image.aeskey !== "string" || image.aeskey.trim().length === 0) {
+    throw new TypeError("image.aeskey must be a non-empty string");
   }
-  const image = value as Record<string, unknown>;
-  if (
-    typeof image.url !== "string" || image.url.trim().length === 0 ||
-    typeof image.aeskey !== "string" || image.aeskey.trim().length === 0
-  ) {
-    return { status: "invalid" };
-  }
-  return { status: "valid", url: image.url, aesKey: image.aeskey };
+  return { url, aesKey: image.aeskey };
 }
 
 function normalizeTextPart(
@@ -294,14 +281,6 @@ export function normalizeUserMessageFrame(frame: unknown): InboundUserMessage {
   throw new TypeError("frame must contain a text, image, or mixed message");
 }
 
-export function normalizeTextFrame(frame: unknown): InboundText {
-  const message = normalizeUserMessageFrame(frame);
-  if (message.messageType !== "text") {
-    throw new TypeError("frame must contain a text message");
-  }
-  return message;
-}
-
 function toError(value: unknown): Error {
   return value instanceof Error ? value : new Error(String(value));
 }
@@ -337,14 +316,11 @@ export class WeComGateway {
   async downloadImage(
     reference: InboundImageReference,
   ): Promise<Uint8Array> {
-    if (reference.status !== "valid") {
-      throw new TypeError("downloadImage requires a valid image reference");
-    }
     const { buffer } = await this.#client.downloadFile(
       reference.url,
       reference.aesKey,
     );
-    return new Uint8Array(buffer);
+    return buffer;
   }
 
   async reply(

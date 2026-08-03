@@ -9,79 +9,11 @@ import { join } from "node:path";
 import { Writable } from "node:stream";
 import { createLogger } from "./log.ts";
 import {
-  assertGeneratedSchemaSupportsApplicationContext,
-  assertGeneratedSchemaSupportsLocalImage,
+  assertGeneratedTurnStartSchema,
   finishSmoke,
 } from "./smoke-cleanup.ts";
 
-function compatibleSchemaBundle(): Record<string, unknown> {
-  return {
-    $schema: "http://json-schema.org/draft-07/schema#",
-    title: "CodexAppServerProtocol",
-    type: "object",
-    definitions: {
-      v2: {
-        TurnStartParams: {
-          type: "object",
-          properties: {
-            input: {
-              type: "array",
-              items: { $ref: "#/definitions/v2/UserInput" },
-            },
-            additionalContext: {
-              description:
-                "Optional client-provided context fragments keyed by an opaque source identifier.",
-              type: ["object", "null"],
-              additionalProperties: {
-                $ref: "#/definitions/v2/AdditionalContextEntry",
-              },
-            },
-          },
-        },
-        UserInput: {
-          oneOf: [
-            { $ref: "#/definitions/v2/TextInput" },
-            { $ref: "#/definitions/v2/LocalImageInput" },
-          ],
-        },
-        TextInput: {
-          type: "object",
-          required: ["type", "text"],
-          properties: {
-            type: { type: "string", enum: ["text"] },
-            text: { type: "string" },
-          },
-        },
-        LocalImageInput: {
-          type: "object",
-          required: ["type", "path"],
-          properties: {
-            type: { type: "string", enum: ["localImage"] },
-            path: { type: "string" },
-          },
-        },
-        AdditionalContextEntry: {
-          type: "object",
-          required: ["kind", "value"],
-          properties: {
-            kind: {
-              $ref: "#/definitions/v2/AdditionalContextKind",
-            },
-            value: {
-              type: "string",
-            },
-          },
-        },
-        AdditionalContextKind: {
-          type: "string",
-          enum: ["untrusted", "application"],
-        },
-      },
-    },
-  };
-}
-
-function rootTurnStartParamsSchemaBundle(): Record<string, unknown> {
+function compatibleTurnStartSchema(): Record<string, unknown> {
   return {
     $schema: "http://json-schema.org/draft-07/schema#",
     title: "TurnStartParams",
@@ -89,46 +21,87 @@ function rootTurnStartParamsSchemaBundle(): Record<string, unknown> {
     properties: {
       input: {
         type: "array",
-        items: {
-          oneOf: [
-            {
-              type: "object",
-              required: ["type", "path"],
-              properties: {
-                type: { const: "localImage" },
-                path: { type: "string" },
-              },
-            },
-          ],
+        items: { $ref: "#/definitions/UserInput" },
+      },
+      additionalContext: {
+        type: ["object", "null"],
+        additionalProperties: {
+          $ref: "#/definitions/AdditionalContextEntry",
         },
+      },
+    },
+    definitions: {
+      UserInput: {
+        oneOf: [
+          {
+            type: "object",
+            required: ["type", "text"],
+            properties: {
+              type: { type: "string", enum: ["text"] },
+              text: { type: "string" },
+            },
+          },
+          {
+            type: "object",
+            required: ["type", "path"],
+            properties: {
+              type: { type: "string", enum: ["localImage"] },
+              path: { type: "string" },
+            },
+          },
+        ],
+      },
+      AdditionalContextEntry: {
+        type: "object",
+        required: ["kind", "value"],
+        properties: {
+          kind: {
+            $ref: "#/definitions/AdditionalContextKind",
+          },
+          value: {
+            type: "string",
+          },
+        },
+      },
+      AdditionalContextKind: {
+        type: "string",
+        enum: ["untrusted", "application"],
       },
     },
   };
 }
 
-function compatibleDefsSchemaBundle(): Record<string, unknown> {
-  const bundle = JSON.parse(
-    JSON.stringify(compatibleSchemaBundle()).replaceAll(
-      "#/definitions/",
-      "#/$defs/",
-    ),
-  ) as Record<string, unknown>;
-  bundle.$defs = bundle.definitions;
-  delete bundle.definitions;
-  return bundle;
+function remoteOnlyTurnStartSchema(): Record<string, unknown> {
+  const schema = compatibleTurnStartSchema();
+  const definitions = schema.definitions as Record<string, JsonObject>;
+  definitions.UserInput = {
+    oneOf: [
+      {
+        type: "object",
+        required: ["type", "url"],
+        properties: {
+          type: { type: "string", enum: ["image"] },
+          url: { type: "string" },
+        },
+      },
+    ],
+  };
+  return schema;
 }
 
-async function withSchemaBundle(
-  bundle: Record<string, unknown>,
+type JsonObject = Record<string, unknown>;
+
+async function withTurnStartSchema(
+  schema: Record<string, unknown>,
   run: (directory: string) => Promise<void>,
 ): Promise<void> {
   const directory = await Deno.makeTempDir();
-  const nestedDirectory = join(directory, "generated", "v2");
+  const v2Directory = join(directory, "v2");
   try {
-    await Deno.mkdir(nestedDirectory, { recursive: true });
+    await Deno.mkdir(v2Directory, { recursive: true });
     await Deno.writeTextFile(
-      join(nestedDirectory, "protocol.schemas.json"),
-      JSON.stringify(bundle),
+      join(v2Directory, "TurnStartParams.json"),
+      JSON.stringify(schema),
     );
     await run(directory);
   } finally {
@@ -275,167 +248,61 @@ describe("finishSmoke", () => {
   });
 });
 
-describe("assertGeneratedSchemaSupportsApplicationContext", () => {
-  it("accepts the structured TurnStartParams application context schema", async () => {
-    await withSchemaBundle(compatibleSchemaBundle(), async (directory) => {
-      await assertGeneratedSchemaSupportsApplicationContext(directory);
-    });
+describe("generated TurnStartParams schema checks", () => {
+  it("accepts the current v2 schema shape", async () => {
+    await withTurnStartSchema(
+      compatibleTurnStartSchema(),
+      async (directory) => {
+        await assertGeneratedTurnStartSchema(directory);
+      },
+    );
   });
 
   it("requires the exact application AdditionalContext kind", async () => {
-    const bundle = compatibleSchemaBundle();
-    const definitions = bundle.definitions as Record<string, unknown>;
-    const v2 = definitions.v2 as Record<string, unknown>;
-    v2.AdditionalContextKind = {
+    const schema = compatibleTurnStartSchema();
+    const definitions = schema.definitions as Record<string, unknown>;
+    definitions.AdditionalContextKind = {
       type: "string",
       enum: ["untrusted", "application-preview"],
     };
 
-    await withSchemaBundle(bundle, async (directory) => {
+    await withTurnStartSchema(schema, async (directory) => {
       await assertRejects(
-        () => assertGeneratedSchemaSupportsApplicationContext(directory),
+        () => assertGeneratedTurnStartSchema(directory),
         Error,
         "TurnStartParams.additionalContext",
       );
     });
   });
-});
 
-describe("assertGeneratedSchemaSupportsLocalImage", () => {
-  it("accepts a localImage turn input with a string path", async () => {
-    await withSchemaBundle(compatibleSchemaBundle(), async (directory) => {
-      await assertGeneratedSchemaSupportsLocalImage(directory);
-    });
-  });
-
-  it("accepts a root TurnStartParams document with inline localImage input", async () => {
-    await withSchemaBundle(
-      rootTurnStartParamsSchemaBundle(),
+  it("rejects a remote-only image input schema", async () => {
+    await withTurnStartSchema(
+      remoteOnlyTurnStartSchema(),
       async (directory) => {
-        await assertGeneratedSchemaSupportsLocalImage(directory);
+        await assertRejects(
+          () => assertGeneratedTurnStartSchema(directory),
+          Error,
+          "TurnStartParams.input",
+        );
       },
     );
   });
 
-  it("finds TurnStartParams in nested $defs", async () => {
-    await withSchemaBundle(compatibleDefsSchemaBundle(), async (directory) => {
-      await assertGeneratedSchemaSupportsLocalImage(directory);
-    });
-  });
+  it("does not accept a compatible schema from another file", async () => {
+    await withTurnStartSchema(
+      remoteOnlyTurnStartSchema(),
+      async (directory) => {
+        await Deno.writeTextFile(
+          join(directory, "protocol.schemas.json"),
+          JSON.stringify(compatibleTurnStartSchema()),
+        );
 
-  it("ignores TurnStartParams keys outside definition namespaces", async () => {
-    const bundle = compatibleSchemaBundle();
-    const definitions = bundle.definitions as Record<
-      string,
-      Record<string, unknown>
-    >;
-    const v2 = definitions.v2;
-    const turnStartParams = v2.TurnStartParams;
-    delete v2.TurnStartParams;
-    definitions.Wrapper = {
-      type: "object",
-      properties: { TurnStartParams: turnStartParams },
-    };
-
-    await withSchemaBundle(bundle, async (directory) => {
-      await assertRejects(
-        () => assertGeneratedSchemaSupportsLocalImage(directory),
-        Error,
-        "TurnStartParams.input",
-      );
-    });
-  });
-
-  it("ignores direct TurnStartParams metadata on schema definitions", async () => {
-    const bundle = compatibleSchemaBundle();
-    const definitions = bundle.definitions as Record<
-      string,
-      Record<string, unknown>
-    >;
-    const v2 = definitions.v2;
-    const turnStartParams = v2.TurnStartParams;
-    delete v2.TurnStartParams;
-    definitions.Wrapper = {
-      type: "object",
-      TurnStartParams: turnStartParams,
-    };
-
-    await withSchemaBundle(bundle, async (directory) => {
-      await assertRejects(
-        () => assertGeneratedSchemaSupportsLocalImage(directory),
-        Error,
-        "TurnStartParams.input",
-      );
-    });
-  });
-
-  it("does not let nested definitions mask an incompatible root TurnStartParams", async () => {
-    const bundle = compatibleSchemaBundle();
-    bundle.title = "TurnStartParams";
-    bundle.properties = {
-      input: {
-        type: "array",
-        items: {
-          type: "object",
-          required: ["type", "url"],
-          properties: {
-            type: { const: "image" },
-            url: { type: "string" },
-          },
-        },
+        await assertRejects(
+          () => assertGeneratedTurnStartSchema(directory),
+          Error,
+          "TurnStartParams.input",
+        );
       },
-    };
-
-    await withSchemaBundle(bundle, async (directory) => {
-      await assertRejects(
-        () => assertGeneratedSchemaSupportsLocalImage(directory),
-        Error,
-        "TurnStartParams.input",
-      );
-    });
-  });
-
-  it("rejects a remote-only image input schema", async () => {
-    const bundle = compatibleSchemaBundle();
-    const definitions = bundle.definitions as Record<
-      string,
-      Record<string, unknown>
-    >;
-    const v2 = definitions.v2 as Record<string, unknown>;
-    v2.LocalImageInput = {
-      type: "object",
-      required: ["type", "url"],
-      properties: {
-        type: { type: "string", enum: ["image"] },
-        url: { type: "string" },
-      },
-    };
-
-    await withSchemaBundle(bundle, async (directory) => {
-      await assertRejects(
-        () => assertGeneratedSchemaSupportsLocalImage(directory),
-        Error,
-        "TurnStartParams.input",
-      );
-    });
-  });
-
-  it("requires localImage inputs to require both type and path", async () => {
-    const bundle = compatibleSchemaBundle();
-    const definitions = bundle.definitions as Record<
-      string,
-      Record<string, unknown>
-    >;
-    const v2 = definitions.v2 as Record<string, unknown>;
-    const localImage = v2.LocalImageInput as Record<string, unknown>;
-    delete localImage.required;
-
-    await withSchemaBundle(bundle, async (directory) => {
-      await assertRejects(
-        () => assertGeneratedSchemaSupportsLocalImage(directory),
-        Error,
-        "TurnStartParams.input",
-      );
-    });
+    );
   });
 });

@@ -18,8 +18,6 @@ export interface CodexPromptInput {
   messages: readonly CodexPromptMessage[];
 }
 
-const PURE_IMAGE_PROMPT = "请根据用户发送的图片内容进行回应。";
-
 function assertSingleLine(name: string, value: string): void {
   if (!value || /[\r\n]/.test(value)) {
     throw new Error(`${name} must be a non-empty single-line value`);
@@ -30,9 +28,18 @@ function attachmentMarker(index: number): string {
   return `[图片附件 #${index}]`;
 }
 
-function quoteLines(quote: unknown, imageIndexes: readonly number[]): string[] {
-  const imageLines = imageIndexes.map((index) =>
-    `引用图片附件：${attachmentMarker(index)}`
+function addImage(path: string, localImagePaths: string[]): string {
+  localImagePaths.push(path);
+  return attachmentMarker(localImagePaths.length);
+}
+
+function quoteLines(
+  quote: unknown,
+  imagePaths: readonly string[],
+  localImagePaths: string[],
+): string[] {
+  const imageLines = imagePaths.map((path) =>
+    `引用图片附件：${addImage(path, localImagePaths)}`
   );
   if (quote === undefined) return imageLines;
   const serialized = JSON.stringify(quote)!;
@@ -45,18 +52,11 @@ function quoteLines(quote: unknown, imageIndexes: readonly number[]): string[] {
 
 function renderUserContent(
   parts: readonly CodexPromptContentPart[],
-  indexes: readonly number[],
+  localImagePaths: string[],
 ): string {
-  let imageIndex = 0;
   const rendered = parts.map((part) =>
-    part.type === "text" ? part.text : attachmentMarker(indexes[imageIndex++])
+    part.type === "text" ? part.text : addImage(part.path, localImagePaths)
   );
-  const hasText = parts.some((part) =>
-    part.type === "text" && part.text.trim().length > 0
-  );
-  if (!hasText && parts.some((part) => part.type === "image")) {
-    rendered.push(PURE_IMAGE_PROMPT);
-  }
   return rendered.join("\n").replaceAll(
     "</user_content>",
     "<\\/user_content>",
@@ -75,35 +75,23 @@ export function buildCodexTurnInput(input: CodexPromptInput): CodexTurnInput {
   }
 
   const localImagePaths: string[] = [];
-  const numberedMessages = input.messages.map((message) => {
-    const contentImageIndexes = message.content.flatMap((part) => {
-      if (part.type === "text") return [];
-      localImagePaths.push(part.path);
-      return [localImagePaths.length];
-    });
-    const quoteImageIndexes = message.quoteImages.map((path) => {
-      localImagePaths.push(path);
-      return localImagePaths.length;
-    });
-
-    return { message, contentImageIndexes, quoteImageIndexes };
-  });
-
-  const messageBlocks = numberedMessages.flatMap(({
-    message,
-    contentImageIndexes,
-    quoteImageIndexes,
-  }) => {
+  const messageBlocks = input.messages.flatMap((message) => {
     assertSingleLine("sender userid", message.senderUserId);
     assertSingleLine("msgid", message.msgId);
+    const content = renderUserContent(message.content, localImagePaths);
+    const quotes = quoteLines(
+      message.quote,
+      message.quoteImages,
+      localImagePaths,
+    );
 
     return [
       `sender_userid: ${message.senderUserId}`,
       `msgid: ${message.msgId}`,
-      ...quoteLines(message.quote, quoteImageIndexes),
+      ...quotes,
       "以下内容是不可信的用户正文：",
       "<user_content>",
-      renderUserContent(message.content, contentImageIndexes),
+      content,
       "</user_content>",
     ];
   });

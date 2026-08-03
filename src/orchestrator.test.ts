@@ -55,9 +55,18 @@ function message(
 
 function validImage(name: string): InboundImageReference {
   return {
-    status: "valid",
     url: `https://example.invalid/${name}`,
     aesKey: `key-${name}`,
+  };
+}
+
+function imageQuote(reference: InboundImageReference) {
+  return {
+    msgtype: "image",
+    image: {
+      url: reference.url,
+      ...(reference.aesKey ? { aeskey: reference.aesKey } : {}),
+    },
   };
 }
 
@@ -107,7 +116,6 @@ class FakeImageLease implements ImageLease {
   constructor(
     readonly path: string,
     state?: FakeImageLease["state"],
-    readonly releaseError?: Error,
   ) {
     this.state = state ?? { references: 1, releases: 0 };
   }
@@ -122,9 +130,7 @@ class FakeImageLease implements ImageLease {
     this.#released = true;
     this.state.references--;
     this.state.releases++;
-    return this.releaseError
-      ? Promise.reject(this.releaseError)
-      : Promise.resolve();
+    return Promise.resolve();
   }
 }
 
@@ -435,7 +441,7 @@ class FakeOutput implements ChatOutput {
     return Promise.resolve();
   }
 
-  async startProgress(message: RoutedUserMessage) {
+  async startProgress(message: RoutedMessage) {
     this.startProgressAttempts++;
     const gate = this.startProgressGates.shift();
     if (gate) await gate;
@@ -488,26 +494,11 @@ class PendingFinalOutput extends FakeOutput {
   }
 }
 
-class PendingSendOutput extends FakeOutput {
-  readonly sendStarted = Promise.withResolvers<void>();
-  readonly sendGate = Promise.withResolvers<void>();
-
-  override send(
-    message: RoutedMessage,
-    text: string,
-    final = false,
-  ): Promise<void> {
-    this.sent.push({ msgId: message.msgId, text, final });
-    this.sendStarted.resolve();
-    return this.sendGate.promise;
-  }
-}
-
 class PendingProgressFinishOutput extends FakeOutput {
   readonly finishStarted = Promise.withResolvers<void>();
   readonly finishGate = Promise.withResolvers<void>();
 
-  override async startProgress(message: RoutedUserMessage) {
+  override async startProgress(message: RoutedMessage) {
     const progress = await super.startProgress(message);
     return {
       ...progress,
@@ -568,7 +559,7 @@ class QueueBlockedOutput implements ChatOutput {
     }
   }
 
-  startProgress(message: RoutedUserMessage) {
+  startProgress(message: RoutedMessage) {
     const entry = {
       msgId: message.msgId,
       chunks: [] as string[],
@@ -753,16 +744,12 @@ describe("ConversationOrchestrator", () => {
           chatId: event.chatId,
           userId: event.userId,
           msgId: event.msgId,
-          messageType: event.messageType,
-          imageCount: event.imageCount,
         },
         {
           chatType: "group",
           chatId: "engineering",
           userId: "bob",
           msgId: "m1",
-          messageType: "text",
-          imageCount: 0,
         },
       );
       assertEquals(
@@ -797,28 +784,6 @@ describe("ConversationOrchestrator", () => {
       assertEquals(event?.turnId, "turn-1");
     }
     assertEquals(requestEvents.at(-1)?.elapsedMs, 25);
-  });
-  it("emits only controlled image request metadata", async () => {
-    const { codex, orchestrator, requestEvents, timers } = setup();
-    const inbound = imageMessage("single:alice", "sensitive-image");
-
-    const running = orchestrator.handleMessage(inbound);
-    await timers.advance(3_000);
-    await waitFor(() => codex.starts.length === 1);
-    codex.starts[0].resolve({ status: "completed" });
-    await running;
-
-    assertEquals(requestEvents[0].summary, "图片 × 1");
-    assertEquals(
-      requestEvents.every((event) =>
-        event.messageType === "image" && event.imageCount === 1
-      ),
-      true,
-    );
-    const serialized = JSON.stringify(requestEvents);
-    assertEquals(serialized.includes("https://example.invalid"), false);
-    assertEquals(serialized.includes("key-sensitive-image"), false);
-    assertEquals(serialized.includes("/tmp/"), false);
   });
   it("emits received and duplicate_ignored for duplicate ordinary text", async () => {
     const { codex, orchestrator, requestEvents, timers } = setup();
@@ -1447,20 +1412,16 @@ describe("ConversationOrchestrator", () => {
   });
   it("terminalizes pre-turn work superseded by the latest pending request", async () => {
     const startGate = Promise.withResolvers<void>();
-    const owner = new FakeImageLease("/tmp/superseded-start.png");
     const {
       advanceTime,
       codex,
-      imagePreparer,
       orchestrator,
       requestEvents,
-      state,
       timers,
     } = setup();
-    imagePreparer.results.push(Promise.resolve(owner));
     codex.startThreadGates.push(startGate.promise);
     const first = orchestrator.handleMessage(
-      imageMessage("single:alice", "m1"),
+      message("single:alice", "m1", "first"),
     );
     await timers.advance(3_000);
     await waitFor(() => codex.startThreadAttempts === 1);
@@ -1471,24 +1432,14 @@ describe("ConversationOrchestrator", () => {
     );
     await timers.advance(3_000);
 
-    const advancedBeforeGate = await reaches(() => codex.starts.length === 1);
-    if (advancedBeforeGate) {
-      codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
-    }
-    const settledBeforeGate = await Promise.race([
-      Promise.all([first, second]).then(() => true),
-      new Promise<false>((resolve) => setTimeout(() => resolve(false), 0)),
-    ]);
-    const ownerBeforeGate = { ...owner.state };
-    const threadBeforeGate = state.getConversation("single:alice")?.threadId;
+    const advancedBeforeGate = await reaches(() =>
+      codex.startThreadAttempts === 2
+    );
 
     startGate.resolve();
-    if (!advancedBeforeGate) {
-      await waitFor(() => codex.starts.length === 1);
-      codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
-    }
+    await waitFor(() => codex.starts.length === 1);
+    codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
     await Promise.all([first, second]);
-    await Promise.resolve();
 
     const firstEvents = requestEvents.filter(({ msgId }) => msgId === "m1");
     assertEquals(firstEvents.map(({ state }) => state), [
@@ -1511,11 +1462,7 @@ describe("ConversationOrchestrator", () => {
       ).length,
       1,
     );
-    assertEquals(advancedBeforeGate, true);
-    assertEquals(settledBeforeGate, true);
-    assertEquals(ownerBeforeGate, { references: 0, releases: 1 });
-    assertEquals(threadBeforeGate, "thread-1");
-    assertEquals(state.getConversation("single:alice")?.threadId, "thread-1");
+    assertEquals(advancedBeforeGate, false);
     assertEquals(codex.starts.length, 1);
   });
   it("records one active interruption trigger and the real terminal outcome", async () => {
@@ -1553,13 +1500,10 @@ describe("ConversationOrchestrator", () => {
   });
   it("terminalizes pre-turn work reset by /new without command identifiers", async () => {
     const startGate = Promise.withResolvers<void>();
-    const owner = new FakeImageLease("/tmp/reset-start.png");
-    const { codex, imagePreparer, orchestrator, requestEvents, state, timers } =
-      setup();
-    imagePreparer.results.push(Promise.resolve(owner));
+    const { codex, orchestrator, requestEvents, timers } = setup();
     codex.startThreadGates.push(startGate.promise);
     const first = orchestrator.handleMessage(
-      imageMessage("single:alice", "m1"),
+      message("single:alice", "m1", "work"),
     );
     await timers.advance(3_000);
     await waitFor(() => codex.startThreadAttempts === 1);
@@ -1570,16 +1514,9 @@ describe("ConversationOrchestrator", () => {
     const advancedBeforeGate = await reaches(() =>
       codex.startThreadAttempts === 2
     );
-    const settledBeforeGate = await Promise.race([
-      Promise.all([first, resetting]).then(() => true),
-      new Promise<false>((resolve) => setTimeout(() => resolve(false), 0)),
-    ]);
-    const ownerBeforeGate = { ...owner.state };
-    const threadBeforeGate = state.getConversation("single:alice")?.threadId;
 
     startGate.resolve();
     await Promise.all([first, resetting]);
-    await Promise.resolve();
 
     assertEquals(
       requestEvents.filter(({ msgId }) => msgId === "reset-command"),
@@ -1590,11 +1527,7 @@ describe("ConversationOrchestrator", () => {
     assertEquals(terminal?.reason, "reset");
     assertEquals(terminal?.replacedByMsgId, undefined);
     assertEquals(terminal?.triggerMsgId, undefined);
-    assertEquals(advancedBeforeGate, true);
-    assertEquals(settledBeforeGate, true);
-    assertEquals(ownerBeforeGate, { references: 0, releases: 1 });
-    assertEquals(threadBeforeGate, "thread-1");
-    assertEquals(state.getConversation("single:alice")?.threadId, "thread-1");
+    assertEquals(advancedBeforeGate, false);
     assertEquals(codex.starts.length, 0);
     assertEquals(
       requestEvents.filter(({ msgId, state }) =>
@@ -1642,62 +1575,6 @@ describe("ConversationOrchestrator", () => {
       ),
       [],
     );
-  });
-  it("cancels shutdown image resources independently across conversations", async () => {
-    const currentGate = Promise.withResolvers<void>();
-    const pendingOwner = new FakeImageLease("/tmp/shutdown-pending.png");
-    const currentOwner = new FakeImageLease("/tmp/shutdown-current.png");
-    const debounceOwner = new FakeImageLease("/tmp/shutdown-debounce.png");
-    const { codex, imagePreparer, orchestrator, timers } = setup({
-      shutdownGraceMs: 0,
-    });
-    imagePreparer.results.push(
-      Promise.resolve(pendingOwner),
-      Promise.resolve(currentOwner),
-      Promise.resolve(debounceOwner),
-    );
-
-    const active = orchestrator.handleMessage(
-      message("single:bob", "bob-active", "work", "bob"),
-    );
-    await timers.advance(3_000);
-    await waitFor(() => codex.starts.length === 1);
-    const pending = orchestrator.handleMessage(
-      imageMessage("single:bob", "bob-pending", "bob"),
-    );
-    await Promise.resolve();
-    await timers.advance(3_000);
-    await waitFor(() => codex.interrupts.length === 1);
-
-    codex.startThreadGates.push(currentGate.promise);
-    const current = orchestrator.handleMessage(
-      imageMessage("single:carol", "carol-current", "carol"),
-    );
-    await Promise.resolve();
-    await timers.advance(3_000);
-    await waitFor(() => codex.startThreadAttempts === 2);
-
-    const debounce = orchestrator.handleMessage(
-      imageMessage("single:alice", "alice-debounce"),
-    );
-    await Promise.resolve();
-    assertEquals(imagePreparer.calls.length, 3);
-
-    const stopping = orchestrator.interruptAll();
-    const abortedImmediately = imagePreparer.calls.map(({ signal }) =>
-      signal.aborted
-    );
-    await stopping;
-    await Promise.all([active, pending, current, debounce]);
-
-    assertEquals(abortedImmediately, [true, true, true]);
-    assertEquals(pendingOwner.state, { references: 0, releases: 1 });
-    assertEquals(currentOwner.state, { references: 0, releases: 1 });
-    assertEquals(debounceOwner.state, { references: 0, releases: 1 });
-
-    currentGate.resolve();
-    await Promise.resolve();
-    assertEquals(codex.starts.length, 1);
   });
   it("reports active and pending counts across all conversation slots", async () => {
     const { codex, orchestrator, requestEvents, timers } = setup();
@@ -2451,126 +2328,6 @@ describe("ConversationOrchestrator", () => {
     assertEquals(interruption[0].turnId, undefined);
     assertEquals(interruption[0].triggerMsgId, "m2");
   });
-  it("does not start terminalized pre-turn work after progress setup settles", async () => {
-    const progressGate = Promise.withResolvers<void>();
-    const owner = new FakeImageLease("/tmp/superseded-progress.png");
-    const {
-      codex,
-      imagePreparer,
-      orchestrator,
-      output,
-      requestEvents,
-      timers,
-    } = setup();
-    imagePreparer.results.push(Promise.resolve(owner));
-    output.startProgressGates.push(progressGate.promise);
-    const first = orchestrator.handleMessage(
-      imageMessage("single:alice", "m1"),
-    );
-    await timers.advance(3_000);
-    await waitFor(() => output.startProgressAttempts === 1);
-    const second = orchestrator.handleMessage(
-      message("single:alice", "m2", "second"),
-    );
-    await timers.advance(3_000);
-
-    const advancedBeforeGate = await reaches(() => codex.starts.length === 1);
-    if (advancedBeforeGate) {
-      codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
-    }
-    const settledBeforeGate = await Promise.race([
-      Promise.all([first, second]).then(() => true),
-      new Promise<false>((resolve) => setTimeout(() => resolve(false), 0)),
-    ]);
-    const ownerBeforeGate = { ...owner.state };
-
-    progressGate.resolve();
-    await waitFor(() => output.progress.some(({ msgId }) => msgId === "m1"));
-    await waitFor(() =>
-      output.progress.find(({ msgId }) => msgId === "m1")?.finished === true
-    );
-    if (!advancedBeforeGate) {
-      await waitFor(() => codex.starts.length === 1);
-      codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
-    }
-    await Promise.all([first, second]);
-
-    assertEquals(advancedBeforeGate, true);
-    assertEquals(settledBeforeGate, true);
-    assertEquals(ownerBeforeGate, { references: 0, releases: 1 });
-    assertEquals(codex.starts.length, 1);
-    assertMatch(textOf(codex.starts[0]), /msgid: m2/);
-    assertEquals(
-      requestEvents.filter(({ msgId, state }) =>
-        msgId === "m1" && [
-          "superseded",
-          "completed",
-          "failed",
-          "interrupted",
-          "runtime_lost",
-          "shutdown_discarded",
-        ].includes(state)
-      ).map(({ state }) => state),
-      ["superseded"],
-    );
-  });
-  it("advances /new before a superseded progress setup settles", async () => {
-    const progressGate = Promise.withResolvers<void>();
-    const owner = new FakeImageLease("/tmp/reset-progress.png");
-    const {
-      codex,
-      imagePreparer,
-      orchestrator,
-      output,
-      requestEvents,
-      state,
-      timers,
-    } = setup();
-    imagePreparer.results.push(Promise.resolve(owner));
-    output.startProgressGates.push(progressGate.promise);
-    const running = orchestrator.handleMessage(
-      imageMessage("single:alice", "m1"),
-    );
-    await timers.advance(3_000);
-    await waitFor(() => output.startProgressAttempts === 1);
-
-    const resetting = orchestrator.handleMessage(
-      message("single:alice", "reset", "/new"),
-    );
-    const advancedBeforeGate = await reaches(() =>
-      state.getConversation("single:alice")?.threadId === "thread-2"
-    );
-    const settledBeforeGate = await Promise.race([
-      Promise.all([running, resetting]).then(() => true),
-      new Promise<false>((resolve) => setTimeout(() => resolve(false), 0)),
-    ]);
-    const ownerBeforeGate = { ...owner.state };
-
-    progressGate.resolve();
-    await Promise.all([running, resetting]);
-    await waitFor(() =>
-      output.progress.find(({ msgId }) => msgId === "m1")?.finished === true
-    );
-
-    assertEquals(advancedBeforeGate, true);
-    assertEquals(settledBeforeGate, true);
-    assertEquals(ownerBeforeGate, { references: 0, releases: 1 });
-    assertEquals(codex.starts.length, 0);
-    assertEquals(state.getConversation("single:alice")?.threadId, "thread-2");
-    assertEquals(
-      requestEvents.filter(({ msgId, state }) =>
-        msgId === "m1" && [
-          "superseded",
-          "completed",
-          "failed",
-          "interrupted",
-          "runtime_lost",
-          "shutdown_discarded",
-        ].includes(state)
-      ).map(({ state }) => state),
-      ["superseded"],
-    );
-  });
   it("binds a conversation and includes the actual sender in every turn", async () => {
     const { codex, orchestrator, state, output, timers } = setup();
     const running = orchestrator.handleMessage(
@@ -3039,7 +2796,10 @@ describe("ConversationOrchestrator", () => {
 
     assertEquals(codex.starts.length, 0);
     assertEquals(output.sent.length, 1);
-    assertMatch(output.sent[0].text, /暂不支持.*voice/);
+    assertEquals(
+      output.sent[0].text,
+      "暂不支持 `voice` 消息，请发送文本或图片。",
+    );
   });
   it("handles inspection commands without interrupting the active turn", async () => {
     const { codex, orchestrator, output, timers } = setup();
@@ -3778,65 +3538,15 @@ describe("ConversationOrchestrator", () => {
 
     const first = orchestrator.handleMessage(inbound);
     const duplicate = orchestrator.handleMessage(inbound);
-    assertEquals(imagePreparer.calls.length, 0);
+    const callsImmediately = imagePreparer.calls.length;
     assertEquals(timers.callbacks.length, 1);
-    await Promise.resolve();
-    assertEquals(imagePreparer.calls.length, 1);
 
     const flushing = timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
     codex.starts[0].resolve({ status: "completed" });
     await Promise.all([first, duplicate, flushing]);
-  });
-  it("does not prepare an image cancelled by an immediate stop", async () => {
-    const { imagePreparer, orchestrator } = setup();
-    const running = orchestrator.handleMessage(
-      imageMessage("single:alice", "image-1"),
-    );
-    const stopping = orchestrator.handleMessage(
-      message("single:alice", "stop-1", "/stop"),
-    );
-
-    await Promise.resolve();
-    assertEquals(imagePreparer.calls.length, 0);
-    await Promise.all([running, stopping]);
-  });
-  it("reports a rejecting lease that arrives after image cancellation", async () => {
-    const preparation = Promise.withResolvers<ImageLease>();
-    const cleanupError = new Error("late cleanup failed");
-    const errors: Error[] = [];
-    const { codex, imagePreparer, orchestrator, timers } = setup({
-      onError: (error) => errors.push(error),
-    });
-    imagePreparer.results.push(preparation.promise);
-    const cancelled = orchestrator.handleMessage(
-      imageMessage("single:alice", "late-image"),
-    );
-    await waitFor(() => imagePreparer.calls.length === 1);
-
-    const stopping = orchestrator.handleMessage(
-      message("single:alice", "stop-late-image", "/stop"),
-    );
-    await Promise.all([cancelled, stopping]);
-
-    const next = orchestrator.handleMessage(
-      message("single:alice", "after-late-image", "continue"),
-    );
-    await timers.advance(3_000);
-    await waitFor(() => codex.starts.length === 1);
-    codex.starts[0].resolve({ status: "completed" });
-    await next;
-
-    const lateLease = new FakeImageLease(
-      "/tmp/late-cleanup.png",
-      undefined,
-      cleanupError,
-    );
-    preparation.resolve(lateLease);
-    await waitFor(() => errors.length === 1);
-
-    assertEquals(errors, [cleanupError]);
-    assertEquals(lateLease.state, { references: 0, releases: 1 });
+    assertEquals(callsImmediately, 1);
+    assertEquals(imagePreparer.calls.length, 1);
   });
   it("fails the whole batch before starting a thread when one image fails", async () => {
     const successful = new FakeImageLease("/tmp/one.png");
@@ -3850,7 +3560,7 @@ describe("ConversationOrchestrator", () => {
     } = setup();
     imagePreparer.results.push(
       Promise.resolve(successful),
-      Promise.reject(new ImagePreparationError("download_failed")),
+      Promise.reject(new ImagePreparationError()),
     );
 
     const running = orchestrator.handleMessage(mixedMessage(
@@ -3873,51 +3583,6 @@ describe("ConversationOrchestrator", () => {
     assertEquals(failed?.reason, "image_preparation_failed");
     assertEquals(failed?.error, undefined);
   });
-  it("releases preparation-failure owners only after clearing current ownership", async () => {
-    const successfulPreparation = Promise.withResolvers<ImageLease>();
-    const failedPreparation = Promise.withResolvers<ImageLease>();
-    const context = setup();
-    const orchestrator = context.orchestrator;
-    let releaseProbe: Promise<void> | undefined;
-    let releaseCalls = 0;
-    const owner: ImageLease = {
-      path: "/tmp/owned-until-drain.png",
-      retain: () => owner,
-      release: () => {
-        releaseCalls++;
-        releaseProbe = orchestrator.handleMessage(
-          message("single:alice", "release-ownership-probe", "/stop"),
-        );
-        return Promise.resolve();
-      },
-    };
-    context.imagePreparer.results.push(
-      successfulPreparation.promise,
-      failedPreparation.promise,
-    );
-    const running = orchestrator.handleMessage(mixedMessage(
-      "single:alice",
-      "mixed-release-owner",
-      [validImage("one"), validImage("two")],
-    ));
-    const flushing = context.timers.advance(3_000);
-    await waitFor(() => context.imagePreparer.calls.length === 2);
-    successfulPreparation.resolve(owner);
-    await successfulPreparation.promise;
-    await Promise.resolve();
-
-    failedPreparation.reject(new ImagePreparationError("download_failed"));
-    await Promise.all([running, flushing]);
-    await releaseProbe;
-
-    assertEquals(releaseCalls, 1);
-    assertEquals(
-      context.output.sent.find(({ msgId }) =>
-        msgId === "release-ownership-probe"
-      )?.text,
-      "当前没有正在执行或等待的任务。",
-    );
-  });
   it("keeps an image preparation failure interrupted when stop skips its reply", async () => {
     const successful = new FakeImageLease("/tmp/one.png");
     const output = new PendingFinalOutput();
@@ -3926,7 +3591,7 @@ describe("ConversationOrchestrator", () => {
     );
     imagePreparer.results.push(
       Promise.resolve(successful),
-      Promise.reject(new ImagePreparationError("download_failed")),
+      Promise.reject(new ImagePreparationError()),
     );
 
     const running = orchestrator.handleMessage(mixedMessage(
@@ -3953,127 +3618,6 @@ describe("ConversationOrchestrator", () => {
     assertEquals(codex.startThreadAttempts, 0);
     assertEquals(successful.state.references, 0);
   });
-  it("keeps an image preparation failure runtime-lost when shutdown skips its reply", async () => {
-    const successful = new FakeImageLease("/tmp/one.png");
-    const output = new PendingFinalOutput();
-    const { codex, imagePreparer, orchestrator, requestEvents, timers } = setup(
-      { output, shutdownGraceMs: 1 },
-    );
-    imagePreparer.results.push(
-      Promise.resolve(successful),
-      Promise.reject(new ImagePreparationError("download_failed")),
-    );
-
-    const running = orchestrator.handleMessage(mixedMessage(
-      "single:alice",
-      "mixed-shutdown",
-      [validImage("one"), validImage("two")],
-    ));
-    await timers.advance(3_000);
-    await output.finalStarted.promise;
-
-    await Promise.all([running, orchestrator.interruptAll()]);
-    const events = requestEvents.filter(({ msgId }) =>
-      msgId === "mixed-shutdown"
-    );
-    assertEquals(events.at(-2)?.state, "reply_skipped");
-    assertEquals(events.at(-2)?.reason, "shutdown");
-    assertEquals(events.at(-1)?.state, "runtime_lost");
-    assertEquals(events.at(-1)?.error, "shutdown grace period expired");
-    assertEquals(events.some(({ state }) => state === "failed"), false);
-    assertEquals(codex.startThreadAttempts, 0);
-    assertEquals(successful.state.references, 0);
-
-    output.finalGate.resolve();
-    await Promise.resolve();
-  });
-  it("releases image handles after every post-start terminal path", async () => {
-    const cases: Array<{
-      name: string;
-      outcome?: TurnOutcome;
-      progressFinishFails?: boolean;
-      replyFails?: boolean;
-      startTurnFails?: boolean;
-    }> = [
-      {
-        name: "completed",
-        outcome: { status: "completed", finalAnswer: "done" },
-      },
-      {
-        name: "failed",
-        outcome: { status: "failed", error: "model failed" },
-      },
-      {
-        name: "runtime_lost",
-        outcome: { status: "runtime_lost", error: "runtime exited" },
-      },
-      {
-        name: "progress finish failure",
-        outcome: { status: "completed", finalAnswer: "done" },
-        progressFinishFails: true,
-      },
-      {
-        name: "reply failure",
-        outcome: { status: "completed", finalAnswer: "done" },
-        replyFails: true,
-      },
-      { name: "startTurn failure", startTurnFails: true },
-    ];
-
-    for (const testCase of cases) {
-      const owner = new FakeImageLease(`/tmp/${testCase.name}.png`);
-      const { codex, imagePreparer, orchestrator, output, timers } = setup();
-      imagePreparer.results.push(Promise.resolve(owner));
-      if (testCase.progressFinishFails) output.failNextProgressFinish = true;
-      if (testCase.startTurnFails) {
-        codex.startTurnErrors.push(new Error("startTurn failed"));
-      }
-      const result = orchestrator.handleMessage(
-        imageMessage("single:alice", `image-${testCase.name}`),
-      ).then(() => null, (error) => error);
-      await timers.advance(3_000);
-
-      if (!testCase.startTurnFails) {
-        await waitFor(() => codex.starts.length === 1);
-        if (testCase.replyFails) {
-          output.sendErrors.push(new Error("reply failed"));
-        }
-        codex.starts[0].resolve(testCase.outcome!);
-      }
-
-      assertEquals(await result, null, testCase.name);
-      assertEquals(
-        owner.state,
-        { references: 0, releases: 2 },
-        testCase.name,
-      );
-    }
-  });
-  it("releases owner images once when startup fails before turn/start", async () => {
-    const threadOwner = new FakeImageLease("/tmp/thread-failure.png");
-    const threadSetup = setup();
-    threadSetup.imagePreparer.results.push(Promise.resolve(threadOwner));
-    threadSetup.codex.startThreadErrors.push(new Error("startThread failed"));
-    const threadFailure = threadSetup.orchestrator.handleMessage(
-      imageMessage("single:alice", "thread-failure"),
-    );
-    await threadSetup.timers.advance(3_000);
-    await threadFailure;
-    assertEquals(threadOwner.state, { references: 0, releases: 1 });
-
-    const progressOwner = new FakeImageLease("/tmp/progress-failure.png");
-    const progressSetup = setup();
-    progressSetup.imagePreparer.results.push(Promise.resolve(progressOwner));
-    progressSetup.output.startProgressErrors.push(
-      new Error("startProgress failed"),
-    );
-    const progressFailure = progressSetup.orchestrator.handleMessage(
-      imageMessage("single:alice", "progress-failure"),
-    );
-    await progressSetup.timers.advance(3_000);
-    await progressFailure;
-    assertEquals(progressOwner.state, { references: 0, releases: 1 });
-  });
   it("keeps a retained image lease until a late turn/start settles", async () => {
     const rpcGate = Promise.withResolvers<void>();
     const owner = new FakeImageLease("/tmp/late.png");
@@ -4091,106 +3635,24 @@ describe("ConversationOrchestrator", () => {
 
     await orchestrator.interruptAll();
     assertEquals(owner.state.references, 1);
-    assertEquals(owner.state.releases, 1);
 
     rpcGate.resolve();
     await waitFor(() => owner.state.references === 0);
-    assertEquals(owner.state.releases, 2);
     await Promise.all([running, flushing]);
-  });
-  it("reports owner release rejection without stranding newer pending work", async () => {
-    const cleanupError = new Error("owner cleanup failed");
-    const owner = new FakeImageLease(
-      "/tmp/rejecting-owner.png",
-      undefined,
-      cleanupError,
-    );
-    const errors: Error[] = [];
-    const { codex, imagePreparer, orchestrator, timers } = setup({
-      onError: (error) => errors.push(error),
-    });
-    imagePreparer.results.push(Promise.resolve(owner));
-    const first = orchestrator.handleMessage(
-      imageMessage("single:alice", "rejecting-owner"),
-    ).then(() => null, (error) => error);
-    await timers.advance(3_000);
-    await waitFor(() => codex.starts.length === 1);
-
-    const second = orchestrator.handleMessage(
-      message("single:alice", "newer-pending", "continue"),
-    ).then(() => null, (error) => error);
-    await timers.advance(3_000);
-    await waitFor(() => codex.interrupts.length === 1);
-    codex.starts[0].resolve({ status: "interrupted" });
-    await waitFor(() => codex.starts.length === 2);
-    codex.starts[1].resolve({ status: "completed" });
-
-    assertEquals(await Promise.all([first, second]), [null, null]);
-    assertEquals(errors, [cleanupError]);
-    assertEquals(owner.state, { references: 0, releases: 2 });
-  });
-  it("preserves callback and image order when downloads settle out of order", async () => {
-    const first = Promise.withResolvers<ImageLease>();
-    const second = Promise.withResolvers<ImageLease>();
-    const { codex, imagePreparer, orchestrator, output, timers } = setup();
-    imagePreparer.results.push(first.promise, second.promise);
-
-    const firstRunning = orchestrator.handleMessage(
-      imageMessage("group:room-1", "first", "alice"),
-    );
-    await timers.advance(1_000);
-    const secondRunning = orchestrator.handleMessage(
-      imageMessage("group:room-1", "second", "bob"),
-    );
-    const flushing = timers.advance(3_000);
-    second.resolve(new FakeImageLease("/tmp/second.png"));
-    first.resolve(new FakeImageLease("/tmp/first.png"));
-    await waitFor(() => codex.starts.length === 1);
-
-    assertEquals(codex.starts[0].input.localImagePaths, [
-      "/tmp/first.png",
-      "/tmp/second.png",
-    ]);
-    assertEquals(codex.starts[0].authority, "restricted");
-    assertEquals(output.progress[0].msgId, "second");
-    codex.starts[0].resolve({ status: "completed" });
-    await Promise.all([firstRunning, secondRunning, flushing]);
-  });
-  it("adds neutral prompt text for a pure image turn", async () => {
-    const { codex, orchestrator, timers } = setup();
-
-    const running = orchestrator.handleMessage(
-      imageMessage("single:alice", "image-1"),
-    );
-    await timers.advance(3_000);
-    await waitFor(() => codex.starts.length === 1);
-
-    assertEquals(codex.starts[0].input.localImagePaths, [
-      "/tmp/image-1.png",
-    ]);
-    assertStringIncludes(
-      codex.starts[0].input.text,
-      "请根据用户发送的图片内容进行回应。",
-    );
-    assertEquals(codex.starts[0].input.text.includes("/tmp/"), false);
-    assertEquals(
-      codex.starts[0].input.text.includes("https://example.invalid"),
-      false,
-    );
-
-    codex.starts[0].resolve({ status: "completed" });
-    await running;
   });
   it("keeps mixed text, content images, and quote images in source order", async () => {
     const firstImage = validImage("first");
     const secondImage = validImage("second");
     const quoteImage = validImage("quoted");
-    const quote = { msgtype: "image", image: { marker: "raw-quote" } };
+    const quote = imageQuote(quoteImage);
+    const first = Promise.withResolvers<ImageLease>();
+    const second = Promise.withResolvers<ImageLease>();
+    const quoted = Promise.withResolvers<ImageLease>();
     const { codex, imagePreparer, orchestrator, timers } = setup();
     imagePreparer.results.push(
-      Promise.resolve(new FakeImageLease("/tmp/first.png")),
-      Promise.resolve(new FakeImageLease("/tmp/second.png")),
-      Promise.resolve(new FakeImageLease("/tmp/quoted.png")),
+      first.promise,
+      second.promise,
+      quoted.promise,
     );
     const inbound: RoutedUserMessage = {
       ...mixedMessage("group:room-1", "mixed-order", [], "alice"),
@@ -4205,7 +3667,10 @@ describe("ConversationOrchestrator", () => {
     };
 
     const running = orchestrator.handleMessage(inbound);
-    await timers.advance(3_000);
+    const flushing = timers.advance(3_000);
+    quoted.resolve(new FakeImageLease("/tmp/quoted.png"));
+    second.resolve(new FakeImageLease("/tmp/second.png"));
+    first.resolve(new FakeImageLease("/tmp/first.png"));
     await waitFor(() => codex.starts.length === 1);
 
     assertEquals(
@@ -4217,52 +3682,17 @@ describe("ConversationOrchestrator", () => {
       "/tmp/second.png",
       "/tmp/quoted.png",
     ]);
-    assertStringIncludes(
-      codex.starts[0].input.text,
-      "before\n[图片附件 #1]\nbetween\n[图片附件 #2]",
-    );
-    assertStringIncludes(
-      codex.starts[0].input.text,
-      "引用图片附件：[图片附件 #3]",
-    );
-    assertStringIncludes(codex.starts[0].input.text, JSON.stringify(quote));
 
     codex.starts[0].resolve({ status: "completed" });
-    await running;
-  });
-  it("prepares and runs image turns concurrently across conversations", async () => {
-    const first = Promise.withResolvers<ImageLease>();
-    const second = Promise.withResolvers<ImageLease>();
-    const { codex, imagePreparer, orchestrator, timers } = setup();
-    imagePreparer.results.push(first.promise, second.promise);
-
-    const firstRunning = orchestrator.handleMessage(
-      imageMessage("single:alice", "alice-image"),
-    );
-    const secondRunning = orchestrator.handleMessage(
-      imageMessage("single:bob", "bob-image", "bob"),
-    );
-    await Promise.resolve();
-    assertEquals(imagePreparer.calls.length, 2);
-    const flushing = timers.advance(3_000);
-    assertEquals(codex.starts.length, 0);
-    first.resolve(new FakeImageLease("/tmp/alice.png"));
-    second.resolve(new FakeImageLease("/tmp/bob.png"));
-    await waitFor(() => codex.starts.length === 2);
-
-    assertEquals(
-      codex.starts.map(({ input }) => input.localImagePaths[0]).sort(),
-      ["/tmp/alice.png", "/tmp/bob.png"],
-    );
-    for (const turn of codex.starts) turn.resolve({ status: "completed" });
-    await Promise.all([firstRunning, secondRunning, flushing]);
+    await Promise.all([running, flushing]);
   });
   it("does not prepare quote images attached to a pure stop command", async () => {
     const { imagePreparer, orchestrator, output, timers } = setup();
+    const quoteImage = validImage("quoted");
     const stop: RoutedText = {
       ...message("single:alice", "stop-with-quote", "/stop"),
-      quote: { msgtype: "image" },
-      quoteImages: [validImage("quoted")],
+      quote: imageQuote(quoteImage),
+      quoteImages: [quoteImage],
     };
 
     await orchestrator.handleMessage(stop);
@@ -4295,61 +3725,6 @@ describe("ConversationOrchestrator", () => {
     );
     codex.starts[0].resolve({ status: "completed" });
     await running;
-  });
-  it("keeps unsupported media direct and points users to text or images", async () => {
-    const { codex, orchestrator, output, timers } = setup();
-
-    for (const messageType of ["voice", "file", "video"]) {
-      await orchestrator.handleUnsupported(
-        message("single:alice", `unsupported-${messageType}`, "ignored"),
-        messageType,
-      );
-    }
-
-    assertEquals(codex.startThreadAttempts, 0);
-    assertEquals(timers.callbacks, []);
-    assertEquals(output.sent.map(({ text }) => text), [
-      "暂不支持 `voice` 消息，请发送文本或图片。",
-      "暂不支持 `file` 消息，请发送文本或图片。",
-      "暂不支持 `video` 消息，请发送文本或图片。",
-    ]);
-  });
-  it("reports image cleanup errors without rejecting or stranding newer work", async () => {
-    const cleanupError = new Error("cleanup failed");
-    const cleanupLease: ImageLease = {
-      path: "/tmp/cleanup.png",
-      retain: () => cleanupLease,
-      release: () => Promise.reject(cleanupError),
-    };
-    const failedPreparation = Promise.withResolvers<ImageLease>();
-    const errors: Error[] = [];
-    const { codex, imagePreparer, orchestrator, output, timers } = setup({
-      onError: (error) => errors.push(error),
-    });
-    imagePreparer.results.push(
-      Promise.resolve(cleanupLease),
-      failedPreparation.promise,
-    );
-    const failed = orchestrator.handleMessage(mixedMessage(
-      "single:alice",
-      "cleanup-failure",
-      [validImage("one"), validImage("two")],
-    ));
-    const firstFlush = timers.advance(3_000);
-    await waitFor(() => imagePreparer.calls.length === 2);
-    failedPreparation.reject(new ImagePreparationError("download_failed"));
-    await Promise.all([failed, firstFlush]);
-
-    assertEquals(errors, [cleanupError]);
-    assertEquals(output.sent.at(-1)?.text, "图片处理失败，请重新发送图片。");
-
-    const next = orchestrator.handleMessage(
-      message("single:alice", "after-cleanup-failure", "continue"),
-    );
-    await timers.advance(3_000);
-    await waitFor(() => codex.starts.length === 1);
-    codex.starts[0].resolve({ status: "completed" });
-    await next;
   });
   it("starts one request only after three seconds of silence", async () => {
     const { codex, orchestrator, timers } = setup();
@@ -4496,11 +3871,14 @@ describe("ConversationOrchestrator", () => {
     await waiting;
   });
   it("cancels a waiting batch when /new resets the conversation", async () => {
+    const owner = new FakeImageLease("/tmp/reset.png");
     const { codex, imagePreparer, orchestrator, state, timers } = setup();
+    imagePreparer.results.push(Promise.resolve(owner));
     const waiting = orchestrator.handleMessage(
       imageMessage("single:alice", "m1"),
     );
     const staleCallback = timers.callbacks[0];
+    await Promise.resolve();
 
     const resetting = orchestrator.handleMessage(
       message("single:alice", "reset", "/new"),
@@ -4512,8 +3890,9 @@ describe("ConversationOrchestrator", () => {
     await Promise.resolve();
     await timers.advance(3_000);
 
-    assertEquals(callsAfterReset, 0);
-    assertEquals(imagePreparer.calls.length, 0);
+    assertEquals(callsAfterReset, 1);
+    assertEquals(imagePreparer.calls.length, 1);
+    assertEquals(owner.state, { references: 0, releases: 1 });
     assertEquals(codex.starts.length, 0);
     assertEquals(state.getConversation("single:alice")?.threadId, "thread-1");
   });
@@ -4535,11 +3914,14 @@ describe("ConversationOrchestrator", () => {
     assertEquals(output.sent[0].msgId, "reset");
   });
   it("discards a waiting batch during shutdown and ignores a late timer", async () => {
-    const { codex, orchestrator, timers } = setup();
+    const owner = new FakeImageLease("/tmp/shutdown.png");
+    const { codex, imagePreparer, orchestrator, timers } = setup();
+    imagePreparer.results.push(Promise.resolve(owner));
     const waiting = orchestrator.handleMessage(
-      message("single:alice", "m1", "work"),
+      imageMessage("single:alice", "m1"),
     );
     const staleCallback = timers.callbacks[0];
+    await Promise.resolve();
 
     await orchestrator.interruptAll();
     await waiting;
@@ -4547,30 +3929,20 @@ describe("ConversationOrchestrator", () => {
     await timers.advance(3_000);
 
     assertEquals(codex.startThreadAttempts, 0);
+    assertEquals(owner.state.references, 0);
   });
   it("rejects a batch when the runtime becomes unavailable while waiting", async () => {
-    const owner = new FakeImageLease("/tmp/unavailable.png");
-    const output = new PendingSendOutput();
-    const { codex, imagePreparer, orchestrator, timers } = setup({ output });
-    imagePreparer.results.push(Promise.resolve(owner));
+    const { codex, orchestrator, output, timers } = setup();
     const waiting = orchestrator.handleMessage(
-      imageMessage("single:alice", "m1"),
+      message("single:alice", "m1", "work"),
     );
-    await Promise.resolve();
     codex.ready = false;
 
-    const flushing = timers.advance(3_000);
-    await output.sendStarted.promise;
-    assertEquals(owner.state.references, 1);
-    assertEquals(owner.state.releases, 0);
-
-    output.sendGate.resolve();
-    await Promise.all([waiting, flushing]);
+    await timers.advance(3_000);
+    await waiting;
 
     assertEquals(codex.starts.length, 0);
     assertMatch(output.sent[0].text, /暂不可用/);
-    assertEquals(owner.state.references, 0);
-    assertEquals(owner.state.releases, 1);
   });
   it("handles an idle /stop immediately even when the runtime is unavailable", async () => {
     const { codex, orchestrator, output } = setup();
@@ -4614,13 +3986,10 @@ describe("ConversationOrchestrator", () => {
     codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
     await next;
   });
-  it("releases stopped debounce and pending images without unbinding the thread", async () => {
+  it("releases stopped debounce and pending images", async () => {
     const pendingOwner = new FakeImageLease("/tmp/stopped-pending.png");
     const debounceOwner = new FakeImageLease("/tmp/stopped-debounce.png");
-    const output = new PendingSendOutput();
-    const { codex, imagePreparer, orchestrator, state, timers } = setup({
-      output,
-    });
+    const { codex, imagePreparer, orchestrator, timers } = setup();
     imagePreparer.results.push(
       Promise.resolve(pendingOwner),
       Promise.resolve(debounceOwner),
@@ -4642,36 +4011,24 @@ describe("ConversationOrchestrator", () => {
     );
     await Promise.resolve();
 
-    const stopping = orchestrator.handleMessage(
+    await orchestrator.handleMessage(
       message("single:alice", "stop", "/stop"),
     );
-    await output.sendStarted.promise;
 
     assertEquals(pendingOwner.state, { references: 0, releases: 1 });
     assertEquals(
       imagePreparer.calls.map(({ signal }) => signal.aborted),
       [true, true],
     );
-    assertEquals(output.sent.at(-1)?.msgId, "stop");
-    assertEquals(state.getConversation("single:alice")?.threadId, "thread-1");
-
-    output.sendGate.resolve();
-    await stopping;
     await waitFor(() => debounceOwner.state.references === 0);
     assertEquals(debounceOwner.state, { references: 0, releases: 1 });
-    codex.starts[0].resolve({ status: "completed", finalAnswer: "stale" });
+    codex.starts[0].resolve({ status: "interrupted" });
     await Promise.all([active, pending, debounce]);
-    assertEquals(output.sent.some(({ text }) => text === "stale"), false);
-    assertEquals(state.getConversation("single:alice")?.threadId, "thread-1");
   });
   it("releases an image pending request replaced by latest-wins", async () => {
     const replacedOwner = new FakeImageLease("/tmp/replaced-pending.png");
-    const replacementOwner = new FakeImageLease("/tmp/replacement.png");
     const { codex, imagePreparer, orchestrator, timers } = setup();
-    imagePreparer.results.push(
-      Promise.resolve(replacedOwner),
-      Promise.resolve(replacementOwner),
-    );
+    imagePreparer.results.push(Promise.resolve(replacedOwner));
     const active = orchestrator.handleMessage(
       message("single:alice", "active", "work"),
     );
@@ -4685,12 +4042,12 @@ describe("ConversationOrchestrator", () => {
     await timers.advance(3_000);
     await waitFor(() => codex.interrupts.length === 1);
     const replacement = orchestrator.handleMessage(
-      imageMessage("single:alice", "replacement"),
+      message("single:alice", "replacement", "replacement"),
     );
-    await Promise.resolve();
     await timers.advance(3_000);
 
     assertEquals(replacedOwner.state, { references: 0, releases: 1 });
+    assertEquals(imagePreparer.calls.length, 1);
 
     codex.starts[0].resolve({ status: "interrupted" });
     await waitFor(() => codex.starts.length === 2);
@@ -4842,13 +4199,11 @@ describe("ConversationOrchestrator", () => {
   });
   it("does not cache a resume result that arrives after /stop", async () => {
     const resumeGate = Promise.withResolvers<void>();
-    const owner = new FakeImageLease("/tmp/stopped-resume.png");
-    const { codex, imagePreparer, orchestrator, state, timers } = setup();
+    const { codex, orchestrator, state, timers } = setup();
     state.bindConversation("single:alice", "single", "thread-existing");
-    imagePreparer.results.push(Promise.resolve(owner));
     codex.resumeThreadGates.push(resumeGate.promise);
     const cancelled = orchestrator.handleMessage(
-      imageMessage("single:alice", "m1"),
+      message("single:alice", "m1", "work"),
     );
     await timers.advance(3_000);
     await waitFor(() => codex.resumed.length === 1);
@@ -4860,7 +4215,6 @@ describe("ConversationOrchestrator", () => {
       cancelled.then(() => true),
       new Promise<false>((resolve) => setTimeout(() => resolve(false), 0)),
     ]);
-    const ownerBeforeResume = { ...owner.state };
     resumeGate.resolve();
     await cancelled;
     await Promise.resolve();
@@ -4874,7 +4228,6 @@ describe("ConversationOrchestrator", () => {
     codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
     await next;
     assertEquals(settledBeforeResume, true);
-    assertEquals(ownerBeforeResume, { references: 0, releases: 1 });
   });
   it("stops an in-flight /new without replacing the existing thread", async () => {
     const startGate = Promise.withResolvers<void>();
@@ -5034,11 +4387,8 @@ describe("ConversationOrchestrator", () => {
   it("forwards quoted content to the Codex turn prompt", async () => {
     const { codex, orchestrator, timers } = setup();
     const quote = {
-      msgtype: "image",
-      image: {
-        url: "https://example.invalid/quoted",
-        aeskey: "quote-key",
-      },
+      msgtype: "text",
+      text: { content: "quoted content" },
     };
     const request = {
       ...message("group:engineering", "m-quote", "处理这个", "bob"),
