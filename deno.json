@@ -9,6 +9,7 @@
   "exclude": [".worktrees", ".superpowers"],
   "tasks": {
     "start": "deno run --env-file=.env -P main.ts",
+    "start:watch": "deno run --watch --env-file=.env -P main.ts",
     "check": "deno check main.ts",
     "test": "deno test -P",
     "smoke": "deno run -P scripts/smoke-app-server.ts",
