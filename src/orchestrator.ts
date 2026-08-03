@@ -1231,9 +1231,13 @@ export class ConversationOrchestrator {
           true,
         );
       }
-      this.#emitRequestStatuses(request, "failed", {
-        reason: "image_preparation_failed",
-      });
+      if (control.forcedOutcome) {
+        this.#emitForcedTerminal(request, control.forcedOutcome);
+      } else {
+        this.#emitRequestStatuses(request, "failed", {
+          reason: "image_preparation_failed",
+        });
+      }
       return;
     }
 

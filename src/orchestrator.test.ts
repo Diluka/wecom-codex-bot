@@ -3582,6 +3582,75 @@ describe("ConversationOrchestrator", () => {
     assertEquals(failed?.reason, "image_preparation_failed");
     assertEquals(failed?.error, undefined);
   });
+  it("keeps an image preparation failure interrupted when stop skips its reply", async () => {
+    const successful = new FakeImageLease("/tmp/one.png");
+    const output = new PendingFinalOutput();
+    const { codex, imagePreparer, orchestrator, requestEvents, timers } = setup(
+      { output },
+    );
+    imagePreparer.results.push(
+      Promise.resolve(successful),
+      Promise.reject(new ImagePreparationError("download_failed")),
+    );
+
+    const running = orchestrator.handleMessage(mixedMessage(
+      "single:alice",
+      "mixed-stop",
+      [validImage("one"), validImage("two")],
+    ));
+    await timers.advance(3_000);
+    await output.finalStarted.promise;
+
+    await orchestrator.handleMessage(
+      message("single:alice", "stop", "/stop"),
+    );
+    await running;
+    output.finalGate.resolve();
+    await Promise.resolve();
+
+    const events = requestEvents.filter(({ msgId }) => msgId === "mixed-stop");
+    assertEquals(events.at(-2)?.state, "reply_skipped");
+    assertEquals(events.at(-2)?.reason, "stop");
+    assertEquals(events.at(-1)?.state, "interrupted");
+    assertEquals(events.at(-1)?.reason, "stop");
+    assertEquals(events.some(({ state }) => state === "failed"), false);
+    assertEquals(codex.startThreadAttempts, 0);
+    assertEquals(successful.state.references, 0);
+  });
+  it("keeps an image preparation failure runtime-lost when shutdown skips its reply", async () => {
+    const successful = new FakeImageLease("/tmp/one.png");
+    const output = new PendingFinalOutput();
+    const { codex, imagePreparer, orchestrator, requestEvents, timers } = setup(
+      { output, shutdownGraceMs: 1 },
+    );
+    imagePreparer.results.push(
+      Promise.resolve(successful),
+      Promise.reject(new ImagePreparationError("download_failed")),
+    );
+
+    const running = orchestrator.handleMessage(mixedMessage(
+      "single:alice",
+      "mixed-shutdown",
+      [validImage("one"), validImage("two")],
+    ));
+    await timers.advance(3_000);
+    await output.finalStarted.promise;
+
+    await Promise.all([running, orchestrator.interruptAll()]);
+    const events = requestEvents.filter(({ msgId }) =>
+      msgId === "mixed-shutdown"
+    );
+    assertEquals(events.at(-2)?.state, "reply_skipped");
+    assertEquals(events.at(-2)?.reason, "shutdown");
+    assertEquals(events.at(-1)?.state, "runtime_lost");
+    assertEquals(events.at(-1)?.error, "shutdown grace period expired");
+    assertEquals(events.some(({ state }) => state === "failed"), false);
+    assertEquals(codex.startThreadAttempts, 0);
+    assertEquals(successful.state.references, 0);
+
+    output.finalGate.resolve();
+    await Promise.resolve();
+  });
   it("preserves callback and image order when downloads settle out of order", async () => {
     const first = Promise.withResolvers<ImageLease>();
     const second = Promise.withResolvers<ImageLease>();
