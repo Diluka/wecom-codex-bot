@@ -8,9 +8,75 @@ const SCHEMA_COMPATIBILITY_ERROR =
   'Generated Codex App Server schema must define TurnStartParams.additionalContext with the exact AdditionalContext kind "application"';
 const LOCAL_IMAGE_SCHEMA_COMPATIBILITY_ERROR =
   "Generated Codex App Server schema must define TurnStartParams.input localImage entries with a string path";
+const JSON_SCHEMA_KEYWORDS = new Set([
+  "$schema",
+  "$id",
+  "$ref",
+  "$anchor",
+  "$dynamicRef",
+  "$dynamicAnchor",
+  "$vocabulary",
+  "$comment",
+  "$defs",
+  "definitions",
+  "title",
+  "description",
+  "default",
+  "deprecated",
+  "readOnly",
+  "writeOnly",
+  "examples",
+  "type",
+  "enum",
+  "const",
+  "multipleOf",
+  "maximum",
+  "exclusiveMaximum",
+  "minimum",
+  "exclusiveMinimum",
+  "maxLength",
+  "minLength",
+  "pattern",
+  "prefixItems",
+  "items",
+  "additionalItems",
+  "contains",
+  "minContains",
+  "maxContains",
+  "maxItems",
+  "minItems",
+  "uniqueItems",
+  "properties",
+  "patternProperties",
+  "additionalProperties",
+  "unevaluatedProperties",
+  "propertyNames",
+  "maxProperties",
+  "minProperties",
+  "required",
+  "dependentRequired",
+  "dependentSchemas",
+  "dependencies",
+  "allOf",
+  "anyOf",
+  "oneOf",
+  "not",
+  "if",
+  "then",
+  "else",
+  "unevaluatedItems",
+  "format",
+  "contentEncoding",
+  "contentMediaType",
+  "contentSchema",
+]);
 
 function isObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasJsonSchemaKeyword(value: JsonObject): boolean {
+  return Object.keys(value).some((key) => JSON_SCHEMA_KEYWORDS.has(key));
 }
 
 function resolveLocalReference(
@@ -179,9 +245,14 @@ function definitionsSupportLocalImage(
     }
     if (!isObject(schema)) return false;
 
-    return turnSchemaSupportsLocalImage(document, schema.TurnStartParams) ||
-      definitionsSupportLocalImage(document, schema.definitions, seen) ||
-      definitionsSupportLocalImage(document, schema.$defs, seen);
+    if (hasJsonSchemaKeyword(schema)) {
+      return definitionsSupportLocalImage(
+        document,
+        schema.definitions,
+        seen,
+      ) || definitionsSupportLocalImage(document, schema.$defs, seen);
+    }
+    return definitionsSupportLocalImage(document, schema, seen);
   });
 }
 
