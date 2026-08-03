@@ -6,9 +6,12 @@
 ## 要求
 
 - Deno 2.9 或更高版本
-- 已安装并登录可用的 Codex CLI 0.144.6 或更高版本
+- 已安装并登录 Codex CLI 最新稳定版（见
+  [openai/codex](https://github.com/openai/codex)）
 - 企业微信智能机器人的 Bot ID 和 Secret
 - 同一个 Bot ID 同时只能运行一个机器人实例
+
+本项目只按 Codex 最新稳定版协议开发；本机升级短暂滞后不构成旧版兼容要求。
 
 ## 配置
 
@@ -38,6 +41,9 @@ OUTPUT_FORMAT_TOOL=individual
 不要在聊天或 `CODEX_WORKSPACE` 中放置不应由模型读取的凭据或敏感数据。发送到企业
 微信的内容只经过现有的格式化、长度控制、限流和分段，不进行敏感值过滤。SDK 诊断、
 错误消息和其他进入日志的字符串同样不会脱敏。
+
+引用消息仍按既有契约把未改写的原始 `quote` JSON 发送给 Codex；其中可能保留企业
+微信 URL 和 AES 字段。图片消息支持没有新增脱敏层。
 
 ### Owner 权限与隔离
 
@@ -227,13 +233,13 @@ OUTPUT_GROUP_FORMAT_TOOL=summary
 
 | scope       | 内容                                                 |
 | ----------- | ---------------------------------------------------- |
-| `request`   | 普通文本请求的状态、计数和编排错误。                 |
+| `request`   | 普通用户请求的状态、计数和编排错误。                 |
 | `codex`     | Codex App Server 的进程、RPC、事件、通知路由和错误。 |
 | `wecom`     | 企业微信鉴权、SDK 日志、网关错误和致命错误。         |
 | `output`    | 输出过滤决策、企业微信流式输出和发送错误。           |
 | `lifecycle` | 启动、恢复、信号、清理和关闭状态。                   |
 
-同一普通文本请求的每个状态都会重复携带消息中的真实 `chat_id`、`user_id` 和
+同一普通用户请求的每个状态都会重复携带消息中的真实 `chat_id`、`user_id` 和
 `msg_id`；获得 Codex 标识后，后续状态还会重复真实 `thread_id` 和 `turn_id`，不会
 另外生成替代标识。只有 `received` 状态包含 `summary`：正文会折叠空白，再按
 Unicode 字素簇截取前 10 个，超长时追加省略号。摘要不会把完整聊天正文写到终端，
@@ -245,7 +251,7 @@ Unicode 字素簇截取前 10 个，超长时追加省略号。摘要不会把�
 request 日志也会记录其真实 `user_id`。
 
 内建命令 `/help`、`/status`、`/model`、`/effort`、`/new`、`/stop` 和不支持的消息
-类型不产生 request 状态。未知斜杠命令仍按普通文本请求处理。
+类型不产生 request 状态。未知斜杠命令仍按普通用户请求处理。
 
 `info` 会记录 App Server 进程就绪和退出、thread 启动、turn 启动和终态。
 `warn`/`error` 用于 RPC 失败或超时、协议异常、策略拒绝、失败
@@ -302,7 +308,8 @@ deno task start
 turn、结束流式回复并关闭 App Server 和状态数据库。
 
 状态保存在 `.data/bot.sqlite`，仅包含聊天与 Codex thread 的绑定、消息 ID 去重和
-turn 状态，不保存聊天正文或 Codex 输出。
+turn 状态，不保存聊天正文或 Codex 输出。图片字节和本地临时路径也不会写入
+SQLite。
 
 ## Docker Compose
 
@@ -363,11 +370,26 @@ Codex 自身优先级，可能覆盖这里保存的用户级默认值。`/status
 继续使用启动时的旧设置，当前绑定 thread 的后续 turn 才使用新设置；回复会明确提示
 这一点。
 
-普通文本按 conversation 使用固定 3 秒的尾随防抖窗口。窗口内每收到一条通过
-`msgid` 去重的新消息，等待时间都会从头计算；连续 3 秒没有新消息后，机器人按
-到达顺序将整个批次聚合成一次 Codex turn。群聊中的不同成员共享该群聊的窗口，但
-每条消息各自的 sender、`msgid` 和引用消息 `quote` 都会保留。批次使用最后一条
-企业微信消息的 frame 承载过程输出和最终回复。
+普通 `text`、独立 `image`、`mixed` 消息，以及 `quote` 中按已知 `image` 或
+`mixed` 结构识别出的图片，共用同一个 conversation 固定 3 秒尾随防抖窗口。窗口内
+每收到一条通过 `msgid` 去重的新消息，等待时间都会从头计算；连续 3 秒没有新消息
+后，机器人按到达顺序将整个批次聚合成一次 Codex turn。群聊中的不同成员共享该群聊
+的窗口，但每条消息各自的 sender、`msgid` 和引用消息 `quote` 都会保留。批次使用
+最后一条企业微信消息的 frame 承载过程输出和最终回复。
+
+命令只由 `text` 消息的文本正文识别；只有纯文本命令本身才是命令。这样的命令消息
+即使带有图片引用也只执行命令，不会下载引用图片。`mixed` 消息中形似命令的文本按
+普通用户请求进入防抖窗口。
+
+图片由企业微信 SDK 下载并解密；当前按 Codex 支持的 JPEG、PNG、GIF 和 WebP
+格式识别。一个聚合批次中任意图片处理失败，整个批次都不会提交给 Codex，并直接
+回复 `图片处理失败，请重新发送图片。`。
+
+下载并解密后的图片只写入 Linux 当前进程专属的随机目录
+`/tmp/wecom-codex-bot-*`。机器人通过 App Server `localImage` 输入把图片交给
+Codex；这些图片不会持久化到 SQLite。文件会在请求进入终态后删除，正常进程关闭时
+也会清理整个临时目录。原生 Linux 进程崩溃可能遗留该进程的随机临时目录，交由系统
+清理；机器人不会扫描或删除其他进程的目录。
 
 防抖等待期间不会中断正在执行的 turn。只有批次到期、进入任务队列后，才应用原有
 latest-wins：如果已有活动 turn，则请求中断它；如果已有普通 pending，则只保留最后
@@ -378,7 +400,7 @@ latest-wins：如果已有活动 turn，则请求中断它；如果已有普通 
 `/effort` 和不支持消息不会重置窗口或中断任务。`/new` 会取消尚未发送的聚合批次，
 再按原有会话重置流程执行。`/stop` 会立即清除当前聊天的聚合批次、普通 pending 和
 待执行的 `/new`，并请求中断活动 turn；它不会删除或替换当前 thread，之后的新普通
-文本仍可开始新的防抖批次。
+用户请求仍可开始新的防抖批次。
 
 机器人关闭时，尚在等待窗口中的批次会直接丢弃。`/stop` 生效后不会再发起旧 turn
 的最终回复，但如果该回复已经进入企业微信发送队列，现有发送接口无法将其撤回。
@@ -403,8 +425,9 @@ Warning Permissions in the config file is an experimental feature and may change
 
 `deno task smoke` 先在当前 workspace 的 `.data/` 下生成并结构化校验临时 App
 Server JSON schema，确认 `TurnStartParams.additionalContext` 支持精确的
-`kind: "application"`，随后完成本机 `codex app-server --stdio` 握手，并在结束时
-尽最大努力清理临时目录。它不会启动模型 turn，也不会连接企业微信。
+`kind: "application"`，并确认 `TurnStartParams.input` 支持必需字符串路径的
+`localImage.path`。验证通过后，它完成本机 `codex app-server --stdio` 握手，并在
+结束时尽最大努力清理临时目录。它不会启动模型 turn，也不会连接企业微信。
 
 需要显式调用一次真实模型 turn 时运行：
 

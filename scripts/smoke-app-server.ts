@@ -5,7 +5,7 @@ import {
   logAppServerStderr,
 } from "../src/log.ts";
 import {
-  assertGeneratedSchemaSupportsApplicationContext,
+  assertGeneratedTurnStartSchema,
   finishSmoke,
 } from "../src/smoke-cleanup.ts";
 import { join } from "node:path";
@@ -47,7 +47,7 @@ try {
       }`,
     );
   }
-  await assertGeneratedSchemaSupportsApplicationContext(schemaDirectory);
+  await assertGeneratedTurnStartSchema(schemaDirectory);
 
   client = await CodexAppServerClient.start({
     cwd: workspace,

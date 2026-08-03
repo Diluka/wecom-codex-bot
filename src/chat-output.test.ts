@@ -2,7 +2,7 @@ import { assert, assertEquals, assertRejects } from "@std/assert";
 import { describe, it } from "@std/testing/bdd";
 import { FakeTime } from "@std/testing/time";
 import { WeComChatOutput } from "./chat-output.ts";
-import type { RoutedText } from "./orchestrator.ts";
+import type { RoutedMessage } from "./orchestrator.ts";
 import { ConversationSendQueue, TRUNCATION_MARKER } from "./output.ts";
 import type { ProgressTail } from "./progress-tail.ts";
 
@@ -15,14 +15,13 @@ function summaryTail(index: number): ProgressTail {
   };
 }
 
-function message(msgId = "m1"): RoutedText {
+function message(msgId = "m1"): RoutedMessage {
   return {
     chatType: "single",
     conversationKey: "single:alice",
     chatId: "alice",
     senderUserId: "alice",
     msgId,
-    text: "hello",
     frame: { req: msgId },
   };
 }

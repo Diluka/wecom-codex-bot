@@ -1,10 +1,12 @@
 import { assertEquals, assertRejects } from "@std/assert";
 import { describe, it } from "@std/testing/bdd";
+
 import { BotLifecycle } from "./lifecycle.ts";
 
 function setup(
   options: {
     failRuntimeStart?: boolean;
+    failTempClose?: boolean;
     failFinish?: boolean;
     failBeginShutdown?: boolean;
     runtimeStart?: Promise<void>;
@@ -32,6 +34,18 @@ function setup(
         return 2;
       },
       close: () => events.push("state:close"),
+    },
+    imageTempStore: {
+      start: () => {
+        events.push("temp:start");
+        return Promise.resolve();
+      },
+      close: () => {
+        events.push("temp:close");
+        return options.failTempClose
+          ? Promise.reject(new Error("temp close failed"))
+          : Promise.resolve();
+      },
     },
     runtime: {
       start: () => {
@@ -73,6 +87,7 @@ describe("BotLifecycle", () => {
     assertEquals(await lifecycle.start(), 2);
     assertEquals(events, [
       "state:runtime-lost",
+      "temp:start",
       "runtime:start",
       "gateway:connect",
     ]);
@@ -91,6 +106,7 @@ describe("BotLifecycle", () => {
       "output:finish",
       "gateway:disconnect",
       "runtime:stop",
+      "temp:close",
       "state:close",
     ]);
   });
@@ -117,6 +133,7 @@ describe("BotLifecycle", () => {
       "output:finish",
       "gateway:disconnect",
       "runtime:stop",
+      "temp:close",
       "state:close",
     ]);
   });
@@ -139,8 +156,10 @@ describe("BotLifecycle", () => {
     await Promise.all([startRejected, stopping]);
     assertEquals(events, [
       "state:runtime-lost",
+      "temp:start",
       "runtime:start",
       "runtime:stop",
+      "temp:close",
       "state:close",
     ]);
   });
@@ -158,6 +177,7 @@ describe("BotLifecycle", () => {
       "output:finish",
       "gateway:disconnect",
       "runtime:stop",
+      "temp:close",
       "state:close",
     ]);
     assertEquals(errors.map((error) => error.message), ["finish failed"]);
@@ -178,6 +198,7 @@ describe("BotLifecycle", () => {
       "output:finish",
       "gateway:disconnect",
       "runtime:stop",
+      "temp:close",
       "state:close",
     ]);
     assertEquals(errors.map((error) => error.message), [
@@ -185,15 +206,28 @@ describe("BotLifecycle", () => {
     ]);
   });
 
-  it("closes state when startup fails and never connects the gateway", async () => {
+  it("closes temp storage after a runtime start failure", async () => {
     const { lifecycle, events } = setup({ failRuntimeStart: true });
 
     await assertRejects(() => lifecycle.start(), Error, "start failed");
     assertEquals(events, [
       "state:runtime-lost",
+      "temp:start",
       "runtime:start",
+      "temp:close",
       "state:close",
     ]);
+  });
+
+  it("reports temp close failure and still closes state", async () => {
+    const { lifecycle, events, errors } = setup({ failTempClose: true });
+    await lifecycle.start();
+    events.length = 0;
+
+    await lifecycle.stop();
+
+    assertEquals(events.slice(-2), ["temp:close", "state:close"]);
+    assertEquals(errors.map((error) => error.message), ["temp close failed"]);
   });
 
   it("is idempotent on repeated stop", async () => {

@@ -10,7 +10,8 @@ import {
   conversationKey,
   createSdkLogger,
   createWeComClient,
-  normalizeTextFrame,
+  type InboundUserMessage,
+  normalizeUserMessageFrame,
   type WeComClientLike,
   WeComGateway,
 } from "./wecom.ts";
@@ -19,6 +20,7 @@ type Listener = (...args: unknown[]) => void;
 
 class FakeClient implements WeComClientLike {
   readonly listeners = new Map<string, Listener[]>();
+  readonly downloadCalls: Array<{ url: string; aesKey?: string }> = [];
   readonly replies: Array<{ frame: unknown; body: unknown; cmd?: string }> = [];
   readonly streams: Array<{
     frame: unknown;
@@ -29,6 +31,7 @@ class FakeClient implements WeComClientLike {
   connectCount = 0;
   disconnectCount = 0;
   replyFailure?: Error;
+  downloadResult = new Uint8Array();
 
   on(event: string, listener: Listener): this {
     const listeners = this.listeners.get(event) ?? [];
@@ -48,6 +51,15 @@ class FakeClient implements WeComClientLike {
 
   disconnect(): void {
     this.disconnectCount++;
+  }
+
+  async downloadFile(
+    url: string,
+    aesKey?: string,
+  ): Promise<{ buffer: Uint8Array; filename?: string }> {
+    await Promise.resolve();
+    this.downloadCalls.push({ url, aesKey });
+    return { buffer: this.downloadResult };
   }
 
   async reply(frame: unknown, body: unknown, cmd?: string): Promise<unknown> {
@@ -109,44 +121,132 @@ describe("WeCom message normalization", () => {
   });
 
   it("preserves group sender identity", () => {
-    assertEquals(normalizeTextFrame(textFrame()), {
+    assertEquals(normalizeUserMessageFrame(textFrame()), {
       chatType: "group",
       conversationKey: "group:room-1",
       chatId: "room-1",
       senderUserId: "alice",
       msgId: "msg-1",
+      messageType: "text",
       text: "hello",
+      content: [{ type: "text", text: "hello" }],
+      quoteImages: [],
     });
   });
 
-  it("preserves complete quoted content without filtering fields", () => {
+  it("normalizes image and mixed content without changing item order", () => {
+    assertEquals(
+      normalizeUserMessageFrame(textFrame({
+        msgtype: "mixed",
+        text: undefined,
+        mixed: {
+          msg_item: [
+            { msgtype: "text", text: { content: "before" } },
+            {
+              msgtype: "image",
+              image: {
+                url: "https://example.invalid/one",
+                aeskey: "key-1",
+              },
+            },
+            { msgtype: "text", text: { content: "after" } },
+          ],
+        },
+      })),
+      {
+        chatType: "group",
+        conversationKey: "group:room-1",
+        chatId: "room-1",
+        senderUserId: "alice",
+        msgId: "msg-1",
+        messageType: "mixed",
+        content: [
+          { type: "text", text: "before" },
+          {
+            type: "image",
+            image: {
+              url: "https://example.invalid/one",
+              aesKey: "key-1",
+            },
+          },
+          { type: "text", text: "after" },
+        ],
+        quoteImages: [],
+      },
+    );
+  });
+
+  it("keeps an image without the SDK-optional AES key routable", () => {
+    const normalized = normalizeUserMessageFrame(textFrame({
+      msgtype: "image",
+      text: undefined,
+      image: { url: "https://example.invalid/image" },
+    }));
+
+    assertEquals(normalized.messageType, "image");
+    assertEquals(normalized.content, [{
+      type: "image",
+      image: { url: "https://example.invalid/image" },
+    }]);
+  });
+
+  it("preserves quote JSON and extracts only known quote image structures", () => {
     const quote = {
       msgtype: "mixed",
       mixed: {
         msg_item: [
-          { msgtype: "text", text: { content: "quoted text" } },
+          { msgtype: "text", text: { content: "quoted" } },
           {
             msgtype: "image",
             image: {
-              url: "https://example.invalid/image",
+              url: "https://example.invalid/quoted",
               aeskey: "quote-key",
             },
           },
         ],
       },
-      future_field: { nested: true },
+      future_field: {
+        image: { url: "do-not-scan", aeskey: "do-not-scan" },
+      },
     };
 
-    const normalized = normalizeTextFrame(
-      textFrame({ quote }),
-    ) as unknown as Record<string, unknown>;
-
+    const normalized = normalizeUserMessageFrame(textFrame({ quote }));
     assertEquals(normalized.quote, quote);
+    assertEquals(normalized.quoteImages, [{
+      url: "https://example.invalid/quoted",
+      aesKey: "quote-key",
+    }]);
+  });
+
+  it("rejects malformed mixed content", () => {
+    assertThrows(
+      () =>
+        normalizeUserMessageFrame(textFrame({
+          msgtype: "mixed",
+          text: undefined,
+          mixed: {},
+        })),
+      TypeError,
+      "mixed",
+    );
+  });
+
+  it("rejects unknown mixed item message types", () => {
+    assertThrows(
+      () =>
+        normalizeUserMessageFrame(textFrame({
+          msgtype: "mixed",
+          text: undefined,
+          mixed: { msg_item: [{ msgtype: "file", file: {} }] },
+        })),
+      TypeError,
+      "msgtype",
+    );
   });
 
   it("derives the single target from sender userid", () => {
     assertEquals(
-      normalizeTextFrame(textFrame({
+      normalizeUserMessageFrame(textFrame({
         chattype: "single",
         chatid: undefined,
         from: { userid: "bob" },
@@ -157,7 +257,10 @@ describe("WeCom message normalization", () => {
         chatId: "bob",
         senderUserId: "bob",
         msgId: "msg-1",
+        messageType: "text",
         text: "hello",
+        content: [{ type: "text", text: "hello" }],
+        quoteImages: [],
       },
     );
   });
@@ -169,12 +272,11 @@ describe("WeCom message normalization", () => {
       ["group chatid", { chatid: "" }, "chatid"],
       ["text body", { text: {} }, "text.content"],
       ["chat type", { chattype: "other" }, "chattype"],
-      ["message type", { msgtype: "image" }, "text message"],
     ] as const
   ) {
     it(`rejects missing or invalid ${name}`, () => {
       assertThrows(
-        () => normalizeTextFrame(textFrame(overrides)),
+        () => normalizeUserMessageFrame(textFrame(overrides)),
         TypeError,
         expected,
       );
@@ -190,7 +292,7 @@ describe("WeComGateway", () => {
       botId: "bot",
       secret: "secret",
       client,
-      onText: () => {},
+      onMessage: () => {},
       onUnsupported: () => {},
       onFatal: () => {},
       onReady: () => {
@@ -211,9 +313,9 @@ describe("WeComGateway", () => {
     assertEquals(client.disconnectCount, 1);
   });
 
-  it("routes text once and all non-text messages to one callback", async () => {
+  it("routes supported messages and keeps unsupported messages separate", async () => {
     const client = new FakeClient();
-    const texts: string[] = [];
+    const messages: InboundUserMessage[] = [];
     const unsupported: Array<{
       type: string;
       conversationKey: string;
@@ -224,8 +326,8 @@ describe("WeComGateway", () => {
       botId: "bot",
       secret: "secret",
       client,
-      onText: (message) => {
-        texts.push(message.text);
+      onMessage: (message) => {
+        messages.push(message);
       },
       onUnsupported: (message, _frame, type) => {
         unsupported.push({
@@ -241,18 +343,26 @@ describe("WeComGateway", () => {
     });
 
     client.emit("message", textFrame());
-    client.emit("message", textFrame({ msgtype: "image", text: undefined }));
+    client.emit(
+      "message",
+      textFrame({
+        msgtype: "image",
+        text: undefined,
+        image: {
+          url: "https://example.invalid/image",
+          aeskey: "key-1",
+        },
+      }),
+    );
     client.emit("message", textFrame({ msgtype: "voice", text: undefined }));
     await Promise.resolve();
     await Promise.resolve();
 
-    assertEquals(texts, ["hello"]);
+    assertEquals(messages.map((message) => message.messageType), [
+      "text",
+      "image",
+    ]);
     assertEquals(unsupported, [
-      {
-        type: "image",
-        conversationKey: "group:room-1",
-        msgId: "msg-1",
-      },
       {
         type: "voice",
         conversationKey: "group:room-1",
@@ -263,6 +373,31 @@ describe("WeComGateway", () => {
     gateway.disconnect();
   });
 
+  it("downloads with the image URL and AES key", async () => {
+    const client = new FakeClient();
+    client.downloadResult = new Uint8Array([0xff, 0xd8, 0xff]);
+    const gateway = new WeComGateway({
+      botId: "bot",
+      secret: "secret",
+      client,
+      onMessage: () => {},
+      onUnsupported: () => {},
+      onFatal: () => {},
+    });
+
+    assertEquals(
+      await gateway.downloadImage({
+        url: "https://example.invalid/image",
+        aesKey: "key-1",
+      }),
+      new Uint8Array([0xff, 0xd8, 0xff]),
+    );
+    assertEquals(client.downloadCalls, [{
+      url: "https://example.invalid/image",
+      aesKey: "key-1",
+    }]);
+  });
+
   it("awaits successful replies and catches failed replies", async () => {
     const client = new FakeClient();
     const errors: Error[] = [];
@@ -270,7 +405,7 @@ describe("WeComGateway", () => {
       botId: "bot",
       secret: "secret",
       client,
-      onText: () => {},
+      onMessage: () => {},
       onUnsupported: () => {},
       onFatal: () => {},
       onError: (error) => {
@@ -312,7 +447,7 @@ describe("WeComGateway", () => {
       botId: "bot",
       secret: "actual-$ecret",
       client,
-      onText: () => {},
+      onMessage: () => {},
       onUnsupported: () => {},
       onFatal: () => {},
     });
@@ -343,7 +478,7 @@ describe("WeComGateway", () => {
       botId: "bot",
       secret: "secret",
       client,
-      onText: () => {},
+      onMessage: () => {},
       onUnsupported: () => {},
       onFatal: (error) => {
         fatals.push(error);

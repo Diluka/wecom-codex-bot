@@ -18,7 +18,7 @@ import {
   type CodexRuntimeTrace,
 } from "./codex-runtime.ts";
 import type { ActivityEvent } from "./activity-event.ts";
-import type { CodexTurnOptions } from "./codex-turn.ts";
+import type { CodexTurnInput, CodexTurnOptions } from "./codex-turn.ts";
 import type {
   CodexModel,
   CodexSettings,
@@ -33,6 +33,10 @@ const EXITED: AppServerProcessStatus = {
   code: 1,
   signal: null,
 };
+
+function textInput(text: string): CodexTurnInput {
+  return { text, localImagePaths: [] };
+}
 
 function modelFixture(
   model: string,
@@ -65,7 +69,7 @@ class FakeClient implements CodexRuntimeClient {
   readonly resumedThreads: string[] = [];
   readonly startedTurns: Array<{
     threadId: string;
-    prompt: string;
+    input: CodexTurnInput;
     authority: RequestAuthority;
     options?: CodexTurnOptions;
   }> = [];
@@ -132,13 +136,13 @@ class FakeClient implements CodexRuntimeClient {
 
   async startTurn(
     threadId: string,
-    prompt: string,
+    input: CodexTurnInput,
     authority: RequestAuthority,
     options?: CodexTurnOptions,
   ): Promise<string> {
     this.startedTurns.push({
       threadId,
-      prompt,
+      input,
       authority,
       ...(options ? { options } : {}),
     });
@@ -1057,7 +1061,7 @@ describe("CodexRuntime", () => {
 
     await runtime.startTurn(
       "thread-summary",
-      "prompt",
+      textInput("prompt"),
       "owner",
       () => {},
       { summary: "auto" },
@@ -1065,7 +1069,7 @@ describe("CodexRuntime", () => {
 
     assertEquals(client.startedTurns, [{
       threadId: "thread-summary",
-      prompt: "prompt",
+      input: textInput("prompt"),
       authority: "owner",
       options: { summary: "auto" },
     }]);
@@ -1086,7 +1090,7 @@ describe("CodexRuntime", () => {
     await runtime.start();
     const handle = await runtime.startTurn(
       "thread-trace",
-      "prompt",
+      textInput("prompt"),
       "owner",
       () => {},
     );
@@ -1180,7 +1184,7 @@ describe("CodexRuntime", () => {
     await runtime.resumeThread("thread-existing");
     const handle = await runtime.startTurn(
       "thread-existing",
-      "检查测试",
+      textInput("检查测试"),
       "owner",
       () => {},
     );
@@ -1189,7 +1193,7 @@ describe("CodexRuntime", () => {
     assertEquals(client.resumedThreads, ["thread-existing"]);
     assertEquals(client.startedTurns, [{
       threadId: "thread-existing",
-      prompt: "检查测试",
+      input: textInput("检查测试"),
       authority: "owner",
     }]);
     assertEquals(client.interruptedTurns, [{
@@ -1224,7 +1228,7 @@ describe("CodexRuntime", () => {
     const secondProgress: ActivityEvent[] = [];
     const first = await runtime.startTurn(
       "thread-a",
-      "first",
+      textInput("first"),
       "restricted",
       (activity) => {
         firstProgress.push(activity);
@@ -1232,7 +1236,7 @@ describe("CodexRuntime", () => {
     );
     const second = await runtime.startTurn(
       "thread-b",
-      "second",
+      textInput("second"),
       "restricted",
       (activity) => {
         secondProgress.push(activity);
@@ -1308,7 +1312,7 @@ describe("CodexRuntime", () => {
     const progress: ActivityEvent[] = [];
     const starting = runtime.startTurn(
       "thread-early",
-      "work",
+      textInput("work"),
       "restricted",
       (activity) => {
         progress.push(activity);
@@ -1362,7 +1366,7 @@ describe("CodexRuntime", () => {
 
     const failedStart = runtime.startTurn(
       "parent-retry",
-      "first",
+      textInput("first"),
       "restricted",
       () => {},
     );
@@ -1384,7 +1388,7 @@ describe("CodexRuntime", () => {
     const activities: ActivityEvent[] = [];
     const retry = await runtime.startTurn(
       "parent-retry",
-      "retry",
+      textInput("retry"),
       "restricted",
       (activity) => {
         activities.push(activity);
@@ -1426,7 +1430,7 @@ describe("CodexRuntime", () => {
     const activities: ActivityEvent[] = [];
     const active = await runtime.startTurn(
       "parent-active",
-      "active",
+      textInput("active"),
       "restricted",
       (activity) => {
         activities.push(activity);
@@ -1446,7 +1450,7 @@ describe("CodexRuntime", () => {
 
     const failedStart = runtime.startTurn(
       "parent-active",
-      "failed",
+      textInput("failed"),
       "restricted",
       () => {},
     );
@@ -1514,7 +1518,7 @@ describe("CodexRuntime", () => {
 
     const failedStart = runtime.startTurn(
       "parent-concurrent",
-      "first",
+      textInput("first"),
       "restricted",
       () => {},
     );
@@ -1522,7 +1526,7 @@ describe("CodexRuntime", () => {
     const pendingActivities: ActivityEvent[] = [];
     const pendingStart = runtime.startTurn(
       "parent-concurrent",
-      "second",
+      textInput("second"),
       "restricted",
       (activity) => {
         pendingActivities.push(activity);
@@ -1606,7 +1610,7 @@ describe("CodexRuntime", () => {
     const activities: unknown[] = [];
     const starting = runtime.startTurn(
       "thread-early",
-      "work",
+      textInput("work"),
       "restricted",
       (activity) => {
         activities.push(activity);
@@ -1682,7 +1686,7 @@ describe("CodexRuntime", () => {
     const activities: ActivityEvent[] = [];
     const handle = await runtime.startTurn(
       "thread-filter",
-      "work",
+      textInput("work"),
       "restricted",
       (activity) => {
         activities.push(activity);
@@ -1754,7 +1758,7 @@ describe("CodexRuntime", () => {
     const activities: ActivityEvent[] = [];
     const handle = await runtime.startTurn(
       "parent-1",
-      "work",
+      textInput("work"),
       "restricted",
       (activity) => {
         activities.push(activity);
@@ -1888,7 +1892,7 @@ describe("CodexRuntime", () => {
     const activities: ActivityEvent[] = [];
     const handle = await runtime.startTurn(
       "parent-pending",
-      "work",
+      textInput("work"),
       "restricted",
       (activity) => {
         activities.push(activity);
@@ -1973,7 +1977,7 @@ describe("CodexRuntime", () => {
     const activities: ActivityEvent[] = [];
     const handle = await runtime.startTurn(
       "parent-terminal-pending",
-      "work",
+      textInput("work"),
       "restricted",
       (activity) => {
         activities.push(activity);
@@ -2055,7 +2059,7 @@ describe("CodexRuntime", () => {
     const activities: ActivityEvent[] = [];
     const handle = await runtime.startTurn(
       "parent-no",
-      "work",
+      textInput("work"),
       "restricted",
       (activity) => {
         activities.push(activity);
@@ -2107,7 +2111,7 @@ describe("CodexRuntime", () => {
     const activities: ActivityEvent[] = [];
     const handle = await runtime.startTurn(
       "parent-role",
-      "work",
+      textInput("work"),
       "restricted",
       (activity) => {
         activities.push(activity);
@@ -2164,7 +2168,7 @@ describe("CodexRuntime", () => {
     const activities: ActivityEvent[] = [];
     const handle = await runtime.startTurn(
       "parent-name",
-      "work",
+      textInput("work"),
       "restricted",
       (activity) => {
         activities.push(activity);
@@ -2222,7 +2226,7 @@ describe("CodexRuntime", () => {
     const activities: ActivityEvent[] = [];
     const handle = await runtime.startTurn(
       "parent-equal-name",
-      "work",
+      textInput("work"),
       "restricted",
       (activity) => {
         activities.push(activity);
@@ -2280,7 +2284,7 @@ describe("CodexRuntime", () => {
     const completedActivities: ActivityEvent[] = [];
     const completed = await runtime.startTurn(
       "parent-clean",
-      "first",
+      textInput("first"),
       "restricted",
       (activity) => {
         completedActivities.push(activity);
@@ -2313,7 +2317,7 @@ describe("CodexRuntime", () => {
     const nextActivities: ActivityEvent[] = [];
     const next = await runtime.startTurn(
       "parent-clean",
-      "second",
+      textInput("second"),
       "restricted",
       (activity) => {
         nextActivities.push(activity);
@@ -2367,7 +2371,7 @@ describe("CodexRuntime", () => {
 
     const lost = await runtime.startTurn(
       "parent-lost",
-      "first",
+      textInput("first"),
       "restricted",
       () => {},
     );
@@ -2394,7 +2398,7 @@ describe("CodexRuntime", () => {
     const recoveredActivities: ActivityEvent[] = [];
     const recovered = await runtime.startTurn(
       "parent-lost",
-      "second",
+      textInput("second"),
       "restricted",
       (activity) => {
         recoveredActivities.push(activity);
@@ -2434,7 +2438,7 @@ describe("CodexRuntime", () => {
 
     const first = await runtime.startTurn(
       "parent-reused",
-      "first",
+      textInput("first"),
       "restricted",
       () => {},
     );
@@ -2460,7 +2464,7 @@ describe("CodexRuntime", () => {
     const activities: ActivityEvent[] = [];
     const second = await runtime.startTurn(
       "parent-reused",
-      "second",
+      textInput("second"),
       "restricted",
       (activity) => {
         activities.push(activity);
@@ -2494,7 +2498,7 @@ describe("CodexRuntime", () => {
 
     const first = await runtime.startTurn(
       "parent-reused-active",
-      "first",
+      textInput("first"),
       "restricted",
       () => {},
     );
@@ -2509,7 +2513,7 @@ describe("CodexRuntime", () => {
     const activities: ActivityEvent[] = [];
     const second = await runtime.startTurn(
       "parent-reused-active",
-      "second",
+      textInput("second"),
       "restricted",
       (activity) => {
         activities.push(activity);
@@ -2558,7 +2562,7 @@ describe("CodexRuntime", () => {
     const activities: ActivityEvent[] = [];
     const handle = await runtime.startTurn(
       "thread-terminal",
-      "work",
+      textInput("work"),
       "restricted",
       (activity) => {
         activities.push(activity);
@@ -2609,7 +2613,7 @@ describe("CodexRuntime", () => {
     await runtime.start();
     const handle = await runtime.startTurn(
       "thread-diagnostic",
-      "work",
+      textInput("work"),
       "restricted",
       () => Promise.reject(new Error("activity callback rejected")),
     );
@@ -2651,7 +2655,7 @@ describe("CodexRuntime", () => {
 
     const first = await runtime.startTurn(
       "thread-reused",
-      "first",
+      textInput("first"),
       "restricted",
       () => {},
     );
@@ -2674,7 +2678,7 @@ describe("CodexRuntime", () => {
     const replayed: ActivityEvent[] = [];
     const second = await runtime.startTurn(
       "thread-reused",
-      "second",
+      textInput("second"),
       "restricted",
       (activity) => {
         replayed.push(activity);
@@ -2702,7 +2706,7 @@ describe("CodexRuntime", () => {
 
     const first = await runtime.startTurn(
       "thread-reused",
-      "first",
+      textInput("first"),
       "restricted",
       () => {},
     );
@@ -2717,7 +2721,7 @@ describe("CodexRuntime", () => {
     const activities: ActivityEvent[] = [];
     const starting = runtime.startTurn(
       "thread-reused",
-      "second",
+      textInput("second"),
       "restricted",
       (activity) => {
         activities.push(activity);
@@ -2759,7 +2763,7 @@ describe("CodexRuntime", () => {
 
     const starting = runtime.startTurn(
       "thread-pending",
-      "first",
+      textInput("first"),
       "restricted",
       () => {},
     );
@@ -2778,7 +2782,7 @@ describe("CodexRuntime", () => {
     const activities: ActivityEvent[] = [];
     const recovered = await runtime.startTurn(
       "thread-pending",
-      "second",
+      textInput("second"),
       "restricted",
       (activity) => {
         activities.push(activity);
@@ -2814,7 +2818,7 @@ describe("CodexRuntime", () => {
 
     const originalStarting = runtime.startTurn(
       "thread-generation-race",
-      "original",
+      textInput("original"),
       "restricted",
       () => {},
     );
@@ -2825,7 +2829,7 @@ describe("CodexRuntime", () => {
     const activities: ActivityEvent[] = [];
     const replacementStarting = runtime.startTurn(
       "thread-generation-race",
-      "replacement",
+      textInput("replacement"),
       "restricted",
       (activity) => {
         activities.push(activity);
@@ -2891,7 +2895,7 @@ describe("CodexRuntime", () => {
 
     const first = await runtime.startTurn(
       "thread-reused",
-      "first",
+      textInput("first"),
       "restricted",
       () => {},
     );
@@ -2902,7 +2906,7 @@ describe("CodexRuntime", () => {
     const activities: ActivityEvent[] = [];
     const starting = runtime.startTurn(
       "thread-reused",
-      "second",
+      textInput("second"),
       "restricted",
       (activity) => {
         activities.push(activity);
@@ -2978,7 +2982,7 @@ describe("CodexRuntime", () => {
     await runtime.start();
     const handle = await runtime.startTurn(
       "thread-lost",
-      "do not replay",
+      textInput("do not replay"),
       "restricted",
       () => {},
     );

@@ -6,6 +6,8 @@ type JsonObject = Record<string, unknown>;
 
 const SCHEMA_COMPATIBILITY_ERROR =
   'Generated Codex App Server schema must define TurnStartParams.additionalContext with the exact AdditionalContext kind "application"';
+const LOCAL_IMAGE_SCHEMA_COMPATIBILITY_ERROR =
+  "Generated Codex App Server schema must define TurnStartParams.input localImage entries with a string path";
 
 function isObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -28,77 +30,79 @@ function resolveLocalReference(
   return isObject(current) ? current : undefined;
 }
 
-function turnSchemaSupportsApplicationContext(
+function schemaProperty(
   document: JsonObject,
-  turnSchema: unknown,
-): boolean {
-  const turn = resolveLocalReference(document, turnSchema);
-  const properties = isObject(turn?.properties) ? turn.properties : undefined;
+  schema: unknown,
+  name: string,
+): JsonObject | undefined {
+  const resolved = resolveLocalReference(document, schema);
+  const properties = isObject(resolved?.properties)
+    ? resolved.properties
+    : undefined;
+  return resolveLocalReference(document, properties?.[name]);
+}
+
+function supportsApplicationContext(document: JsonObject): boolean {
   const additionalContext = resolveLocalReference(
     document,
-    properties?.additionalContext,
+    schemaProperty(document, document, "additionalContext"),
   );
   const entry = resolveLocalReference(
     document,
     additionalContext?.additionalProperties,
   );
-  const entryProperties = isObject(entry?.properties)
-    ? entry.properties
-    : undefined;
-  const kind = resolveLocalReference(document, entryProperties?.kind);
+  const kind = schemaProperty(document, entry, "kind");
 
   return Array.isArray(kind?.enum) && kind.enum.includes("application");
 }
 
-function definitionsSupportApplicationContext(
-  document: JsonObject,
-  definitions: unknown,
-): boolean {
-  if (!isObject(definitions)) return false;
-
-  return Object.entries(definitions).some(([name, schema]) =>
-    (name === "TurnStartParams" &&
-      turnSchemaSupportsApplicationContext(document, schema)) ||
-    definitionsSupportApplicationContext(document, schema)
-  );
-}
-
-function documentSupportsApplicationContext(document: unknown): boolean {
-  if (!isObject(document)) return false;
+function isLocalImageInput(document: JsonObject, schema: unknown): boolean {
+  const resolved = resolveLocalReference(document, schema);
+  if (resolved === undefined) return false;
+  const required = resolved.required;
   if (
-    document.title === "TurnStartParams" &&
-    turnSchemaSupportsApplicationContext(document, document)
+    !Array.isArray(required) ||
+    !required.includes("type") ||
+    !required.includes("path")
   ) {
-    return true;
+    return false;
   }
-  return definitionsSupportApplicationContext(document, document.definitions);
+
+  const type = schemaProperty(document, resolved, "type");
+  const path = schemaProperty(document, resolved, "path");
+
+  return Array.isArray(type?.enum) && type.enum.includes("localImage") &&
+    path?.type === "string";
 }
 
-async function* jsonSchemaFiles(directory: string): AsyncGenerator<string> {
-  for await (const entry of Deno.readDir(directory)) {
-    const path = join(directory, entry.name);
-    if (entry.isDirectory) {
-      yield* jsonSchemaFiles(path);
-    } else if (entry.isFile && entry.name.endsWith(".json")) {
-      yield path;
-    }
-  }
+function supportsLocalImage(document: JsonObject): boolean {
+  const input = schemaProperty(document, document, "input");
+  const userInput = resolveLocalReference(document, input?.items);
+  return Array.isArray(userInput?.oneOf) &&
+    userInput.oneOf.some((schema) => isLocalImageInput(document, schema));
 }
 
-export async function assertGeneratedSchemaSupportsApplicationContext(
+async function readTurnStartSchema(directory: string): Promise<JsonObject> {
+  const path = join(directory, "v2", "TurnStartParams.json");
+  try {
+    const document: unknown = JSON.parse(await Deno.readTextFile(path));
+    if (isObject(document)) return document;
+  } catch (cause) {
+    throw new Error(`Invalid generated JSON schema: ${path}`, { cause });
+  }
+  throw new Error(`Invalid generated JSON schema: ${path}`);
+}
+
+export async function assertGeneratedTurnStartSchema(
   schemaDirectory: string,
 ): Promise<void> {
-  for await (const path of jsonSchemaFiles(schemaDirectory)) {
-    let document: unknown;
-    try {
-      document = JSON.parse(await Deno.readTextFile(path));
-    } catch (cause) {
-      throw new Error(`Invalid generated JSON schema: ${path}`, { cause });
-    }
-    if (documentSupportsApplicationContext(document)) return;
+  const document = await readTurnStartSchema(schemaDirectory);
+  if (!supportsApplicationContext(document)) {
+    throw new Error(SCHEMA_COMPATIBILITY_ERROR);
   }
-
-  throw new Error(SCHEMA_COMPATIBILITY_ERROR);
+  if (!supportsLocalImage(document)) {
+    throw new Error(LOCAL_IMAGE_SCHEMA_COMPATIBILITY_ERROR);
+  }
 }
 
 export async function finishSmoke(

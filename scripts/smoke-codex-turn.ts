@@ -38,10 +38,14 @@ try {
         codexLogger.warn({ source: "client" }, message.trimEnd()),
     },
   });
-  const threadId = await client.startThread();
+  const { threadId } = await client.startThread();
   const turnId = await client.startTurn(
     threadId,
-    "Reply with one short sentence confirming that this Codex turn works. Do not use tools.",
+    {
+      text:
+        "Reply with one short sentence confirming that this Codex turn works. Do not use tools.",
+      localImagePaths: [],
+    },
     "restricted",
   );
   const result = await withTimeout(completed.promise, 120_000);

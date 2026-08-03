@@ -1,5 +1,10 @@
 import type { ActivityEvent } from "./activity-event.ts";
-import type { CodexTurnOptions } from "./codex-turn.ts";
+import type { CodexTurnInput, CodexTurnOptions } from "./codex-turn.ts";
+import {
+  type ImageLease,
+  ImagePreparationError,
+  type ImagePreparer,
+} from "./image-temp-store.ts";
 import {
   classifyRequestAuthority,
   normalizeOwnerUserId,
@@ -14,7 +19,7 @@ import {
   type OutputDecisionReason,
   TurnOutputPipeline,
 } from "./output-pipeline.ts";
-import { buildCodexPrompt } from "./prompt.ts";
+import { buildCodexTurnInput } from "./prompt.ts";
 import {
   DEFAULT_OUTPUT_SETTINGS,
   type OutputSettings,
@@ -23,14 +28,17 @@ import type { ProgressTail } from "./progress-tail.ts";
 import type {
   ChatType,
   ConversationKey,
+  InboundImageReference,
   InboundMessage,
   InboundText,
+  InboundUserMessage,
 } from "./wecom.ts";
 
 export interface RoutedMessage extends InboundMessage {
   frame: unknown;
 }
 
+export type RoutedUserMessage = InboundUserMessage & RoutedMessage;
 export interface RoutedText extends InboundText, RoutedMessage {}
 
 export interface ConversationStateRecord {
@@ -91,7 +99,7 @@ export interface CodexPort {
   ): Promise<ModelSettingsUpdateResult>;
   startTurn(
     threadId: string,
-    prompt: string,
+    input: CodexTurnInput,
     authority: RequestAuthority,
     onActivity: (event: ActivityEvent) => void | Promise<void>,
     options?: CodexTurnOptions,
@@ -107,7 +115,7 @@ export interface ProgressHandle {
 
 export interface ChatOutput {
   send(message: RoutedMessage, text: string, final?: boolean): Promise<void>;
-  startProgress(message: RoutedText): Promise<ProgressHandle>;
+  startProgress(message: RoutedMessage): Promise<ProgressHandle>;
 }
 
 export type RequestStatus =
@@ -156,6 +164,7 @@ export interface ConversationOrchestratorOptions {
   state: OrchestratorState;
   codex: CodexPort;
   output: ChatOutput;
+  imagePreparer: ImagePreparer;
   workspace: string;
   ownerUserId?: string;
   outputSettings?: OutputSettings;
@@ -212,7 +221,7 @@ interface ActiveTurn {
 }
 
 interface RequestTrace {
-  message: RoutedText;
+  message: RoutedUserMessage;
   startedAt: number;
   threadId?: string;
   turnId?: string;
@@ -220,15 +229,21 @@ interface RequestTrace {
   terminal: boolean;
 }
 
+interface PendingMessage {
+  readonly message: RoutedUserMessage;
+  readonly contentImages: readonly PendingImage[];
+  readonly quoteImages: readonly PendingImage[];
+}
+
 interface PendingRequest {
-  message: RoutedText;
-  messages: RoutedText[];
+  message: RoutedUserMessage;
+  messages: PendingMessage[];
   traces: RequestTrace[];
   settingsBarrier: Promise<void>;
 }
 
 interface DebounceBatch {
-  messages: RoutedText[];
+  messages: PendingMessage[];
   traces: RequestTrace[];
   settingsBarrier: Promise<void>;
   timer?: unknown;
@@ -238,7 +253,7 @@ interface DebounceBatch {
 }
 
 interface TurnOutput {
-  message: RoutedText;
+  message: RoutedUserMessage;
   progress: ProgressHandle;
   pipeline: TurnOutputPipeline;
   activityTail: Promise<void>;
@@ -273,6 +288,11 @@ interface RequestStatusDetails {
   error?: unknown;
 }
 
+interface PreparedRequestImages {
+  readonly input: CodexTurnInput;
+  readonly leases: readonly ImageLease[];
+}
+
 type SettingsCommand =
   | { kind: "model"; value?: string; valid: boolean }
   | { kind: "effort"; value?: string; valid: boolean };
@@ -287,6 +307,36 @@ const TERMINAL_REQUEST_STATUSES = new Set<RequestStatus>([
   "runtime_lost",
 ]);
 const MESSAGE_DEBOUNCE_MS = 3_000;
+
+class PendingImage {
+  readonly #controller = new AbortController();
+  readonly result: Promise<ImageLease>;
+  #lease?: ImageLease;
+  #released = false;
+
+  constructor(
+    preparer: ImagePreparer,
+    reference: InboundImageReference,
+  ) {
+    this.result = preparer.prepare(reference, this.#controller.signal)
+      .then((lease) => {
+        this.#lease = lease;
+        return lease;
+      });
+    void this.result.catch(() => undefined);
+  }
+
+  cancel(): void {
+    this.#controller.abort();
+  }
+
+  async release(): Promise<void> {
+    if (this.#released) return;
+    this.#released = true;
+    this.cancel();
+    await this.#lease?.release();
+  }
+}
 
 function hasLiveTraces(request?: PendingRequest): request is PendingRequest {
   return Boolean(request?.traces.some((trace) => !trace.terminal));
@@ -422,6 +472,7 @@ export class ConversationOrchestrator {
   readonly #state: OrchestratorState;
   readonly #codex: CodexPort;
   readonly #output: ChatOutput;
+  readonly #imagePreparer: ImagePreparer;
   readonly #workspace: string;
   readonly #ownerUserId?: string;
   readonly #outputSettings: OutputSettings;
@@ -444,6 +495,7 @@ export class ConversationOrchestrator {
     this.#state = options.state;
     this.#codex = options.codex;
     this.#output = options.output;
+    this.#imagePreparer = options.imagePreparer;
     this.#workspace = options.workspace;
     this.#ownerUserId = normalizeOwnerUserId(options.ownerUserId);
     this.#outputSettings = options.outputSettings ?? DEFAULT_OUTPUT_SETTINGS;
@@ -477,85 +529,96 @@ export class ConversationOrchestrator {
     }
   }
 
-  async handleText(message: RoutedText): Promise<void> {
-    const command = message.text.trim();
-    const parsedSettingsCommand = settingsCommand(command);
-    if (
-      command === "/help" || command === "/status" || command === "/new" ||
-      command === "/stop" || parsedSettingsCommand
-    ) {
-      if (this.#shuttingDown) return;
-      if (!this.#state.claimMessage(message.msgId, message.conversationKey)) {
-        return;
-      }
-      if (command === "/help") {
-        await this.#output.send(message, HELP);
-        return;
-      }
-      if (command === "/status") {
-        await this.#enqueueSettingsCommand(
-          message.conversationKey,
-          async () => {
-            const status = await this.#status(message.conversationKey);
-            if (status === undefined || this.#shuttingDown) return;
-            await this.#output.send(message, status);
-          },
-        );
-        return;
-      }
-      if (parsedSettingsCommand) {
-        await this.#enqueueSettingsCommand(
-          message.conversationKey,
-          () => this.#handleSettingsCommand(message, parsedSettingsCommand),
-          parsedSettingsCommand.valid && parsedSettingsCommand.value !==
-              undefined,
-        );
-        return;
-      }
-      if (command === "/stop") {
-        await this.#stopConversation(message);
-        return;
-      }
-      const slot = this.#slot(message.conversationKey);
-      const debounce = this.#cancelDebounce(slot);
-      if (debounce) {
-        this.#emitRequestStatuses(
-          this.#requestFromBatch(debounce),
-          "superseded",
-          { reason: "reset" },
-        );
-      }
-      const pending = slot.pending;
-      const current = isSupersedable(slot.current) ? slot.current : undefined;
-      slot.pending = undefined;
-      if (pending) {
-        this.#emitRequestStatuses(pending, "superseded", { reason: "reset" });
-      }
-      if (current) {
-        this.#emitRequestStatuses(current, "superseded", { reason: "reset" });
-      }
-      if (!this.#codex.ready) {
-        this.#deleteSlotIfIdle(message.conversationKey, slot);
-        await this.#output.send(
+  async handleMessage(message: RoutedUserMessage): Promise<void> {
+    if (message.messageType === "text") {
+      const command = message.text.trim();
+      const parsedSettingsCommand = settingsCommand(command);
+      if (
+        command === "/help" || command === "/status" || command === "/new" ||
+        command === "/stop" || parsedSettingsCommand
+      ) {
+        if (this.#shuttingDown) return;
+        if (!this.#state.claimMessage(message.msgId, message.conversationKey)) {
+          return;
+        }
+        if (command === "/help") {
+          await this.#output.send(message, HELP);
+          return;
+        }
+        if (command === "/status") {
+          await this.#enqueueSettingsCommand(
+            message.conversationKey,
+            async () => {
+              const status = await this.#status(message.conversationKey);
+              if (status === undefined || this.#shuttingDown) return;
+              await this.#output.send(message, status);
+            },
+          );
+          return;
+        }
+        if (parsedSettingsCommand) {
+          await this.#enqueueSettingsCommand(
+            message.conversationKey,
+            () => this.#handleSettingsCommand(message, parsedSettingsCommand),
+            parsedSettingsCommand.valid && parsedSettingsCommand.value !==
+                undefined,
+          );
+          return;
+        }
+        if (command === "/stop") {
+          await this.#stopConversation(message);
+          return;
+        }
+        const slot = this.#slot(message.conversationKey);
+        const debounce = this.#cancelDebounce(slot);
+        if (debounce) {
+          this.#emitRequestStatuses(
+            debounce,
+            "superseded",
+            { reason: "reset" },
+          );
+          void this.#releaseRequestImages(debounce);
+        }
+        const pending = slot.pending;
+        const current = isSupersedable(slot.current) ? slot.current : undefined;
+        slot.pending = undefined;
+        if (pending) {
+          this.#emitRequestStatuses(pending, "superseded", {
+            reason: "reset",
+          });
+          void this.#releaseRequestImages(pending);
+        }
+        if (current) {
+          this.#emitRequestStatuses(current, "superseded", {
+            reason: "reset",
+          });
+          this.#cancelRequestImages(current);
+        }
+        if (!this.#codex.ready) {
+          this.#deleteSlotIfIdle(message.conversationKey, slot);
+          await this.#output.send(
+            message,
+            "Codex App Server 暂不可用，请稍后重试。",
+          );
+          return;
+        }
+        slot.resetPending = {
           message,
-          "Codex App Server 暂不可用，请稍后重试。",
-        );
+          settingsBarrier: this.#settingsMutationTails.get(
+            message.conversationKey,
+          ) ?? Promise.resolve(),
+        };
+        if (isInterruptible(slot.active)) this.#requestInterrupt(slot);
+        if (!slot.drain) {
+          slot.drain = this.#drain(message.conversationKey, slot).finally(
+            () => {
+              slot.drain = undefined;
+            },
+          );
+        }
+        await slot.drain;
         return;
       }
-      slot.resetPending = {
-        message,
-        settingsBarrier: this.#settingsMutationTails.get(
-          message.conversationKey,
-        ) ?? Promise.resolve(),
-      };
-      if (isInterruptible(slot.active)) this.#requestInterrupt(slot);
-      if (!slot.drain) {
-        slot.drain = this.#drain(message.conversationKey, slot).finally(() => {
-          slot.drain = undefined;
-        });
-      }
-      await slot.drain;
-      return;
     }
 
     const trace = this.#createRequestTrace(message);
@@ -576,7 +639,7 @@ export class ConversationOrchestrator {
     ) ?? Promise.resolve();
     const request: PendingRequest = {
       message,
-      messages: [message],
+      messages: [{ message, contentImages: [], quoteImages: [] }],
       traces: [trace],
       settingsBarrier,
     };
@@ -698,16 +761,18 @@ export class ConversationOrchestrator {
       const debounce = this.#cancelDebounce(slot);
       if (debounce) {
         this.#emitRequestStatuses(
-          this.#requestFromBatch(debounce),
+          debounce,
           "interrupted",
           { reason: "stop" },
         );
+        void this.#releaseRequestImages(debounce);
       }
       const pending = slot.pending;
       slot.pending = undefined;
       slot.resetPending = undefined;
       if (pending) {
         this.#emitRequestStatuses(pending, "interrupted", { reason: "stop" });
+        void this.#releaseRequestImages(pending);
       }
 
       if (slot.active) {
@@ -718,6 +783,7 @@ export class ConversationOrchestrator {
           this.#emitRequestStatuses(slot.current, "interrupted", {
             reason: "stop",
           });
+          this.#cancelRequestImages(slot.current);
         }
         slot.control.forceComplete({ status: "interrupted" });
       }
@@ -741,7 +807,7 @@ export class ConversationOrchestrator {
     }
     await this.#output.send(
       message,
-      `暂不支持 \`${messageType}\` 消息，请发送纯文本。`,
+      `暂不支持 \`${messageType}\` 消息，请发送文本或图片。`,
     );
   }
 
@@ -758,20 +824,23 @@ export class ConversationOrchestrator {
       slot.resetPending = undefined;
       if (debounce) {
         this.#emitRequestStatuses(
-          this.#requestFromBatch(debounce),
+          debounce,
           "shutdown_discarded",
           { reason: "shutdown" },
         );
+        void this.#releaseRequestImages(debounce);
       }
       if (pending) {
         this.#emitRequestStatuses(pending, "shutdown_discarded", {
           reason: "shutdown",
         });
+        void this.#releaseRequestImages(pending);
       }
       if (current) {
         this.#emitRequestStatuses(current, "shutdown_discarded", {
           reason: "shutdown",
         });
+        this.#cancelRequestImages(current);
       }
       if (slot.drain) drains.push(slot.drain);
       if (!isInterruptible(slot.active)) continue;
@@ -824,10 +893,29 @@ export class ConversationOrchestrator {
   async #debounceMessage(
     conversationKey: ConversationKey,
     slot: ConversationSlot,
-    message: RoutedText,
+    message: RoutedUserMessage,
     trace: RequestTrace,
     settingsBarrier: Promise<void>,
   ): Promise<void> {
+    const pendingMessage: PendingMessage = {
+      message,
+      contentImages: message.content.flatMap((part) =>
+        part.type === "image"
+          ? [
+            new PendingImage(
+              this.#imagePreparer,
+              part.image,
+            ),
+          ]
+          : []
+      ),
+      quoteImages: message.quoteImages.map((reference) =>
+        new PendingImage(
+          this.#imagePreparer,
+          reference,
+        )
+      ),
+    };
     let batch = slot.debounce;
     if (!batch) {
       const completion = Promise.withResolvers<void>();
@@ -841,7 +929,7 @@ export class ConversationOrchestrator {
       };
       slot.debounce = batch;
     }
-    batch.messages.push(message);
+    batch.messages.push(pendingMessage);
     batch.traces.push(trace);
     batch.settingsBarrier = settingsBarrier;
     if (batch.timer !== undefined) {
@@ -871,6 +959,7 @@ export class ConversationOrchestrator {
       this.#emitRequestStatuses(request, "shutdown_discarded", {
         reason: "shutdown",
       });
+      await this.#releaseRequestImages(request);
       this.#deleteSlotIfIdle(conversationKey, slot);
       return;
     }
@@ -889,6 +978,7 @@ export class ConversationOrchestrator {
           reason: "runtime_unavailable",
         });
       } finally {
+        await this.#releaseRequestImages(request);
         this.#deleteSlotIfIdle(conversationKey, slot);
       }
       return;
@@ -896,7 +986,7 @@ export class ConversationOrchestrator {
     await this.#enqueueRequest(conversationKey, slot, request);
   }
 
-  #cancelDebounce(slot: ConversationSlot): DebounceBatch | undefined {
+  #cancelDebounce(slot: ConversationSlot): PendingRequest | undefined {
     const batch = slot.debounce;
     if (!batch) return;
     slot.debounce = undefined;
@@ -905,7 +995,7 @@ export class ConversationOrchestrator {
       batch.timer = undefined;
     }
     batch.resolve();
-    return batch;
+    return this.#requestFromBatch(batch);
   }
 
   async #enqueueRequest(
@@ -913,13 +1003,21 @@ export class ConversationOrchestrator {
     slot: ConversationSlot,
     request: PendingRequest,
   ): Promise<void> {
-    const superseded = slot.pending ??
-      (isSupersedable(slot.current) ? slot.current : undefined);
+    const pending = slot.pending;
+    const current = !pending && isSupersedable(slot.current)
+      ? slot.current
+      : undefined;
     slot.pending = request;
-    if (superseded) {
-      this.#emitRequestStatuses(superseded, "superseded", {
+    if (pending) {
+      this.#emitRequestStatuses(pending, "superseded", {
         replacedByMsgId: request.message.msgId,
       });
+      void this.#releaseRequestImages(pending);
+    } else if (current) {
+      this.#emitRequestStatuses(current, "superseded", {
+        replacedByMsgId: request.message.msgId,
+      });
+      this.#cancelRequestImages(current);
     }
     this.#emitRequestStatuses(request, "queued");
     if (isInterruptible(slot.active)) {
@@ -985,6 +1083,7 @@ export class ConversationOrchestrator {
         }
         if (slot.control === control) slot.control = undefined;
         if (slot.current === request) slot.current = undefined;
+        await this.#releaseRequestImages(request);
       }
     }
 
@@ -1030,6 +1129,79 @@ export class ConversationOrchestrator {
     );
   }
 
+  async #resolveRequestImages(
+    request: PendingRequest,
+  ): Promise<PreparedRequestImages> {
+    const preparedMessages = await Promise.all(
+      request.messages.map(async (pending) => {
+        const [contentLeases, quoteLeases] = await Promise.all([
+          Promise.all(pending.contentImages.map((image) => image.result)),
+          Promise.all(pending.quoteImages.map((image) => image.result)),
+        ]);
+        let contentImageIndex = 0;
+        return {
+          message: pending.message,
+          contentLeases,
+          quoteLeases,
+          content: pending.message.content.map((part) =>
+            part.type === "text" ? part : {
+              type: "image" as const,
+              path: contentLeases[contentImageIndex++].path,
+            }
+          ),
+        };
+      }),
+    );
+    const input = buildCodexTurnInput({
+      chatType: request.message.chatType,
+      conversationKey: request.message.conversationKey,
+      messages: preparedMessages.map((prepared) => ({
+        senderUserId: prepared.message.senderUserId,
+        msgId: prepared.message.msgId,
+        content: prepared.content,
+        quote: prepared.message.quote,
+        quoteImages: prepared.quoteLeases.map(({ path }) => path),
+      })),
+    });
+    return {
+      input,
+      leases: preparedMessages.flatMap((prepared) => [
+        ...prepared.contentLeases,
+        ...prepared.quoteLeases,
+      ]),
+    };
+  }
+
+  async #releaseRequestImages(request: PendingRequest): Promise<void> {
+    const results = await Promise.allSettled(
+      request.messages.flatMap((pending) =>
+        [...pending.contentImages, ...pending.quoteImages].map((image) =>
+          image.release()
+        )
+      ),
+    );
+    for (const result of results) {
+      if (result.status === "rejected") this.#report(result.reason);
+    }
+  }
+
+  async #releaseLeases(leases: readonly ImageLease[]): Promise<void> {
+    const results = await Promise.allSettled(
+      leases.map((lease) => lease.release()),
+    );
+    for (const result of results) {
+      if (result.status === "rejected") this.#report(result.reason);
+    }
+  }
+
+  #cancelRequestImages(request: PendingRequest): void {
+    for (const pending of request.messages) {
+      for (const image of [...pending.contentImages, ...pending.quoteImages]) {
+        image.cancel();
+      }
+    }
+  }
+
   async #runTurn(
     request: PendingRequest,
     slot: ConversationSlot,
@@ -1049,6 +1221,38 @@ export class ConversationOrchestrator {
       (settingsReady.type === "value" && !settingsReady.value)
     ) return;
     if (settingsReady.type === "error") throw settingsReady.error;
+
+    const prepared = await this.#raceWithForce(
+      () => this.#resolveRequestImages(request),
+      control,
+    );
+    if (prepared.type === "forced") return;
+    if (prepared.type === "error") {
+      if (!(prepared.error instanceof ImagePreparationError)) {
+        throw prepared.error;
+      }
+      this.#cancelRequestImages(request);
+      if (
+        hasLiveTraces(request) && !control.forced && !this.#shuttingDown &&
+        !slot.resetPending && !slot.pending
+      ) {
+        await this.#sendRequestWithForce(
+          control,
+          request,
+          "图片处理失败，请重新发送图片。",
+          true,
+        );
+      }
+      if (control.forcedOutcome) {
+        this.#emitForcedTerminal(request, control.forcedOutcome);
+      } else {
+        this.#emitRequestStatuses(request, "failed", {
+          reason: "image_preparation_failed",
+        });
+      }
+      return;
+    }
+
     const threadId = await this.#ensureThread(request, control);
     if (threadId === undefined) return;
 
@@ -1059,16 +1263,7 @@ export class ConversationOrchestrator {
       slot.resetPending || slot.pending
     ) return;
 
-    const prompt = buildCodexPrompt({
-      chatType: message.chatType,
-      conversationKey: message.conversationKey,
-      messages: request.messages.map((item) => ({
-        senderUserId: item.senderUserId,
-        msgId: item.msgId,
-        content: item.text,
-        quote: item.quote,
-      })),
-    });
+    const input = prepared.value.input;
     const progress = await this.#startProgressWithForce(message, control);
     if (progress === undefined) return;
     const turnOutput = this.#createTurnOutput(message, progress);
@@ -1122,14 +1317,15 @@ export class ConversationOrchestrator {
 
     let start: Promise<CodexTurnHandle>;
     this.#emitRequestStatuses(request, "turn_starting");
+    const rpcLeases = prepared.value.leases.map((lease) => lease.retain());
     try {
       const authority = classifyRequestAuthority(
         this.#ownerUserId,
-        request.messages.map((message) => message.senderUserId),
+        request.messages.map(({ message }) => message.senderUserId),
       );
       start = this.#codex.startTurn(
         threadId,
-        prompt,
+        input,
         authority,
         (activity) => this.#enqueueActivity(turnOutput, activity, control),
         this.#effectiveOutputSettings(request.message).toolFormat === "summary"
@@ -1139,6 +1335,10 @@ export class ConversationOrchestrator {
     } catch (error) {
       start = Promise.reject(error);
     }
+    void start.then(
+      () => this.#releaseLeases(rpcLeases),
+      () => this.#releaseLeases(rpcLeases),
+    ).catch((error) => this.#report(error));
 
     const startResult = await Promise.race([
       start.then(
@@ -1355,7 +1555,7 @@ export class ConversationOrchestrator {
   }
 
   #createTurnOutput(
-    message: RoutedText,
+    message: RoutedUserMessage,
     progress: ProgressHandle,
   ): TurnOutput {
     return {
@@ -1369,7 +1569,7 @@ export class ConversationOrchestrator {
     };
   }
 
-  #effectiveOutputSettings(message: RoutedText): OutputSettings {
+  #effectiveOutputSettings(message: RoutedUserMessage): OutputSettings {
     return message.chatType === "group"
       ? this.#groupOutputSettings
       : this.#outputSettings;
@@ -1411,7 +1611,7 @@ export class ConversationOrchestrator {
   }
 
   async #startProgressWithForce(
-    message: RoutedText,
+    message: RoutedUserMessage,
     control: TurnControl,
   ): Promise<ProgressHandle | undefined> {
     let pending: Promise<ProgressHandle>;
@@ -1673,7 +1873,7 @@ export class ConversationOrchestrator {
   }
 
   async #startAndBindThread(
-    message: RoutedText,
+    message: RoutedUserMessage,
     control: TurnControl,
     request?: PendingRequest,
   ): Promise<string | undefined> {
@@ -1741,7 +1941,7 @@ export class ConversationOrchestrator {
     return existing.threadId;
   }
 
-  #createRequestTrace(message: RoutedText): RequestTrace {
+  #createRequestTrace(message: RoutedUserMessage): RequestTrace {
     return {
       message,
       startedAt: this.#now(),
@@ -1752,7 +1952,7 @@ export class ConversationOrchestrator {
 
   #requestFromBatch(batch: DebounceBatch): PendingRequest {
     return {
-      message: batch.messages[batch.messages.length - 1],
+      message: batch.messages[batch.messages.length - 1].message,
       messages: batch.messages,
       traces: batch.traces,
       settingsBarrier: batch.settingsBarrier,
@@ -1829,7 +2029,7 @@ export class ConversationOrchestrator {
     terminal: boolean,
   ): void {
     const counts = this.#requestCounts();
-    const summary = state === "received"
+    const summary = state === "received" && trace.message.messageType === "text"
       ? summarizeRequest(trace.message.text)
       : undefined;
     const event: RequestStatusEvent = {
