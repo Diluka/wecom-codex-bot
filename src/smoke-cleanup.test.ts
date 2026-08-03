@@ -10,6 +10,7 @@ import { Writable } from "node:stream";
 import { createLogger } from "./log.ts";
 import {
   assertGeneratedSchemaSupportsApplicationContext,
+  assertGeneratedSchemaSupportsLocalImage,
   finishSmoke,
 } from "./smoke-cleanup.ts";
 
@@ -23,6 +24,10 @@ function compatibleSchemaBundle(): Record<string, unknown> {
         TurnStartParams: {
           type: "object",
           properties: {
+            input: {
+              type: "array",
+              items: { $ref: "#/definitions/v2/UserInput" },
+            },
             additionalContext: {
               description:
                 "Optional client-provided context fragments keyed by an opaque source identifier.",
@@ -31,6 +36,28 @@ function compatibleSchemaBundle(): Record<string, unknown> {
                 $ref: "#/definitions/v2/AdditionalContextEntry",
               },
             },
+          },
+        },
+        UserInput: {
+          oneOf: [
+            { $ref: "#/definitions/v2/TextInput" },
+            { $ref: "#/definitions/v2/LocalImageInput" },
+          ],
+        },
+        TextInput: {
+          type: "object",
+          required: ["type", "text"],
+          properties: {
+            type: { type: "string", enum: ["text"] },
+            text: { type: "string" },
+          },
+        },
+        LocalImageInput: {
+          type: "object",
+          required: ["type", "path"],
+          properties: {
+            type: { type: "string", enum: ["localImage"] },
+            path: { type: "string" },
           },
         },
         AdditionalContextEntry: {
@@ -52,6 +79,43 @@ function compatibleSchemaBundle(): Record<string, unknown> {
       },
     },
   };
+}
+
+function rootTurnStartParamsSchemaBundle(): Record<string, unknown> {
+  return {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    title: "TurnStartParams",
+    type: "object",
+    properties: {
+      input: {
+        type: "array",
+        items: {
+          oneOf: [
+            {
+              type: "object",
+              required: ["type", "path"],
+              properties: {
+                type: { const: "localImage" },
+                path: { type: "string" },
+              },
+            },
+          ],
+        },
+      },
+    },
+  };
+}
+
+function compatibleDefsSchemaBundle(): Record<string, unknown> {
+  const bundle = JSON.parse(
+    JSON.stringify(compatibleSchemaBundle()).replaceAll(
+      "#/definitions/",
+      "#/$defs/",
+    ),
+  ) as Record<string, unknown>;
+  bundle.$defs = bundle.definitions;
+  delete bundle.definitions;
+  return bundle;
 }
 
 async function withSchemaBundle(
@@ -232,6 +296,73 @@ describe("assertGeneratedSchemaSupportsApplicationContext", () => {
         () => assertGeneratedSchemaSupportsApplicationContext(directory),
         Error,
         "TurnStartParams.additionalContext",
+      );
+    });
+  });
+});
+
+describe("assertGeneratedSchemaSupportsLocalImage", () => {
+  it("accepts a localImage turn input with a string path", async () => {
+    await withSchemaBundle(compatibleSchemaBundle(), async (directory) => {
+      await assertGeneratedSchemaSupportsLocalImage(directory);
+    });
+  });
+
+  it("accepts a root TurnStartParams document with inline localImage input", async () => {
+    await withSchemaBundle(
+      rootTurnStartParamsSchemaBundle(),
+      async (directory) => {
+        await assertGeneratedSchemaSupportsLocalImage(directory);
+      },
+    );
+  });
+
+  it("finds TurnStartParams in nested $defs", async () => {
+    await withSchemaBundle(compatibleDefsSchemaBundle(), async (directory) => {
+      await assertGeneratedSchemaSupportsLocalImage(directory);
+    });
+  });
+
+  it("rejects a remote-only image input schema", async () => {
+    const bundle = compatibleSchemaBundle();
+    const definitions = bundle.definitions as Record<
+      string,
+      Record<string, unknown>
+    >;
+    const v2 = definitions.v2 as Record<string, unknown>;
+    v2.LocalImageInput = {
+      type: "object",
+      required: ["type", "url"],
+      properties: {
+        type: { type: "string", enum: ["image"] },
+        url: { type: "string" },
+      },
+    };
+
+    await withSchemaBundle(bundle, async (directory) => {
+      await assertRejects(
+        () => assertGeneratedSchemaSupportsLocalImage(directory),
+        Error,
+        "TurnStartParams.input",
+      );
+    });
+  });
+
+  it("requires localImage inputs to require both type and path", async () => {
+    const bundle = compatibleSchemaBundle();
+    const definitions = bundle.definitions as Record<
+      string,
+      Record<string, unknown>
+    >;
+    const v2 = definitions.v2 as Record<string, unknown>;
+    const localImage = v2.LocalImageInput as Record<string, unknown>;
+    delete localImage.required;
+
+    await withSchemaBundle(bundle, async (directory) => {
+      await assertRejects(
+        () => assertGeneratedSchemaSupportsLocalImage(directory),
+        Error,
+        "TurnStartParams.input",
       );
     });
   });

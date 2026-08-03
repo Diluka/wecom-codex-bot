@@ -6,6 +6,8 @@ type JsonObject = Record<string, unknown>;
 
 const SCHEMA_COMPATIBILITY_ERROR =
   'Generated Codex App Server schema must define TurnStartParams.additionalContext with the exact AdditionalContext kind "application"';
+const LOCAL_IMAGE_SCHEMA_COMPATIBILITY_ERROR =
+  "Generated Codex App Server schema must define TurnStartParams.input localImage entries with a string path";
 
 function isObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -74,6 +76,119 @@ function documentSupportsApplicationContext(document: unknown): boolean {
   return definitionsSupportApplicationContext(document, document.definitions);
 }
 
+function resolveReferenceChain(
+  document: JsonObject,
+  schema: unknown,
+  seen = new WeakSet<object>(),
+): JsonObject | undefined {
+  if (!isObject(schema) || seen.has(schema)) return undefined;
+  seen.add(schema);
+  if (typeof schema.$ref !== "string") return schema;
+
+  const target = resolveLocalReference(document, schema);
+  return target === undefined
+    ? undefined
+    : resolveReferenceChain(document, target, seen);
+}
+
+function isLocalImageInputSchema(
+  document: JsonObject,
+  schema: JsonObject,
+): boolean {
+  const required = schema.required;
+  if (
+    !Array.isArray(required) ||
+    !required.includes("type") ||
+    !required.includes("path")
+  ) {
+    return false;
+  }
+
+  const properties = isObject(schema.properties)
+    ? schema.properties
+    : undefined;
+  const type = resolveReferenceChain(document, properties?.type);
+  const path = resolveReferenceChain(document, properties?.path);
+
+  return (type?.const === "localImage" ||
+    (Array.isArray(type?.enum) && type.enum.includes("localImage"))) &&
+    path?.type === "string";
+}
+
+function schemaSupportsLocalImage(
+  document: JsonObject,
+  schema: unknown,
+  seen: WeakSet<object>,
+): boolean {
+  if (!isObject(schema) || seen.has(schema)) return false;
+  seen.add(schema);
+
+  if (isLocalImageInputSchema(document, schema)) return true;
+
+  const target = resolveLocalReference(document, schema);
+  if (
+    target !== undefined && target !== schema &&
+    schemaSupportsLocalImage(document, target, seen)
+  ) {
+    return true;
+  }
+
+  for (const key of ["items", "oneOf", "anyOf", "allOf"]) {
+    const nested = schema[key];
+    if (Array.isArray(nested)) {
+      if (
+        nested.some((entry) => schemaSupportsLocalImage(document, entry, seen))
+      ) {
+        return true;
+      }
+    } else if (schemaSupportsLocalImage(document, nested, seen)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function turnSchemaSupportsLocalImage(
+  document: JsonObject,
+  turnSchema: unknown,
+): boolean {
+  const turn = resolveLocalReference(document, turnSchema);
+  const properties = isObject(turn?.properties) ? turn.properties : undefined;
+  return schemaSupportsLocalImage(
+    document,
+    properties?.input,
+    new WeakSet<object>(),
+  );
+}
+
+function definitionsSupportLocalImage(
+  document: JsonObject,
+  definitions: unknown,
+  seen = new WeakSet<object>(),
+): boolean {
+  if (!isObject(definitions) || seen.has(definitions)) return false;
+  seen.add(definitions);
+
+  return Object.entries(definitions).some(([name, schema]) =>
+    (name === "TurnStartParams" &&
+      turnSchemaSupportsLocalImage(document, schema)) ||
+    definitionsSupportLocalImage(document, schema, seen)
+  );
+}
+
+function documentSupportsLocalImage(document: unknown): boolean {
+  if (!isObject(document)) return false;
+  if (
+    document.title === "TurnStartParams" &&
+    turnSchemaSupportsLocalImage(document, document)
+  ) {
+    return true;
+  }
+  return definitionsSupportLocalImage(document, document.definitions) ||
+    definitionsSupportLocalImage(document, document.$defs);
+}
+
 async function* jsonSchemaFiles(directory: string): AsyncGenerator<string> {
   for await (const entry of Deno.readDir(directory)) {
     const path = join(directory, entry.name);
@@ -99,6 +214,21 @@ export async function assertGeneratedSchemaSupportsApplicationContext(
   }
 
   throw new Error(SCHEMA_COMPATIBILITY_ERROR);
+}
+
+export async function assertGeneratedSchemaSupportsLocalImage(
+  schemaDirectory: string,
+): Promise<void> {
+  for await (const path of jsonSchemaFiles(schemaDirectory)) {
+    let document: unknown;
+    try {
+      document = JSON.parse(await Deno.readTextFile(path));
+    } catch {
+      throw new Error("Invalid generated JSON schema");
+    }
+    if (documentSupportsLocalImage(document)) return;
+  }
+  throw new Error(LOCAL_IMAGE_SCHEMA_COMPATIBILITY_ERROR);
 }
 
 export async function finishSmoke(
