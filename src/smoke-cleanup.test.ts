@@ -323,6 +323,55 @@ describe("assertGeneratedSchemaSupportsLocalImage", () => {
     });
   });
 
+  it("ignores TurnStartParams keys outside definition namespaces", async () => {
+    const bundle = compatibleSchemaBundle();
+    const definitions = bundle.definitions as Record<
+      string,
+      Record<string, unknown>
+    >;
+    const v2 = definitions.v2;
+    const turnStartParams = v2.TurnStartParams;
+    delete v2.TurnStartParams;
+    definitions.Wrapper = {
+      type: "object",
+      properties: { TurnStartParams: turnStartParams },
+    };
+
+    await withSchemaBundle(bundle, async (directory) => {
+      await assertRejects(
+        () => assertGeneratedSchemaSupportsLocalImage(directory),
+        Error,
+        "TurnStartParams.input",
+      );
+    });
+  });
+
+  it("does not let nested definitions mask an incompatible root TurnStartParams", async () => {
+    const bundle = compatibleSchemaBundle();
+    bundle.title = "TurnStartParams";
+    bundle.properties = {
+      input: {
+        type: "array",
+        items: {
+          type: "object",
+          required: ["type", "url"],
+          properties: {
+            type: { const: "image" },
+            url: { type: "string" },
+          },
+        },
+      },
+    };
+
+    await withSchemaBundle(bundle, async (directory) => {
+      await assertRejects(
+        () => assertGeneratedSchemaSupportsLocalImage(directory),
+        Error,
+        "TurnStartParams.input",
+      );
+    });
+  });
+
   it("rejects a remote-only image input schema", async () => {
     const bundle = compatibleSchemaBundle();
     const definitions = bundle.definitions as Record<

@@ -170,20 +170,25 @@ function definitionsSupportLocalImage(
   if (!isObject(definitions) || seen.has(definitions)) return false;
   seen.add(definitions);
 
-  return Object.entries(definitions).some(([name, schema]) =>
-    (name === "TurnStartParams" &&
-      turnSchemaSupportsLocalImage(document, schema)) ||
-    definitionsSupportLocalImage(document, schema, seen)
-  );
+  return Object.entries(definitions).some(([name, schema]) => {
+    if (
+      name === "TurnStartParams" &&
+      turnSchemaSupportsLocalImage(document, schema)
+    ) {
+      return true;
+    }
+    if (!isObject(schema)) return false;
+
+    return turnSchemaSupportsLocalImage(document, schema.TurnStartParams) ||
+      definitionsSupportLocalImage(document, schema.definitions, seen) ||
+      definitionsSupportLocalImage(document, schema.$defs, seen);
+  });
 }
 
 function documentSupportsLocalImage(document: unknown): boolean {
   if (!isObject(document)) return false;
-  if (
-    document.title === "TurnStartParams" &&
-    turnSchemaSupportsLocalImage(document, document)
-  ) {
-    return true;
+  if (document.title === "TurnStartParams") {
+    return turnSchemaSupportsLocalImage(document, document);
   }
   return definitionsSupportLocalImage(document, document.definitions) ||
     definitionsSupportLocalImage(document, document.$defs);
