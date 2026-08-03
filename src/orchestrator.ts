@@ -320,6 +320,7 @@ class PendingImage {
   constructor(
     preparer: ImagePreparer,
     reference: InboundImageReference,
+    report: (error: unknown) => void,
   ) {
     this.result = Promise.resolve()
       .then(() => {
@@ -330,7 +331,11 @@ class PendingImage {
       })
       .then(async (lease) => {
         if (this.#released) {
-          await lease.release();
+          try {
+            await lease.release();
+          } catch (error) {
+            report(error);
+          }
           throw new ImagePreparationError("cancelled");
         }
         this.#lease = lease;
@@ -941,11 +946,21 @@ export class ConversationOrchestrator {
       message,
       contentImages: message.content.flatMap((part) =>
         part.type === "image"
-          ? [new PendingImage(this.#imagePreparer, part.image)]
+          ? [
+            new PendingImage(
+              this.#imagePreparer,
+              part.image,
+              (error) => this.#report(error),
+            ),
+          ]
           : []
       ),
       quoteImages: message.quoteImages.map((reference) =>
-        new PendingImage(this.#imagePreparer, reference)
+        new PendingImage(
+          this.#imagePreparer,
+          reference,
+          (error) => this.#report(error),
+        )
       ),
     };
     let batch = slot.debounce;
@@ -1266,7 +1281,7 @@ export class ConversationOrchestrator {
       if (!(prepared.error instanceof ImagePreparationError)) {
         throw prepared.error;
       }
-      await this.#releaseRequestImages(request);
+      this.#cancelRequestImages(request);
       if (
         hasLiveTraces(request) && !control.forced && !this.#shuttingDown &&
         !slot.resetPending && !slot.pending

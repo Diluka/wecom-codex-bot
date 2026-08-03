@@ -3801,6 +3801,43 @@ describe("ConversationOrchestrator", () => {
     assertEquals(imagePreparer.calls.length, 0);
     await Promise.all([running, stopping]);
   });
+  it("reports a rejecting lease that arrives after image cancellation", async () => {
+    const preparation = Promise.withResolvers<ImageLease>();
+    const cleanupError = new Error("late cleanup failed");
+    const errors: Error[] = [];
+    const { codex, imagePreparer, orchestrator, timers } = setup({
+      onError: (error) => errors.push(error),
+    });
+    imagePreparer.results.push(preparation.promise);
+    const cancelled = orchestrator.handleMessage(
+      imageMessage("single:alice", "late-image"),
+    );
+    await waitFor(() => imagePreparer.calls.length === 1);
+
+    const stopping = orchestrator.handleMessage(
+      message("single:alice", "stop-late-image", "/stop"),
+    );
+    await Promise.all([cancelled, stopping]);
+
+    const next = orchestrator.handleMessage(
+      message("single:alice", "after-late-image", "continue"),
+    );
+    await timers.advance(3_000);
+    await waitFor(() => codex.starts.length === 1);
+    codex.starts[0].resolve({ status: "completed" });
+    await next;
+
+    const lateLease = new FakeImageLease(
+      "/tmp/late-cleanup.png",
+      undefined,
+      cleanupError,
+    );
+    preparation.resolve(lateLease);
+    await waitFor(() => errors.length === 1);
+
+    assertEquals(errors, [cleanupError]);
+    assertEquals(lateLease.state, { references: 0, releases: 1 });
+  });
   it("fails the whole batch before starting a thread when one image fails", async () => {
     const successful = new FakeImageLease("/tmp/one.png");
     const {
@@ -3835,6 +3872,51 @@ describe("ConversationOrchestrator", () => {
     const failed = requestEvents.find(({ state }) => state === "failed");
     assertEquals(failed?.reason, "image_preparation_failed");
     assertEquals(failed?.error, undefined);
+  });
+  it("releases preparation-failure owners only after clearing current ownership", async () => {
+    const successfulPreparation = Promise.withResolvers<ImageLease>();
+    const failedPreparation = Promise.withResolvers<ImageLease>();
+    const context = setup();
+    const orchestrator = context.orchestrator;
+    let releaseProbe: Promise<void> | undefined;
+    let releaseCalls = 0;
+    const owner: ImageLease = {
+      path: "/tmp/owned-until-drain.png",
+      retain: () => owner,
+      release: () => {
+        releaseCalls++;
+        releaseProbe = orchestrator.handleMessage(
+          message("single:alice", "release-ownership-probe", "/stop"),
+        );
+        return Promise.resolve();
+      },
+    };
+    context.imagePreparer.results.push(
+      successfulPreparation.promise,
+      failedPreparation.promise,
+    );
+    const running = orchestrator.handleMessage(mixedMessage(
+      "single:alice",
+      "mixed-release-owner",
+      [validImage("one"), validImage("two")],
+    ));
+    const flushing = context.timers.advance(3_000);
+    await waitFor(() => context.imagePreparer.calls.length === 2);
+    successfulPreparation.resolve(owner);
+    await successfulPreparation.promise;
+    await Promise.resolve();
+
+    failedPreparation.reject(new ImagePreparationError("download_failed"));
+    await Promise.all([running, flushing]);
+    await releaseProbe;
+
+    assertEquals(releaseCalls, 1);
+    assertEquals(
+      context.output.sent.find(({ msgId }) =>
+        msgId === "release-ownership-probe"
+      )?.text,
+      "当前没有正在执行或等待的任务。",
+    );
   });
   it("keeps an image preparation failure interrupted when stop skips its reply", async () => {
     const successful = new FakeImageLease("/tmp/one.png");
