@@ -1,18 +1,5 @@
 import type { CodexTurnInput } from "./codex-turn.ts";
 
-export interface TextCodexPromptMessage {
-  senderUserId: string;
-  msgId: string;
-  content: string;
-  quote?: unknown;
-}
-
-export interface TextCodexPromptInput {
-  chatType: "single" | "group";
-  conversationKey: string;
-  messages: readonly TextCodexPromptMessage[];
-}
-
 export type CodexPromptContentPart =
   | { readonly type: "text"; readonly text: string }
   | { readonly type: "image"; readonly path: string };
@@ -130,18 +117,4 @@ export function buildCodexTurnInput(input: CodexPromptInput): CodexTurnInput {
     ].join("\n"),
     localImagePaths,
   };
-}
-
-export function buildCodexPrompt(input: TextCodexPromptInput): string {
-  return buildCodexTurnInput({
-    chatType: input.chatType,
-    conversationKey: input.conversationKey,
-    messages: input.messages.map((message) => ({
-      senderUserId: message.senderUserId,
-      msgId: message.msgId,
-      content: [{ type: "text", text: message.content }],
-      quote: message.quote,
-      quoteImages: [],
-    })),
-  }).text;
 }

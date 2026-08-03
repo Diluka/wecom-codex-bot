@@ -2,7 +2,7 @@ import type {
   ChatOutput,
   ProgressHandle,
   RoutedMessage,
-  RoutedText,
+  RoutedUserMessage,
 } from "./orchestrator.ts";
 import {
   ConversationSendQueue,
@@ -91,7 +91,7 @@ export class WeComChatOutput implements ChatOutput {
     }
   }
 
-  startProgress(message: RoutedText): Promise<ProgressHandle> {
+  startProgress(message: RoutedUserMessage): Promise<ProgressHandle> {
     const controller = new StreamController({
       conversationKey: message.conversationKey,
       frame: message.frame,

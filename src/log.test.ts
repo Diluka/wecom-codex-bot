@@ -280,6 +280,8 @@ describe("logRequestStatus", () => {
       chatId: "room-1",
       userId: "alice",
       msgId: "m1",
+      messageType: "mixed",
+      imageCount: 2,
       activeCount: 1,
       pendingCount: 0,
     };
@@ -309,6 +311,8 @@ describe("logRequestStatus", () => {
     assertMatch(lines[0], / INFO: \[request\] received /);
     assertMatch(lines[0], /"chat_type":"group"/);
     assertMatch(lines[0], /"summary":"hello"/);
+    assertMatch(lines[0], /"message_type":"mixed"/);
+    assertMatch(lines[0], /"image_count":2/);
     assertMatch(lines[1], / WARN: \[request\] runtime_unavailable /);
     assertMatch(lines[1], /"reason":"offline"/);
     assertMatch(lines[2], / ERROR: \[request\] failed /);
@@ -316,6 +320,9 @@ describe("logRequestStatus", () => {
     assertMatch(lines[2], /"turn_id":"turn-1"/);
     assertMatch(lines[2], /"elapsed_ms":12/);
     assertEquals(output.includes("actual-secret"), true);
+    assertEquals(output.includes("https://example.invalid/private"), false);
+    assertEquals(output.includes("private-aes-key"), false);
+    assertEquals(output.includes("/tmp/private-image.png"), false);
   });
 });
 

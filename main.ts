@@ -156,12 +156,7 @@ const gateway = new WeComGateway({
   botId: config.botId,
   secret: config.botSecret,
   onMessage: (message, frame) =>
-    message.messageType === "text"
-      ? context.orchestrator!.handleText({ ...message, frame })
-      : context.orchestrator!.handleUnsupported(
-        { ...message, frame },
-        message.messageType,
-      ),
+    context.orchestrator!.handleMessage({ ...message, frame }),
   onUnsupported: (message, frame, messageType) =>
     context.orchestrator!.handleUnsupported(
       { ...message, frame },
@@ -189,6 +184,7 @@ const orchestrator = new ConversationOrchestrator({
   state,
   codex: runtime,
   output,
+  imagePreparer: imageTempStore,
   workspace: config.workspace,
   ownerUserId: config.ownerUserId,
   outputSettings: config.outputSettings,

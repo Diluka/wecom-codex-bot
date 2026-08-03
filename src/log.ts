@@ -48,6 +48,8 @@ export interface RequestStatusEventLike {
   chatId: string;
   userId: string;
   msgId: string;
+  messageType: string;
+  imageCount: number;
   summary?: string;
   threadId?: string;
   turnId?: string;
@@ -159,6 +161,8 @@ export function logRequestStatus(
     chat_id: event.chatId,
     user_id: event.userId,
     msg_id: event.msgId,
+    message_type: event.messageType,
+    image_count: event.imageCount,
     summary: event.summary,
     thread_id: event.threadId,
     turn_id: event.turnId,
