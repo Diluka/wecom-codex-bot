@@ -3,6 +3,11 @@ export interface LifecycleState {
   close(): void;
 }
 
+export interface LifecycleImageTempStore {
+  start(): Promise<void>;
+  close(): Promise<void>;
+}
+
 export interface LifecycleRuntime {
   start(): Promise<void>;
   stop(): Promise<void>;
@@ -24,6 +29,7 @@ export interface LifecycleOutput {
 
 export interface BotLifecycleOptions {
   state: LifecycleState;
+  imageTempStore: LifecycleImageTempStore;
   runtime: LifecycleRuntime;
   gateway: LifecycleGateway;
   orchestrator: LifecycleOrchestrator;
@@ -64,6 +70,7 @@ export class BotLifecycle {
     const runtimeLost = this.#options.state.markRuntimeLost();
     let runtimeStarted = false;
     try {
+      await this.#options.imageTempStore.start();
       await this.#options.runtime.start();
       runtimeStarted = true;
       if (this.#closed) {
@@ -76,6 +83,7 @@ export class BotLifecycle {
       if (runtimeStarted) {
         await this.#attempt(() => this.#options.runtime.stop());
       }
+      await this.#attempt(() => this.#options.imageTempStore.close());
       this.#closeState();
       throw error;
     }
@@ -98,6 +106,7 @@ export class BotLifecycle {
       } catch {
         // Startup owns cleanup when shutdown wins the race.
       }
+      if (this.#stateClosed) return;
     }
     if (this.#started) {
       // interruptAll synchronously closes the orchestrator's intake gate.
@@ -118,6 +127,7 @@ export class BotLifecycle {
       await this.#attempt(() => this.#options.gateway.disconnect());
       await this.#attempt(() => this.#options.runtime.stop());
     }
+    await this.#attempt(() => this.#options.imageTempStore.close());
     this.#closeState();
   }
 

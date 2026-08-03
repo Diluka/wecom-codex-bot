@@ -2,6 +2,7 @@ import { dirname } from "node:path";
 import { WeComChatOutput } from "./src/chat-output.ts";
 import { CodexRuntime } from "./src/codex-runtime.ts";
 import { loadConfig } from "./src/config.ts";
+import { ImageTempStore } from "./src/image-temp-store.ts";
 import { BotLifecycle } from "./src/lifecycle.ts";
 import {
   closeLogTransport,
@@ -175,6 +176,10 @@ const gateway = new WeComGateway({
   onSdkLog: (level, message) => wecomLogger[level]({ source: "sdk" }, message),
 });
 
+const imageTempStore = new ImageTempStore((reference) =>
+  gateway.downloadImage(reference)
+);
+
 const output = new WeComChatOutput({
   gateway,
   onError: (error) => outputLogger.error({ error }, "error"),
@@ -206,6 +211,7 @@ context.orchestrator = orchestrator;
 
 const lifecycle = new BotLifecycle({
   state,
+  imageTempStore,
   runtime,
   gateway,
   orchestrator,
