@@ -299,13 +299,23 @@ describe("CodexAppServerClient thread settings", () => {
         settings: { model: "gpt-test", effort: "high" },
       });
       equal(
-        await client.startTurn("thread-existing", "Run tests", "restricted"),
+        await client.startTurn(
+          "thread-existing",
+          { text: "Run tests", localImagePaths: [] },
+          "restricted",
+        ),
         "turn-new",
       );
       equal(
-        await client.startTurn("thread-existing", "Ship changes", "owner", {
-          summary: "auto",
-        }),
+        await client.startTurn(
+          "thread-existing",
+          {
+            text: "Inspect attachments",
+            localImagePaths: ["/tmp/one.png", "/tmp/two.jpg"],
+          },
+          "owner",
+          { summary: "auto" },
+        ),
         "turn-new",
       );
       await client.interrupt("thread-existing", "turn-new");
@@ -345,7 +355,15 @@ describe("CodexAppServerClient thread settings", () => {
         id: 5,
         params: {
           threadId: "thread-existing",
-          input: [{ type: "text", text: "Ship changes", text_elements: [] }],
+          input: [
+            {
+              type: "text",
+              text: "Inspect attachments",
+              text_elements: [],
+            },
+            { type: "localImage", path: "/tmp/one.png" },
+            { type: "localImage", path: "/tmp/two.jpg" },
+          ],
           cwd: "/workspace/project",
           additionalContext: {
             wecom_owner_policy: {
@@ -419,7 +437,12 @@ describe("CodexAppServerClient thread settings", () => {
 
     try {
       const error = await assertRejects(
-        () => client.startTurn("thread-existing", "Run tests", "restricted"),
+        () =>
+          client.startTurn(
+            "thread-existing",
+            { text: "Run tests", localImagePaths: [] },
+            "restricted",
+          ),
         CodexRpcError,
         "context rejected",
       );

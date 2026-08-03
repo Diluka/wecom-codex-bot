@@ -1,5 +1,5 @@
 import type { ActivityEvent } from "./activity-event.ts";
-import type { CodexTurnOptions } from "./codex-turn.ts";
+import type { CodexTurnInput, CodexTurnOptions } from "./codex-turn.ts";
 import {
   classifyRequestAuthority,
   normalizeOwnerUserId,
@@ -91,7 +91,7 @@ export interface CodexPort {
   ): Promise<ModelSettingsUpdateResult>;
   startTurn(
     threadId: string,
-    prompt: string,
+    input: CodexTurnInput,
     authority: RequestAuthority,
     onActivity: (event: ActivityEvent) => void | Promise<void>,
     options?: CodexTurnOptions,
@@ -1059,16 +1059,19 @@ export class ConversationOrchestrator {
       slot.resetPending || slot.pending
     ) return;
 
-    const prompt = buildCodexPrompt({
-      chatType: message.chatType,
-      conversationKey: message.conversationKey,
-      messages: request.messages.map((item) => ({
-        senderUserId: item.senderUserId,
-        msgId: item.msgId,
-        content: item.text,
-        quote: item.quote,
-      })),
-    });
+    const input: CodexTurnInput = {
+      text: buildCodexPrompt({
+        chatType: message.chatType,
+        conversationKey: message.conversationKey,
+        messages: request.messages.map((item) => ({
+          senderUserId: item.senderUserId,
+          msgId: item.msgId,
+          content: item.text,
+          quote: item.quote,
+        })),
+      }),
+      localImagePaths: [],
+    };
     const progress = await this.#startProgressWithForce(message, control);
     if (progress === undefined) return;
     const turnOutput = this.#createTurnOutput(message, progress);
@@ -1129,7 +1132,7 @@ export class ConversationOrchestrator {
       );
       start = this.#codex.startTurn(
         threadId,
-        prompt,
+        input,
         authority,
         (activity) => this.#enqueueActivity(turnOutput, activity, control),
         this.#effectiveOutputSettings(request.message).toolFormat === "summary"

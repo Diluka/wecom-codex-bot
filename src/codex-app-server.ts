@@ -1,5 +1,5 @@
 import { readJsonLines } from "./jsonl.ts";
-import type { CodexTurnOptions } from "./codex-turn.ts";
+import type { CodexTurnInput, CodexTurnOptions } from "./codex-turn.ts";
 import type {
   CodexModel,
   CodexThreadSession,
@@ -424,7 +424,7 @@ export class CodexAppServerClient {
 
   async startTurn(
     threadId: string,
-    text: string,
+    input: CodexTurnInput,
     authority: RequestAuthority,
     options: CodexTurnOptions = {},
   ): Promise<string> {
@@ -436,7 +436,13 @@ export class CodexAppServerClient {
     };
     const result = await this.#request("turn/start", {
       threadId,
-      input: [{ type: "text", text, text_elements: [] }],
+      input: [
+        { type: "text", text: input.text, text_elements: [] },
+        ...input.localImagePaths.map((path) => ({
+          type: "localImage",
+          path,
+        })),
+      ],
       cwd: this.#cwd,
       additionalContext,
       ...(options.summary ? { summary: options.summary } : {}),

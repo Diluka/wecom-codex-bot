@@ -10,7 +10,7 @@ import {
   type TurnCompletedEvent,
 } from "./codex-app-server.ts";
 import type { ActivityEvent } from "./activity-event.ts";
-import type { CodexTurnOptions } from "./codex-turn.ts";
+import type { CodexTurnInput, CodexTurnOptions } from "./codex-turn.ts";
 import type { RequestAuthority } from "./owner-policy.ts";
 import {
   describeCodexNotification,
@@ -38,7 +38,7 @@ export interface CodexRuntimeClient {
   resumeThread(threadId: string): Promise<CodexThreadSession>;
   startTurn(
     threadId: string,
-    prompt: string,
+    input: CodexTurnInput,
     authority: RequestAuthority,
     options?: CodexTurnOptions,
   ): Promise<string>;
@@ -413,7 +413,7 @@ export class CodexRuntime implements CodexPort {
 
   async startTurn(
     threadId: string,
-    prompt: string,
+    input: CodexTurnInput,
     authority: RequestAuthority,
     onActivity: (event: ActivityEvent) => void | Promise<void>,
     options?: CodexTurnOptions,
@@ -425,7 +425,7 @@ export class CodexRuntime implements CodexPort {
     try {
       const turnId = await client.startTurn(
         threadId,
-        prompt,
+        input,
         authority,
         options,
       );

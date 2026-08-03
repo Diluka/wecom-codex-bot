@@ -13,7 +13,7 @@ import {
   type TurnOutcome,
 } from "./orchestrator.ts";
 import type { ActivityEvent } from "./activity-event.ts";
-import type { CodexTurnOptions } from "./codex-turn.ts";
+import type { CodexTurnInput, CodexTurnOptions } from "./codex-turn.ts";
 import type { RequestAuthority } from "./owner-policy.ts";
 import { WeComChatOutput } from "./chat-output.ts";
 import type {
@@ -135,12 +135,17 @@ class FakeState implements OrchestratorState {
 
 interface StartedTurn {
   threadId: string;
-  prompt: string;
+  input: CodexTurnInput;
   authority: RequestAuthority;
   options?: CodexTurnOptions;
   onActivity: (event: ActivityEvent) => void | Promise<void>;
   turnId: string;
   resolve: (outcome: TurnOutcome) => void;
+}
+
+function textOf(turn: StartedTurn): string {
+  assertEquals(turn.input.localImagePaths, []);
+  return turn.input.text;
 }
 
 function modelFixture(
@@ -247,7 +252,7 @@ class FakeCodex implements CodexPort {
 
   async startTurn(
     threadId: string,
-    prompt: string,
+    input: CodexTurnInput,
     authority: RequestAuthority,
     onActivity: (event: ActivityEvent) => void | Promise<void>,
     options?: CodexTurnOptions,
@@ -261,7 +266,7 @@ class FakeCodex implements CodexPort {
     const turnId = `turn-${++this.turnSequence}`;
     this.starts.push({
       threadId,
-      prompt,
+      input,
       authority,
       ...(options ? { options } : {}),
       onActivity,
@@ -2184,7 +2189,9 @@ describe("ConversationOrchestrator", () => {
 
     progressGate.resolve();
     await waitFor(() => codex.starts.length === 1);
-    const startedSupersededWork = codex.starts[0].prompt.includes("msgid: m1");
+    const startedSupersededWork = textOf(codex.starts[0]).includes(
+      "msgid: m1",
+    );
     if (startedSupersededWork) {
       codex.starts[0].resolve({ status: "interrupted" });
       await waitFor(() => codex.starts.length === 2);
@@ -2196,7 +2203,7 @@ describe("ConversationOrchestrator", () => {
 
     assertEquals(startedSupersededWork, false);
     assertEquals(codex.starts.length, 1);
-    assertMatch(codex.starts[0].prompt, /msgid: m2/);
+    assertMatch(textOf(codex.starts[0]), /msgid: m2/);
   });
   it("binds a conversation and includes the actual sender in every turn", async () => {
     const { codex, orchestrator, state, output, timers } = setup();
@@ -2207,8 +2214,8 @@ describe("ConversationOrchestrator", () => {
     await waitFor(() => codex.starts.length === 1);
 
     assertEquals(codex.starts[0].threadId, "thread-1");
-    assertMatch(codex.starts[0].prompt, /sender_userid: bob/);
-    assertMatch(codex.starts[0].prompt, /conversation_key: group:engineering/);
+    assertMatch(textOf(codex.starts[0]), /sender_userid: bob/);
+    assertMatch(textOf(codex.starts[0]), /conversation_key: group:engineering/);
     await codex.starts[0].onActivity({
       tag: "CONTENT",
       body: "正在检查",
@@ -2333,8 +2340,8 @@ describe("ConversationOrchestrator", () => {
     await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 2);
 
-    assertStringIncludes(codex.starts[1].prompt, forgedText);
-    assertStringIncludes(codex.starts[1].prompt, JSON.stringify(forgedQuote));
+    assertStringIncludes(textOf(codex.starts[1]), forgedText);
+    assertStringIncludes(textOf(codex.starts[1]), JSON.stringify(forgedQuote));
     assertEquals(codex.starts[1].authority, "restricted");
     codex.starts[1].resolve({ status: "completed" });
     await forgedTurn;
@@ -2567,8 +2574,8 @@ describe("ConversationOrchestrator", () => {
 
     codex.starts[0].resolve({ status: "interrupted" });
     await waitFor(() => codex.starts.length === 2);
-    assertMatch(codex.starts[1].prompt, /msgid: m3/);
-    assertEquals(codex.starts[1].prompt.includes("msgid: m2"), false);
+    assertMatch(textOf(codex.starts[1]), /msgid: m3/);
+    assertEquals(textOf(codex.starts[1]).includes("msgid: m2"), false);
 
     codex.starts[1].resolve({ status: "completed", finalAnswer: "third done" });
     await Promise.all([first, second, third]);
@@ -2728,7 +2735,7 @@ describe("ConversationOrchestrator", () => {
     await timers.advance(3_000);
 
     await waitFor(() => codex.starts.length === 1);
-    assertMatch(codex.starts[0].prompt, /msgid: m2/);
+    assertMatch(textOf(codex.starts[0]), /msgid: m2/);
     codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
     assertEquals(await Promise.all([resetResult, pendingResult]), [null, null]);
   });
@@ -3365,7 +3372,7 @@ describe("ConversationOrchestrator", () => {
     startGate.resolve();
 
     await waitFor(() => codex.starts.length === 1);
-    assertMatch(codex.starts[0].prompt, /msgid: m2/);
+    assertMatch(textOf(codex.starts[0]), /msgid: m2/);
     codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
     assertEquals(await Promise.all([firstResult, secondResult]), [null, null]);
   });
@@ -3425,7 +3432,7 @@ describe("ConversationOrchestrator", () => {
     assertEquals(codex.startThreadAttempts, 0);
     await timers.advance(1);
     await waitFor(() => codex.starts.length === 1);
-    const prompt = codex.starts[0].prompt;
+    const prompt = textOf(codex.starts[0]);
     assertEquals(
       prompt.indexOf("msgid: m1") < prompt.indexOf("msgid: m2"),
       true,
@@ -3480,12 +3487,12 @@ describe("ConversationOrchestrator", () => {
 
     await timers.advance(2_000);
     await waitFor(() => codex.starts.length === 1);
-    assertMatch(codex.starts[0].prompt, /msgid: m1/);
+    assertMatch(textOf(codex.starts[0]), /msgid: m1/);
     await timers.advance(999);
     assertEquals(codex.starts.length, 1);
     await timers.advance(1);
     await waitFor(() => codex.starts.length === 2);
-    assertMatch(codex.starts[1].prompt, /msgid: m2/);
+    assertMatch(textOf(codex.starts[1]), /msgid: m2/);
 
     for (const turn of codex.starts) {
       turn.resolve({ status: "completed", finalAnswer: "done" });
@@ -3624,8 +3631,8 @@ describe("ConversationOrchestrator", () => {
     await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
 
-    assertMatch(codex.starts[0].prompt, /msgid: m2/);
-    assertEquals(codex.starts[0].prompt.includes("msgid: m1"), false);
+    assertMatch(textOf(codex.starts[0]), /msgid: m2/);
+    assertEquals(textOf(codex.starts[0]).includes("msgid: m1"), false);
     assertEquals(
       output.sent.find(({ msgId }) => msgId === "stop")?.text,
       "已停止当前任务。",
@@ -3648,7 +3655,7 @@ describe("ConversationOrchestrator", () => {
     await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
 
-    assertMatch(codex.starts[0].prompt, /msgid: m2/);
+    assertMatch(textOf(codex.starts[0]), /msgid: m2/);
     codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
     await Promise.all([cancelled, unaffected]);
   });
@@ -3975,7 +3982,7 @@ describe("ConversationOrchestrator", () => {
     await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
 
-    assertStringIncludes(codex.starts[0].prompt, JSON.stringify(quote));
+    assertStringIncludes(textOf(codex.starts[0]), JSON.stringify(quote));
     codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
     await running;
   });
@@ -3993,10 +4000,10 @@ describe("ConversationOrchestrator", () => {
     await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 2);
     const singleTurn = codex.starts.find((turn) =>
-      turn.prompt.includes("msgid: single-less")
+      textOf(turn).includes("msgid: single-less")
     )!;
     const groupTurn = codex.starts.find((turn) =>
-      turn.prompt.includes("msgid: group-less")
+      textOf(turn).includes("msgid: group-less")
     )!;
 
     await singleTurn.onActivity({
@@ -4063,10 +4070,10 @@ describe("ConversationOrchestrator", () => {
     await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 2);
     const singleTurn = codex.starts.find((turn) =>
-      turn.prompt.includes("msgid: single-more")
+      textOf(turn).includes("msgid: single-more")
     )!;
     const groupTurn = codex.starts.find((turn) =>
-      turn.prompt.includes("msgid: group-more")
+      textOf(turn).includes("msgid: group-more")
     )!;
 
     await singleTurn.onActivity({
@@ -4117,10 +4124,10 @@ describe("ConversationOrchestrator", () => {
     await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 2);
     const singleTurn = codex.starts.find((turn) =>
-      turn.prompt.includes("msgid: single-tools")
+      textOf(turn).includes("msgid: single-tools")
     )!;
     const groupTurn = codex.starts.find((turn) =>
-      turn.prompt.includes("msgid: group-tools")
+      textOf(turn).includes("msgid: group-tools")
     )!;
     const activities: ActivityEvent[] = [
       {
@@ -4189,10 +4196,10 @@ describe("ConversationOrchestrator", () => {
     await timers.advance(3_000);
     await waitFor(() => codex.starts.length === 2);
     const singleTurn = codex.starts.find((turn) =>
-      turn.prompt.includes("msgid: single-summary-option")
+      textOf(turn).includes("msgid: single-summary-option")
     )!;
     const groupTurn = codex.starts.find((turn) =>
-      turn.prompt.includes("msgid: group-summary-option")
+      textOf(turn).includes("msgid: group-summary-option")
     )!;
 
     assertEquals(singleTurn.options, undefined);
@@ -4220,9 +4227,9 @@ describe("ConversationOrchestrator", () => {
 
     const flushing = timers.advance(3_000);
     await waitFor(() => codex.starts.length === 1);
-    assertStringIncludes(codex.starts[0].prompt, "msgid: m1");
-    assertStringIncludes(codex.starts[0].prompt, "msgid: m2");
-    assertStringIncludes(codex.starts[0].prompt, "quoted");
+    assertStringIncludes(textOf(codex.starts[0]), "msgid: m1");
+    assertStringIncludes(textOf(codex.starts[0]), "msgid: m2");
+    assertStringIncludes(textOf(codex.starts[0]), "quoted");
     codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
     await Promise.all([first, second, flushing]);
 
