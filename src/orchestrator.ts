@@ -606,10 +606,12 @@ export class ConversationOrchestrator {
         const debounce = this.#cancelDebounce(slot);
         if (debounce) {
           this.#emitRequestStatuses(
-            this.#requestFromBatch(debounce),
+            debounce,
             "superseded",
             { reason: "reset" },
           );
+          this.#cancelRequestImages(debounce);
+          void this.#releaseRequestImages(debounce);
         }
         const pending = slot.pending;
         const current = isSupersedable(slot.current) ? slot.current : undefined;
@@ -618,11 +620,15 @@ export class ConversationOrchestrator {
           this.#emitRequestStatuses(pending, "superseded", {
             reason: "reset",
           });
+          this.#cancelRequestImages(pending);
+          void this.#releaseRequestImages(pending);
         }
         if (current) {
           this.#emitRequestStatuses(current, "superseded", {
             reason: "reset",
           });
+          this.#cancelRequestImages(current);
+          slot.control?.forceComplete({ status: "interrupted" });
         }
         if (!this.#codex.ready) {
           this.#deleteSlotIfIdle(message.conversationKey, slot);
@@ -791,16 +797,20 @@ export class ConversationOrchestrator {
       const debounce = this.#cancelDebounce(slot);
       if (debounce) {
         this.#emitRequestStatuses(
-          this.#requestFromBatch(debounce),
+          debounce,
           "interrupted",
           { reason: "stop" },
         );
+        this.#cancelRequestImages(debounce);
+        void this.#releaseRequestImages(debounce);
       }
       const pending = slot.pending;
       slot.pending = undefined;
       slot.resetPending = undefined;
       if (pending) {
         this.#emitRequestStatuses(pending, "interrupted", { reason: "stop" });
+        this.#cancelRequestImages(pending);
+        void this.#releaseRequestImages(pending);
       }
 
       if (slot.active) {
@@ -811,6 +821,7 @@ export class ConversationOrchestrator {
           this.#emitRequestStatuses(slot.current, "interrupted", {
             reason: "stop",
           });
+          this.#cancelRequestImages(slot.current);
         }
         slot.control.forceComplete({ status: "interrupted" });
       }
@@ -851,20 +862,25 @@ export class ConversationOrchestrator {
       slot.resetPending = undefined;
       if (debounce) {
         this.#emitRequestStatuses(
-          this.#requestFromBatch(debounce),
+          debounce,
           "shutdown_discarded",
           { reason: "shutdown" },
         );
+        this.#cancelRequestImages(debounce);
+        void this.#releaseRequestImages(debounce);
       }
       if (pending) {
         this.#emitRequestStatuses(pending, "shutdown_discarded", {
           reason: "shutdown",
         });
+        this.#cancelRequestImages(pending);
+        void this.#releaseRequestImages(pending);
       }
       if (current) {
         this.#emitRequestStatuses(current, "shutdown_discarded", {
           reason: "shutdown",
         });
+        this.#cancelRequestImages(current);
       }
       if (slot.drain) drains.push(slot.drain);
       if (!isInterruptible(slot.active)) continue;
@@ -975,6 +991,8 @@ export class ConversationOrchestrator {
       this.#emitRequestStatuses(request, "shutdown_discarded", {
         reason: "shutdown",
       });
+      this.#cancelRequestImages(request);
+      await this.#releaseRequestImages(request);
       this.#deleteSlotIfIdle(conversationKey, slot);
       return;
     }
@@ -993,6 +1011,7 @@ export class ConversationOrchestrator {
           reason: "runtime_unavailable",
         });
       } finally {
+        await this.#releaseRequestImages(request);
         this.#deleteSlotIfIdle(conversationKey, slot);
       }
       return;
@@ -1000,7 +1019,7 @@ export class ConversationOrchestrator {
     await this.#enqueueRequest(conversationKey, slot, request);
   }
 
-  #cancelDebounce(slot: ConversationSlot): DebounceBatch | undefined {
+  #cancelDebounce(slot: ConversationSlot): PendingRequest | undefined {
     const batch = slot.debounce;
     if (!batch) return;
     slot.debounce = undefined;
@@ -1009,7 +1028,7 @@ export class ConversationOrchestrator {
       batch.timer = undefined;
     }
     batch.resolve();
-    return batch;
+    return this.#requestFromBatch(batch);
   }
 
   async #enqueueRequest(
@@ -1017,13 +1036,23 @@ export class ConversationOrchestrator {
     slot: ConversationSlot,
     request: PendingRequest,
   ): Promise<void> {
-    const superseded = slot.pending ??
-      (isSupersedable(slot.current) ? slot.current : undefined);
+    const pending = slot.pending;
+    const current = !pending && isSupersedable(slot.current)
+      ? slot.current
+      : undefined;
     slot.pending = request;
-    if (superseded) {
-      this.#emitRequestStatuses(superseded, "superseded", {
+    if (pending) {
+      this.#emitRequestStatuses(pending, "superseded", {
         replacedByMsgId: request.message.msgId,
       });
+      this.#cancelRequestImages(pending);
+      void this.#releaseRequestImages(pending);
+    } else if (current) {
+      this.#emitRequestStatuses(current, "superseded", {
+        replacedByMsgId: request.message.msgId,
+      });
+      this.#cancelRequestImages(current);
+      slot.control?.forceComplete({ status: "interrupted" });
     }
     this.#emitRequestStatuses(request, "queued");
     if (isInterruptible(slot.active)) {
@@ -1089,6 +1118,7 @@ export class ConversationOrchestrator {
         }
         if (slot.control === control) slot.control = undefined;
         if (slot.current === request) slot.current = undefined;
+        await this.#releaseRequestImages(request);
       }
     }
 
@@ -1187,6 +1217,23 @@ export class ConversationOrchestrator {
     );
     for (const result of results) {
       if (result.status === "rejected") this.#report(result.reason);
+    }
+  }
+
+  async #releaseLeases(leases: readonly ImageLease[]): Promise<void> {
+    const results = await Promise.allSettled(
+      leases.map((lease) => lease.release()),
+    );
+    for (const result of results) {
+      if (result.status === "rejected") this.#report(result.reason);
+    }
+  }
+
+  #cancelRequestImages(request: PendingRequest): void {
+    for (const pending of request.messages) {
+      for (const image of [...pending.contentImages, ...pending.quoteImages]) {
+        image.cancel();
+      }
     }
   }
 
@@ -1305,6 +1352,7 @@ export class ConversationOrchestrator {
 
     let start: Promise<CodexTurnHandle>;
     this.#emitRequestStatuses(request, "turn_starting");
+    const rpcLeases = prepared.value.leases.map((lease) => lease.retain());
     try {
       const authority = classifyRequestAuthority(
         this.#ownerUserId,
@@ -1322,6 +1370,10 @@ export class ConversationOrchestrator {
     } catch (error) {
       start = Promise.reject(error);
     }
+    void start.then(
+      () => this.#releaseLeases(rpcLeases),
+      () => this.#releaseLeases(rpcLeases),
+    ).catch((error) => this.#report(error));
 
     const startResult = await Promise.race([
       start.then(
