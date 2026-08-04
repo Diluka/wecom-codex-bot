@@ -26,7 +26,10 @@ import type {
   ConfigDefaults,
   SettingsPatch,
 } from "./model-settings.ts";
-import type { RequestAuthority } from "./owner-policy.ts";
+import {
+  buildOwnerDeveloperInstructions,
+  type RequestAuthority,
+} from "./owner-policy.ts";
 
 const EXITED: AppServerProcessStatus = {
   success: false,
@@ -2944,12 +2947,12 @@ describe("CodexRuntime", () => {
     await runtime.stop();
   });
 
-  it("passes developer instructions unchanged to every client generation", async () => {
+  it("passes owner instructions unchanged to initial and restarted clients", async () => {
     const factory = new FakeFactory();
     const crashed = new FakeClient();
     const replacement = new FakeClient();
     factory.queue.push(crashed, replacement);
-    const developerInstructions = "stable owner isolation policy";
+    const developerInstructions = buildOwnerDeveloperInstructions("owner-id");
     const runtime = runtimeWith(factory, {
       developerInstructions,
       delay: async () => {},

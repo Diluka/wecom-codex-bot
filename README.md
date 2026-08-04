@@ -73,10 +73,25 @@ Secret。
 `owner_user_id` 为 `null`。既有 request 日志保持不变，仍会记录每条消息真实的
 sender `user_id`。
 
-restricted turn 的写操作、测试、构建、格式化和依赖安装等必须在隔离 worktree 中
-执行。worktree 位置、分支命名、验证、提交约定，以及 PR/MR 的类型、模板和工作流均
-由目标仓库的 `AGENTS.md` 与贡献文档决定；机器人不固定 Draft 或 Ready。隔离边界
-优先于冲突的仓库工作流规则。
+restricted turn 可在 main checkout
+中执行无副作用的读取、搜索和状态检查。需要修改
+目标仓库时，它可以在仓库认可的位置创建隔离 worktree，并创建或继续非默认任务
+分支；在其中可以修改文件、安装依赖、执行仓库规定的验证和提交，通过非强制推送更新
+该任务分支，并在用户要求时创建或更新对应的 PR/MR。worktree 位置、分支命名、
+验证、提交约定和 PR/MR 工作流仍由目标仓库的 `AGENTS.md` 与贡献文档决定；机器人
+不固定 Draft 或 Ready。
+
+restricted turn 不得修改 main checkout
+的内容、index、stash、未提交内容或无关嵌套
+仓库；不得提交或推送默认分支、强推、删除远端引用、覆盖远端并发更新、合并或关闭
+PR/MR、发布、部署、变更仓库设置或修改 owner 的全局配置。它只需解析当前任务的目标
+仓库；只有任务
+明确涉及嵌套仓库时才检查或修改该仓库。隔离边界优先于冲突的仓库工作流规则。
+
+开始写入前无法确定目标仓库根目录、默认分支或安全 worktree 路径时必须停止。如果
+只是无法推送或发布 PR/MR，则保留本地 worktree 分支并说明阻塞，不能回退到 main
+checkout 修改。获准命令产生的工具临时文件和缓存仍由 Codex sandbox 与审批策略
+约束，不因 worktree 隔离而获得额外权限。
 
 该机制是 developer instructions 形成的软约束，不是 OS 权限、Codex sandbox 或 Git
 hook 级别的硬隔离。

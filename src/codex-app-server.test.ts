@@ -12,6 +12,7 @@ import {
   selectFinalAgentMessage,
   type SpawnAppServer,
 } from "./codex-app-server.ts";
+import { buildOwnerDeveloperInstructions } from "./owner-policy.ts";
 
 type JsonObject = Record<string, unknown>;
 
@@ -205,11 +206,14 @@ describe("CodexAppServerClient", () => {
 
     const fake = new FakeAppServerProcess();
     const calls: Array<{ command: string; options: Deno.CommandOptions }> = [];
+    const developerInstructions = buildOwnerDeveloperInstructions(
+      "owner-id-secret",
+    );
     let client: CodexAppServerClient | undefined;
     try {
       client = await CodexAppServerClient.start({
         cwd: "/workspace/project",
-        developerInstructions: 'Owner "policy"\npath \\ workspace',
+        developerInstructions,
         spawn: createSpawn(fake, calls),
       });
       await waitFor(
@@ -221,7 +225,7 @@ describe("CodexAppServerClient", () => {
       equal(calls[0].command, "codex");
       deepStrictEqual(calls[0].options.args, [
         "-c",
-        'developer_instructions="Owner \\"policy\\"\\npath \\\\ workspace"',
+        `developer_instructions=${JSON.stringify(developerInstructions)}`,
         "app-server",
         "--stdio",
       ]);
