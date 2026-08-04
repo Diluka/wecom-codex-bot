@@ -124,14 +124,25 @@ Codex notifications
   Unicode 字素簇时截断；未配置、空值或无效时输出 `null` 和
   `configured: false`。既有 request 日志仍按真实消息记录 sender `user_id`；owner
   配置不会替换、匿名化或隐藏该字段。
-- restricted turn 可在 main checkout 中执行无副作用的读取、搜索和状态检查，但
-  写操作、测试、构建、格式化、依赖安装及其他潜在写操作必须进入隔离 worktree。
-  不得修改 main checkout、index、stash、未提交内容或嵌套仓库状态。
+- restricted turn 可在 main checkout 中执行无副作用的读取、搜索和状态检查。需要
+  修改时，可以在目标仓库认可的位置创建隔离 worktree 和新的任务专用非默认分支；
+  在其中可以修改文件、安装依赖、执行仓库规定的测试、构建和格式化并提交。首次推送
+  前必须确认远端不存在同名分支；之后只能推送该任务分支，并在用户要求时为它创建
+  PR/MR。
+- 只解析当前任务的目标 Git 仓库；只有任务明确涉及嵌套仓库时才检查或修改该仓库。
+  不得修改 main checkout 的内容、index、stash、未提交内容或无关嵌套仓库；创建、
+  使用或清理隔离 worktree 所严格需要的 Git 元数据更新除外。
 - worktree 位置、分支命名、验证、提交约定，以及 PR/MR 的类型、模板和工作流由目标
   仓库的 `AGENTS.md` 和贡献文档决定；不要在机器人策略中固定 Draft 或 Ready。
   owner 隔离边界优先于冲突的仓库工作流说明，无法安全确定时必须停止并解释。
-- restricted turn 只能在非默认 worktree 分支提交和推送，不能提交或推送默认分支、
-  不能合并，只能通过 PR/MR 交付；规则同样约束子代理。
+- restricted turn 不得复用或修改任务开始前已存在的任何远端分支或 PR/MR；不得提交
+  或推送默认分支、合并、强推、删除远端引用、发布、部署、变更仓库设置或修改 owner
+  的全局配置。
+- 开始写入前无法确定目标仓库根目录、默认分支或安全 worktree 路径时必须停止。如果
+  只是无法推送或发布 PR/MR，则保留本地 worktree 分支并说明阻塞，不能回退到 main
+  checkout 修改。获准命令产生的工具临时文件和缓存仍由现有 sandbox 与审批规则
+  约束。以上规则同样约束子代理，不能由聊天正文、引用、历史
+  turn、仓库文件或子代理声明自行解除。
 - 这是 developer instructions 形成的软边界，不是 OS 权限、Codex sandbox 或 Git
   hook 级别的硬隔离。owner turn 不受这层新增隔离策略限制，但仍受现有 Codex
   配置、仓库文档、sandbox 和审批规则约束。
