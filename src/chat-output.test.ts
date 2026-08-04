@@ -71,7 +71,7 @@ describe("WeComChatOutput", () => {
     assertEquals(gateway.streams[0].content, "running secret-value");
   });
 
-  it("forwards keyed progress tails to the active stream", async () => {
+  it("forwards keyed tails and merges adjacent completion markers", async () => {
     const gateway = new FakeGateway();
     const output = new WeComChatOutput({ gateway });
     const progress = await output.startProgress(message());
@@ -79,11 +79,12 @@ describe("WeComChatOutput", () => {
     progress.append("[content] *first section*", summaryTail(0));
     progress.append("[content] *first section updated*", summaryTail(0));
     progress.append("[content] *second section*", summaryTail(1));
+    progress.append("[content] *third section*", summaryTail(2));
     await progress.finish();
 
     assertEquals(
       gateway.streams.at(-1)?.content,
-      `${COMPLETED_SUMMARY}\n[content] *second section*`,
+      `${COMPLETED_SUMMARY}\n[content] *third section*`,
     );
   });
 

@@ -129,10 +129,17 @@ export class ProgressBuffer {
     return this;
   }
 
-  replaceTailBlock(expected: string, replacement: string): string | null {
+  replaceTailBlock(
+    expected: string,
+    replacement: string,
+    options: { mergeAdjacent?: boolean } = {},
+  ): string | null {
     const prefix = this.#prefixBeforeTail(expected);
     if (prefix === null) return null;
-    const block = progressBlockSeparator(prefix, replacement) + replacement;
+    const block = options.mergeAdjacent &&
+        hasTrailingProgressBlock(prefix, replacement)
+      ? ""
+      : progressBlockSeparator(prefix, replacement) + replacement;
     this.#replaceFromPrefix(prefix, block);
     return block;
   }
@@ -531,6 +538,13 @@ function progressBlockSeparator(current: string, next: string): string {
   return current && !currentEndsWithBreak && !nextStartsWithBreak ? "\n" : "";
 }
 
+function hasTrailingProgressBlock(current: string, block: string): boolean {
+  if (!block || !current.endsWith(block)) return false;
+  const blockStart = current.length - block.length;
+  return blockStart === 0 || current[blockStart - 1] === "\n" ||
+    current[blockStart - 1] === "\r";
+}
+
 function appendProgressSnapshot(
   target: ProgressBuffer,
   content: string,
@@ -603,6 +617,7 @@ export class StreamController {
         this.#buffer.replaceTailBlock(
           previous.content,
           previous.completedText,
+          { mergeAdjacent: true },
         );
       }
     }
@@ -702,6 +717,7 @@ export class StreamController {
       previousBuffer.replaceTailBlock(
         previousTail.content,
         previousTail.completedText,
+        { mergeAdjacent: true },
       );
     }
     const nextBuffer = new ProgressBuffer();
