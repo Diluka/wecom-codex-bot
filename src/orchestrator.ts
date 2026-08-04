@@ -294,8 +294,13 @@ interface PreparedRequestImages {
 }
 
 type SettingsCommand =
-  | { kind: "model"; value?: string; valid: boolean }
-  | { kind: "effort"; value?: string; valid: boolean };
+  | { kind: "model"; value?: string }
+  | { kind: "effort"; value?: string };
+
+interface SlashCommand {
+  readonly name: string;
+  readonly arguments: readonly string[];
+}
 
 const TERMINAL_REQUEST_STATUSES = new Set<RequestStatus>([
   "duplicate_ignored",
@@ -360,13 +365,21 @@ function isInterruptible(active?: ActiveTurn): active is ActiveTurn {
   );
 }
 
-function settingsCommand(text: string): SettingsCommand | undefined {
+function slashCommand(text: string): SlashCommand | undefined {
   const parts = text.trim().split(/\s+/);
-  if (parts[0] !== "/model" && parts[0] !== "/effort") return undefined;
+  if (!parts[0].startsWith("/")) return undefined;
+  return { name: parts[0], arguments: parts.slice(1) };
+}
+
+function settingsCommand(command: SlashCommand): SettingsCommand | undefined {
+  if (command.name !== "/model" && command.name !== "/effort") {
+    return undefined;
+  }
   return {
-    kind: parts[0] === "/model" ? "model" : "effort",
-    ...(parts.length === 2 ? { value: parts[1] } : {}),
-    valid: parts.length <= 2,
+    kind: command.name === "/model" ? "model" : "effort",
+    ...(command.arguments[0] === undefined
+      ? {}
+      : { value: command.arguments[0] }),
   };
 }
 
@@ -451,6 +464,7 @@ function settingsUpdateReply(
 
 const SETTINGS_MUTATION_DENIED =
   "权限不足：只有机器人 owner 可以修改模型或推理强度；不带参数的 `/model` 和 `/effort` 仍可查询。";
+const UNKNOWN_COMMAND = "未知命令。发送 `/help` 查看可用命令。";
 
 const HELP = [
   "可用命令：",
@@ -531,21 +545,18 @@ export class ConversationOrchestrator {
 
   async handleMessage(message: RoutedUserMessage): Promise<void> {
     if (message.messageType === "text") {
-      const command = message.text.trim();
-      const parsedSettingsCommand = settingsCommand(command);
-      if (
-        command === "/help" || command === "/status" || command === "/new" ||
-        command === "/stop" || parsedSettingsCommand
-      ) {
+      const command = slashCommand(message.text);
+      if (command) {
+        const parsedSettingsCommand = settingsCommand(command);
         if (this.#shuttingDown) return;
         if (!this.#state.claimMessage(message.msgId, message.conversationKey)) {
           return;
         }
-        if (command === "/help") {
+        if (command.name === "/help") {
           await this.#output.send(message, HELP);
           return;
         }
-        if (command === "/status") {
+        if (command.name === "/status") {
           await this.#enqueueSettingsCommand(
             message.conversationKey,
             async () => {
@@ -560,13 +571,16 @@ export class ConversationOrchestrator {
           await this.#enqueueSettingsCommand(
             message.conversationKey,
             () => this.#handleSettingsCommand(message, parsedSettingsCommand),
-            parsedSettingsCommand.valid && parsedSettingsCommand.value !==
-                undefined,
+            parsedSettingsCommand.value !== undefined,
           );
           return;
         }
-        if (command === "/stop") {
+        if (command.name === "/stop") {
           await this.#stopConversation(message);
+          return;
+        }
+        if (command.name !== "/new") {
+          await this.#output.send(message, UNKNOWN_COMMAND);
           return;
         }
         const slot = this.#slot(message.conversationKey);
@@ -674,15 +688,6 @@ export class ConversationOrchestrator {
     command: SettingsCommand,
   ): Promise<void> {
     if (this.#shuttingDown) return;
-    if (!command.valid) {
-      await this.#output.send(
-        message,
-        command.kind === "model"
-          ? "用法：`/model <model-id>`"
-          : "用法：`/effort <level>`",
-      );
-      return;
-    }
     if (
       command.value !== undefined &&
       classifyRequestAuthority(this.#ownerUserId, [message.senderUserId]) !==

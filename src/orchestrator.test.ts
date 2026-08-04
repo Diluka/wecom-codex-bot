@@ -827,59 +827,62 @@ describe("ConversationOrchestrator", () => {
       false,
     );
   });
-  it("excludes commands and unsupported messages but treats unknown commands as requests", async () => {
-    const { codex, orchestrator, requestEvents, timers } = setup();
+  it("routes slash commands locally by their first token", async () => {
+    const { codex, orchestrator, output, requestEvents, timers } = setup();
+    codex.ready = false;
 
-    await orchestrator.handleMessage(message("single:alice", "help", "/help"));
     await orchestrator.handleMessage(
-      message("single:alice", "status", "/status"),
+      message("single:alice", "help", "/help ignored"),
     );
     await orchestrator.handleMessage(
-      message("single:alice", "model", "/model"),
+      message("single:alice", "status", "/status ignored"),
     );
     await orchestrator.handleMessage(
-      message("single:alice", "effort", "/effort"),
+      message("single:alice", "new", "/new ignored"),
     );
-    await orchestrator.handleMessage(message("single:alice", "new", "/new"));
+    await orchestrator.handleMessage(
+      message("single:alice", "stop", "/stop ignored"),
+    );
+    await orchestrator.handleMessage(
+      message("single:alice", "unknown", "/unknown ignored"),
+    );
+    await orchestrator.handleMessage(
+      message("single:alice", "model-lookalike", "/models"),
+    );
+    await orchestrator.handleMessage(
+      message("single:alice", "effort-lookalike", "/effortful high"),
+    );
     await orchestrator.handleUnsupported(
       message("single:alice", "voice", ""),
       "voice",
     );
+
     assertEquals(requestEvents, []);
-
-    const unknown = orchestrator.handleMessage(
-      message("single:alice", "m1", "/unknown"),
+    assertEquals(timers.callbacks, []);
+    assertEquals(codex.startThreadAttempts, 0);
+    assertEquals(codex.startTurnAttempts, 0);
+    assertMatch(
+      output.sent.find(({ msgId }) => msgId === "help")!.text,
+      /可用命令/,
     );
-    const flushing = timers.advance(3_000);
-    await waitFor(() => codex.starts.length === 1);
-    assertEquals(requestEvents[0].state, "received");
-    codex.starts[0].resolve({ status: "completed" });
-    await Promise.all([unknown, flushing]);
-  });
-  it("treats lookalike model and effort commands as ordinary text", async () => {
-    const { codex, orchestrator, requestEvents, timers } = setup();
-
-    const modelLookalike = orchestrator.handleMessage(
-      message("single:alice", "model-lookalike", "/models"),
+    assertMatch(
+      output.sent.find(({ msgId }) => msgId === "status")!.text,
+      /codex: unavailable/,
     );
-    await timers.advance(3_000);
-    await waitFor(() => codex.starts.length === 1);
-    codex.starts[0].resolve({ status: "completed" });
-    await modelLookalike;
-    const effortLookalike = orchestrator.handleMessage(
-      message("single:alice", "effort-lookalike", "/effortful high"),
+    assertMatch(
+      output.sent.find(({ msgId }) => msgId === "new")!.text,
+      /暂不可用/,
     );
-    await timers.advance(3_000);
-    await waitFor(() => codex.starts.length === 2);
-    codex.starts[1].resolve({ status: "completed" });
-    await effortLookalike;
-
     assertEquals(
-      requestEvents.filter(({ state }) => state === "received").map(
-        ({ msgId }) => msgId,
-      ),
-      ["model-lookalike", "effort-lookalike"],
+      output.sent.find(({ msgId }) => msgId === "stop")!.text,
+      "当前没有正在执行或等待的任务。",
     );
+    for (const msgId of ["unknown", "model-lookalike", "effort-lookalike"]) {
+      assertMatch(
+        output.sent.find((entry) => entry.msgId === msgId)!.text,
+        /未知.*命令/,
+      );
+    }
   });
   it("shows model and effort choices without starting turns", async () => {
     const { codex, orchestrator, output, requestEvents } = setup();
@@ -1028,8 +1031,8 @@ describe("ConversationOrchestrator settings authorization", () => {
     assertEquals(output.sent.map(({ msgId }) => msgId), ["non-owner", "owner"]);
     assertEquals(codex.starts, []);
   });
-  it("keeps restricted settings queries and malformed usage read-only", async () => {
-    const { codex, orchestrator, output } = setup();
+  it("uses the first supported settings argument and ignores the rest", async () => {
+    const { codex, orchestrator, output } = setup({ ownerUserId: "alice" });
 
     await orchestrator.handleMessage(
       message("single:alice", "model-query", "/model"),
@@ -1045,15 +1048,14 @@ describe("ConversationOrchestrator settings authorization", () => {
     );
 
     assertEquals(codex.settingsLookups, [undefined, undefined]);
-    assertEquals(codex.modelChanges, []);
-    assertEquals(codex.effortChanges, []);
+    assertEquals(codex.modelChanges, [{ threadId: undefined, model: "gpt-a" }]);
+    assertEquals(codex.effortChanges, [{
+      threadId: undefined,
+      effort: "high",
+    }]);
     assertEquals(
-      output.sent.find(({ msgId }) => msgId === "bad-model")?.text,
-      "用法：`/model <model-id>`",
-    );
-    assertEquals(
-      output.sent.find(({ msgId }) => msgId === "bad-effort")?.text,
-      "用法：`/effort <level>`",
+      output.sent.some(({ text }) => text.startsWith("用法：")),
+      false,
     );
   });
   it("sends one direct denial without leaking owner ID or affecting the active turn", async () => {
@@ -1195,7 +1197,7 @@ describe("ConversationOrchestrator", () => {
     };
 
     await orchestrator.handleMessage(
-      message("single:alice", "model", "/model missing"),
+      message("single:alice", "model", "/model missing ignored"),
     );
     codex.nextSettingsResult = {
       status: "invalid_effort",
@@ -1203,7 +1205,7 @@ describe("ConversationOrchestrator", () => {
       availableEfforts: ["low", "medium"],
     };
     await orchestrator.handleMessage(
-      message("single:alice", "effort", "/effort ultra"),
+      message("single:alice", "effort", "/effort ultra ignored"),
     );
 
     assertMatch(
@@ -1272,7 +1274,7 @@ describe("ConversationOrchestrator", () => {
 
     assertEquals(unbound.output.sent[0].text, "设置未修改：defaults read-only");
   });
-  it("reserves malformed settings commands and deduplicates mutations", async () => {
+  it("ignores surplus settings arguments and deduplicates mutations", async () => {
     const { codex, orchestrator, output, requestEvents } = setup({
       ownerUserId: "alice",
     });
@@ -1287,15 +1289,13 @@ describe("ConversationOrchestrator", () => {
     await orchestrator.handleMessage(duplicate);
     await orchestrator.handleMessage(duplicate);
 
-    assertEquals(
-      output.sent.find(({ msgId }) => msgId === "bad-model")!.text,
-      "用法：`/model <model-id>`",
-    );
-    assertEquals(
-      output.sent.find(({ msgId }) => msgId === "bad-effort")!.text,
-      "用法：`/effort <level>`",
-    );
-    assertEquals(codex.modelChanges, [{ threadId: undefined, model: "gpt-b" }]);
+    assertEquals(codex.modelChanges, [
+      { threadId: undefined, model: "a" },
+      { threadId: undefined, model: "gpt-b" },
+    ]);
+    assertEquals(codex.effortChanges, [
+      { threadId: undefined, effort: "high" },
+    ]);
     assertEquals(
       output.sent.filter(({ msgId }) => msgId === "duplicate").length,
       1,
@@ -2843,7 +2843,7 @@ describe("ConversationOrchestrator", () => {
     await waitFor(() => codex.starts.length === 1);
 
     const resetting = orchestrator.handleMessage(
-      message("single:alice", "m2", "/new"),
+      message("single:alice", "m2", "/new ignored"),
     );
     await waitFor(() => codex.interrupts.length === 1);
     codex.starts[0].resolve({ status: "interrupted" });
