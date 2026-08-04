@@ -345,7 +345,7 @@ describe("WeComSink", () => {
 });
 
 describe("StreamController", () => {
-  it("refreshes one summary key and seals each completed key in place", async () => {
+  it("refreshes one summary key and merges adjacent completion markers", async () => {
     const calls: SendCall[] = [];
     const controller = new StreamController({
       conversationKey: "single:alice",
@@ -370,7 +370,55 @@ describe("StreamController", () => {
     assertEquals(await controller.finish(), true);
     assertEquals(
       calls.at(-1)?.content,
-      `${COMPLETED_SUMMARY}\n${COMPLETED_SUMMARY}\n*third*`,
+      `${COMPLETED_SUMMARY}\n*third*`,
+    );
+  });
+
+  it("keeps completion markers separated by visible progress", async () => {
+    const calls: SendCall[] = [];
+    const controller = new StreamController({
+      conversationKey: "single:alice",
+      frame: { key: "single:alice" },
+      sink: recordingSink(calls),
+      streamIdFactory: () => "stream-1",
+    });
+
+    controller.appendBlock("*first*", tail("item", 0));
+    controller.appendBlock("*second*", tail("item", 1));
+    controller.appendBlock("ordinary commentary");
+    controller.appendBlock("*third*", tail("item", 2));
+    controller.appendBlock("*fourth*", tail("item", 3));
+    assertEquals(await controller.finish(), true);
+
+    assertEquals(
+      calls.at(-1)?.content,
+      [
+        COMPLETED_SUMMARY,
+        "*second*",
+        "ordinary commentary",
+        COMPLETED_SUMMARY,
+        "*fourth*",
+      ].join("\n"),
+    );
+  });
+
+  it("does not merge a marker embedded at the end of ordinary progress", async () => {
+    const calls: SendCall[] = [];
+    const controller = new StreamController({
+      conversationKey: "single:alice",
+      frame: { key: "single:alice" },
+      sink: recordingSink(calls),
+      streamIdFactory: () => "stream-1",
+    });
+
+    controller.appendBlock(`ordinary ${COMPLETED_SUMMARY}`);
+    controller.appendBlock("*first*", tail("item", 0));
+    controller.appendBlock("*second*", tail("item", 1));
+    assertEquals(await controller.finish(), true);
+
+    assertEquals(
+      calls.at(-1)?.content,
+      `ordinary ${COMPLETED_SUMMARY}\n${COMPLETED_SUMMARY}\n*second*`,
     );
   });
 
@@ -432,7 +480,7 @@ describe("StreamController", () => {
     assertEquals(calls.at(-1)?.content.includes(COMPLETED_SUMMARY), false);
   });
 
-  it("seals a tracked summary before scheduled stream rotation", async () => {
+  it("merges adjacent completion markers before scheduled rotation", async () => {
     const calls: SendCall[] = [];
     const timers = new FakeTimers();
     const ids = ["stream-1", "stream-2"];
@@ -444,7 +492,8 @@ describe("StreamController", () => {
       streamIdFactory: () => ids.shift() ?? "unexpected",
     });
 
-    controller.appendBlock("*live summary*", tail("item", 0));
+    controller.appendBlock("*completed summary*", tail("item", 0));
+    controller.appendBlock("*live summary*", tail("item", 1));
     await timers.advance(6 * 60_000);
 
     const oldFinal = calls.find(({ streamId, finish }) =>

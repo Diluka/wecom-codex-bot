@@ -159,8 +159,9 @@ OUTPUT_FORMAT_TOOL=individual
 同一 reasoning summary section 的增量会先按 App Server 提供的 `itemId` 和
 `summaryIndex` 累积，再原位刷新当前企业微信 stream 的活动摘要尾块。新的 section
 立即接替它时，机器人会先把旧尾块替换为固定的
-`*已完成上一阶段，继续处理中…*`，再显示新摘要。只有摘要完整一行都是 `**bold**`
-时才会转成 `*italic*`；普通文本、行内格式、代码和其他 Markdown 都保持原样。
+`*已完成上一阶段，继续处理中…*`，再显示新摘要；连续产生的相同完成提示会合并为
+一条，中间有其他可见进度时则分别保留。只有摘要完整一行都是 `**bold**` 时才会转成
+`*italic*`；普通文本、行内格式、代码和其他 Markdown 都保持原样。
 
 一旦出现其他可见进度，当前摘要就会固化，之后的摘要从新的活动尾块开始。被输出级别
 抑制的事件和 direct 消息不会中断这条替换链。企业微信 stream 到达六分钟 scheduled
