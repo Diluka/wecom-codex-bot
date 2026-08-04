@@ -365,10 +365,17 @@ function isInterruptible(active?: ActiveTurn): active is ActiveTurn {
   );
 }
 
-function slashCommand(text: string): SlashCommand | undefined {
-  const parts = text.trim().split(/\s+/);
-  if (!parts[0].startsWith("/")) return undefined;
-  return { name: parts[0], arguments: parts.slice(1) };
+function slashCommand(message: RoutedText): SlashCommand | undefined {
+  const parts = message.text.trim().split(/\s+/);
+  // Group callbacks retain the bot mention, but the SDK exposes no mention span.
+  const commandIndex = message.chatType === "group" &&
+      parts[0].length > 1 && parts[0].startsWith("@") &&
+      parts[1]?.startsWith("/")
+    ? 1
+    : 0;
+  const name = parts[commandIndex];
+  if (!name?.startsWith("/")) return undefined;
+  return { name, arguments: parts.slice(commandIndex + 1) };
 }
 
 function settingsCommand(command: SlashCommand): SettingsCommand | undefined {
@@ -545,7 +552,7 @@ export class ConversationOrchestrator {
 
   async handleMessage(message: RoutedUserMessage): Promise<void> {
     if (message.messageType === "text") {
-      const command = slashCommand(message.text);
+      const command = slashCommand(message);
       if (command) {
         const parsedSettingsCommand = settingsCommand(command);
         if (this.#shuttingDown) return;

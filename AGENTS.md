@@ -69,15 +69,18 @@ Codex notifications
   latest-wins：同一 conversation 中进入 slot 的请求严格串行，活动 turn 存在时由
   新批次请求中断它，普通 pending 只保留最后一个到期批次。不同 conversation 可以
   并发，因此会同时修改同一个工作区；不要在没有明确需求时改成全局串行。
-- 纯文本斜杠命令按首个空白分隔 token 匹配；无参数命令忽略其余 token，`/model` 和
-  `/effort` 只消费第一个参数并忽略其余 token。未知命令和非法参数只在本地报错，
-  任何命令都不能成为 Codex prompt。
+- 纯文本斜杠命令按空白分隔 token 匹配；通常首个 token 是命令，群聊首个 token 是
+  非空 `@mention` 且第二个 token 以 `/` 开头时使用第二个 token。只跳过这一个
+  前缀，不向后搜索正文。无参数命令忽略其余 token，`/model` 和 `/effort` 只消费
+  命令后的第一个参数并忽略其余 token。未知命令和非法参数只在本地报错，任何命令
+  都不能成为 Codex prompt。
 - `/help`、`/status`、`/model`、`/effort`、`/new`、`/stop`、未知命令和不支持的
   消息绕过防抖。除 `/new` 和 `/stop`
   的既定控制行为外，它们不重置等待窗口、不进入 任务 slot，也不打断活动 turn。
 - `/new` 会先取消尚未到期的聚合批次，再使用独立的 reset pending：它会清掉旧的
-  普通 pending；如果之后又收到普通文本，则先新建 thread，再执行最后一个到期的
-  普通批次。
+  普通 pending，只调用 `thread/start` 创建并绑定新 thread，绝不能调用
+  `turn/start`；如果之后又收到普通文本，则必须先新建 thread，然后执行最后一个
+  到期批次。
 - `/stop` 必须立即清掉当前 conversation 的防抖批次、普通 pending 和 reset
   pending，并请求中断活动 turn；它保留 thread 绑定。停止后的新普通文本可以重新
   开始防抖窗口，且停止范围不能影响其他 conversation。
