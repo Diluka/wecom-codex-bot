@@ -884,6 +884,79 @@ describe("ConversationOrchestrator", () => {
       );
     }
   });
+  it("starts a mention-prefixed group /new immediately without a model turn", async () => {
+    const {
+      codex,
+      orchestrator,
+      output,
+      requestEvents,
+      state,
+      timers,
+    } = setup();
+
+    const handling = orchestrator.handleMessage(
+      message("group:engineering", "new", "@Codex /new ignored"),
+    );
+    await waitFor(() =>
+      codex.startThreadAttempts === 1 || timers.callbacks.length > 0
+    );
+
+    try {
+      assertEquals(requestEvents, []);
+      assertEquals(timers.callbacks, []);
+      assertEquals(codex.startThreadAttempts, 1);
+      assertEquals(codex.startTurnAttempts, 0);
+      await handling;
+      assertEquals(codex.startTurnAttempts, 0);
+      assertEquals(codex.starts, []);
+      assertEquals(
+        state.getConversation("group:engineering")?.threadId,
+        "thread-1",
+      );
+      assertMatch(output.sent.at(-1)?.text ?? "", /已新建 Codex 会话/);
+    } finally {
+      if (timers.callbacks.length > 0) {
+        const flushing = timers.advance(3_000);
+        await waitFor(() => codex.starts.length === 1);
+        codex.starts[0].resolve({ status: "completed" });
+        await Promise.all([handling, flushing]);
+      }
+    }
+  });
+  it("keeps slash text outside the group mention command position on the request path", async () => {
+    const cases = [
+      message(
+        "group:engineering",
+        "prose",
+        "@Codex 请说明 /new 的行为",
+      ),
+      message(
+        "group:engineering",
+        "multiple-mentions",
+        "@Codex @Alice /new",
+      ),
+      message("group:engineering", "empty-mention", "@ /new"),
+      message("single:alice", "single-mention", "@Codex /new"),
+    ];
+
+    for (const inbound of cases) {
+      const { codex, orchestrator, requestEvents, timers } = setup();
+      const running = orchestrator.handleMessage(inbound);
+
+      assertEquals(timers.callbacks.length, 1);
+      await timers.advance(3_000);
+      await waitFor(() => codex.starts.length === 1);
+
+      assertStringIncludes(textOf(codex.starts[0]), inbound.text);
+      assertEquals(requestEvents.at(0)?.state, "received");
+      assertEquals(
+        requestEvents.some(({ state }) => state === "running"),
+        true,
+      );
+      codex.starts[0].resolve({ status: "completed", finalAnswer: "done" });
+      await running;
+    }
+  });
   it("shows model and effort choices without starting turns", async () => {
     const { codex, orchestrator, output, requestEvents } = setup();
     codex.startTurnErrors.push(
