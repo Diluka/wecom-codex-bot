@@ -1,0 +1,93 @@
+<mxfile host="Agent">
+  <diagram id="wecom-codex-message-flow" name="Message Flow">
+    <mxGraphModel grid="1" gridSize="10" guides="1" connect="1" arrows="1" page="1" pageScale="1" pageWidth="2100" pageHeight="1120" background="#FFFDF5">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="title" value="一条企业微信消息，怎样变成一次 Codex 工作" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;fontFamily=Chalkboard SE,Comic Sans MS;fontSize=30;fontStyle=1;fontColor=#243142;" vertex="1" parent="1">
+          <mxGeometry x="70" y="38" width="1200" height="52" as="geometry" />
+        </mxCell>
+        <mxCell id="subtitle" value="上方是请求进入工作区的主链路；下方是状态、过程和最终回答回到企业微信的闭环。" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;fontFamily=Chalkboard SE,Comic Sans MS;fontSize=17;fontColor=#64748B;" vertex="1" parent="1">
+          <mxGeometry x="72" y="94" width="1350" height="34" as="geometry" />
+        </mxCell>
+
+        <mxCell id="wecom-boundary" value="企业微信" style="rounded=1;whiteSpace=wrap;html=1;arcSize=10;sketch=1;curveFitting=1;jiggle=2;fillColor=none;strokeColor=#91A4BA;strokeWidth=2;dashed=1;dashPattern=8 6;fontFamily=Chalkboard SE,Comic Sans MS;fontSize=18;fontStyle=1;fontColor=#243142;verticalAlign=top;align=left;spacingTop=14;spacingLeft=18;pointerEvents=0;" vertex="1" parent="1">
+          <mxGeometry x="45" y="155" width="300" height="700" as="geometry" />
+        </mxCell>
+        <mxCell id="bot-boundary" value="WeCom Codex Bot（本机进程）" style="rounded=1;whiteSpace=wrap;html=1;arcSize=10;sketch=1;curveFitting=1;jiggle=2;fillColor=none;strokeColor=#91A4BA;strokeWidth=2;dashed=1;dashPattern=8 6;fontFamily=Chalkboard SE,Comic Sans MS;fontSize=18;fontStyle=1;fontColor=#243142;verticalAlign=top;align=left;spacingTop=14;spacingLeft=18;pointerEvents=0;" vertex="1" parent="1">
+          <mxGeometry x="375" y="155" width="1150" height="700" as="geometry" />
+        </mxCell>
+        <mxCell id="codex-boundary" value="Codex 与目标项目" style="rounded=1;whiteSpace=wrap;html=1;arcSize=10;sketch=1;curveFitting=1;jiggle=2;fillColor=none;strokeColor=#91A4BA;strokeWidth=2;dashed=1;dashPattern=8 6;fontFamily=Chalkboard SE,Comic Sans MS;fontSize=18;fontStyle=1;fontColor=#243142;verticalAlign=top;align=left;spacingTop=14;spacingLeft=18;pointerEvents=0;" vertex="1" parent="1">
+          <mxGeometry x="1560" y="155" width="470" height="700" as="geometry" />
+        </mxCell>
+
+        <mxCell id="wecom-chat" value="企业微信会话&lt;br&gt;&lt;b&gt;单聊 / 群聊&lt;/b&gt;&lt;br&gt;文本 · 图片 · 引用" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;sketch=1;curveFitting=1;jiggle=2;fillColor=#DCEBFF;strokeColor=#243142;strokeWidth=2;hachureGap=8;fillWeight=1.5;fontFamily=Chalkboard SE,Comic Sans MS;fontSize=18;fontColor=#243142;" vertex="1" parent="1">
+          <mxGeometry x="82" y="270" width="225" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="gateway" value="WeComGateway&lt;br&gt;&lt;b&gt;长连接与消息适配&lt;/b&gt;&lt;br&gt;图片下载 / 解密" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;sketch=1;curveFitting=1;jiggle=2;fillColor=#FFF2CC;strokeColor=#243142;strokeWidth=2;hachureGap=8;fillWeight=1.5;fontFamily=Chalkboard SE,Comic Sans MS;fontSize=17;fontColor=#243142;" vertex="1" parent="1">
+          <mxGeometry x="425" y="270" width="230" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="orchestrator" value="ConversationOrchestrator&lt;br&gt;&lt;b&gt;会话状态机&lt;/b&gt;&lt;br&gt;3 秒聚合 · 命令 · 排队 · 中断" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;sketch=1;curveFitting=1;jiggle=2;fillColor=#FFF2CC;strokeColor=#243142;strokeWidth=2.5;hachureGap=8;fillWeight=1.5;fontFamily=Chalkboard SE,Comic Sans MS;fontSize=17;fontStyle=1;fontColor=#243142;" vertex="1" parent="1">
+          <mxGeometry x="790" y="255" width="270" height="150" as="geometry" />
+        </mxCell>
+        <mxCell id="runtime" value="CodexRuntime&lt;br&gt;&lt;b&gt;codex app-server --stdio&lt;/b&gt;&lt;br&gt;恢复 thread · 启动 turn&lt;br&gt;进程重启" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;sketch=1;curveFitting=1;jiggle=2;fillColor=#E9E1F7;strokeColor=#243142;strokeWidth=2;hachureGap=8;fillWeight=1.5;fontFamily=Chalkboard SE,Comic Sans MS;fontSize=17;fontColor=#243142;" vertex="1" parent="1">
+          <mxGeometry x="1210" y="255" width="260" height="150" as="geometry" />
+        </mxCell>
+        <mxCell id="workspace" value="CODEX_WORKSPACE&lt;br&gt;&lt;b&gt;目标项目&lt;/b&gt;&lt;br&gt;读取 · 工具 · 修改" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;sketch=1;curveFitting=1;jiggle=2;fillColor=#DFF3E4;strokeColor=#243142;strokeWidth=2;hachureGap=8;fillWeight=1.5;fontFamily=Chalkboard SE,Comic Sans MS;fontSize=18;fontColor=#243142;" vertex="1" parent="1">
+          <mxGeometry x="1690" y="270" width="240" height="120" as="geometry" />
+        </mxCell>
+
+        <mxCell id="state" value=".data/bot.sqlite&lt;br&gt;&lt;b&gt;持久状态&lt;/b&gt;&lt;br&gt;thread 绑定 · 去重 · turn 状态" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=12;sketch=1;curveFitting=1;jiggle=2;fillColor=#DFF3E4;strokeColor=#243142;strokeWidth=2;hachureGap=8;fillWeight=1.5;fontFamily=Chalkboard SE,Comic Sans MS;fontSize=17;fontColor=#243142;" vertex="1" parent="1">
+          <mxGeometry x="800" y="485" width="250" height="135" as="geometry" />
+        </mxCell>
+        <mxCell id="output-pipeline" value="TurnOutputPipeline&lt;br&gt;&lt;b&gt;过程输出策略&lt;/b&gt;&lt;br&gt;标签 · 截断 · reasoning summary" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;sketch=1;curveFitting=1;jiggle=2;fillColor=#FFF2CC;strokeColor=#243142;strokeWidth=2;hachureGap=8;fillWeight=1.5;fontFamily=Chalkboard SE,Comic Sans MS;fontSize=17;fontColor=#243142;" vertex="1" parent="1">
+          <mxGeometry x="1195" y="680" width="275" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="chat-output" value="WeComChatOutput&lt;br&gt;&lt;b&gt;企业微信投递&lt;/b&gt;&lt;br&gt;保序 · 分段 · 限流 · stream 轮换" style="rounded=1;whiteSpace=wrap;html=1;arcSize=14;sketch=1;curveFitting=1;jiggle=2;fillColor=#FFF2CC;strokeColor=#243142;strokeWidth=2;hachureGap=8;fillWeight=1.5;fontFamily=Chalkboard SE,Comic Sans MS;fontSize=17;fontColor=#243142;" vertex="1" parent="1">
+          <mxGeometry x="425" y="680" width="245" height="120" as="geometry" />
+        </mxCell>
+
+        <mxCell id="flow-note" value="&lt;b&gt;同一聊天严格串行，不同聊天可以并发。&lt;/b&gt;&lt;br&gt;普通消息在 3 秒无新消息后成批提交；新批次进入任务 slot 时采用 latest-wins。命令和最终回答走 direct 路径，不受过程输出过滤影响。" style="shape=note;whiteSpace=wrap;html=1;size=18;sketch=1;curveFitting=1;jiggle=2;fillColor=#FFF4D6;strokeColor=#D97736;strokeWidth=2;hachureGap=10;fillWeight=1;fontFamily=Chalkboard SE,Comic Sans MS;fontSize=17;fontColor=#7C3514;align=left;spacingLeft=18;spacingRight=14;spacingTop=12;" vertex="1" parent="1">
+          <mxGeometry x="190" y="900" width="1470" height="125" as="geometry" />
+        </mxCell>
+        <mxCell id="security-note" value="安全边界&lt;br&gt;owner / restricted 是注入给 Codex 的软策略；聊天、输出和日志没有敏感值扫描或脱敏层。" style="shape=note;whiteSpace=wrap;html=1;size=18;sketch=1;curveFitting=1;jiggle=2;fillColor=#F9DFDF;strokeColor=#B94A48;strokeWidth=2;hachureGap=10;fillWeight=1;fontFamily=Chalkboard SE,Comic Sans MS;fontSize=16;fontColor=#7F1D1D;align=left;spacingLeft=16;spacingRight=12;spacingTop=10;" vertex="1" parent="1">
+          <mxGeometry x="1690" y="900" width="315" height="125" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e-chat-gateway" value="WebSocket" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;sketch=1;curveFitting=1;jiggle=2;strokeColor=#243142;strokeWidth=2.5;endArrow=classic;endFill=1;endSize=18;fontFamily=Chalkboard SE,Comic Sans MS;fontSize=15;fontColor=#243142;labelBackgroundColor=#FFFDF5;" edge="1" parent="1" source="wecom-chat" target="gateway">
+          <mxGeometry x="0" y="-1" relative="1" as="geometry"><mxPoint x="0" y="-16" as="offset" /></mxGeometry>
+        </mxCell>
+        <mxCell id="e-gateway-orchestrator" value="去重 / 聚合" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;sketch=1;curveFitting=1;jiggle=2;strokeColor=#243142;strokeWidth=2.5;endArrow=classic;endFill=1;endSize=18;fontFamily=Chalkboard SE,Comic Sans MS;fontSize=15;fontColor=#243142;labelBackgroundColor=#FFFDF5;" edge="1" parent="1" source="gateway" target="orchestrator">
+          <mxGeometry x="0" y="-1" relative="1" as="geometry"><mxPoint x="0" y="-16" as="offset" /></mxGeometry>
+        </mxCell>
+        <mxCell id="e-orchestrator-runtime" value="恢复 thread / 启动 turn" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;sketch=1;curveFitting=1;jiggle=2;strokeColor=#243142;strokeWidth=2.5;endArrow=classic;endFill=1;endSize=18;fontFamily=Chalkboard SE,Comic Sans MS;fontSize=15;fontColor=#243142;labelBackgroundColor=#FFFDF5;" edge="1" parent="1" source="orchestrator" target="runtime">
+          <mxGeometry x="0" y="-1" relative="1" as="geometry"><mxPoint x="0" y="-20" as="offset" /></mxGeometry>
+        </mxCell>
+        <mxCell id="e-runtime-workspace" value="读取 / 工具 / 修改" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;sketch=1;curveFitting=1;jiggle=2;strokeColor=#243142;strokeWidth=2.5;endArrow=classic;endFill=1;endSize=18;fontFamily=Chalkboard SE,Comic Sans MS;fontSize=15;fontColor=#243142;labelBackgroundColor=#FFFDF5;" edge="1" parent="1" source="runtime" target="workspace">
+          <mxGeometry x="0" y="-1" relative="1" as="geometry"><mxPoint x="0" y="-16" as="offset" /></mxGeometry>
+        </mxCell>
+        <mxCell id="e-orchestrator-state" value="原子读写" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;sketch=1;curveFitting=1;jiggle=2;strokeColor=#243142;strokeWidth=2.5;endArrow=classic;endFill=1;endSize=18;startArrow=classic;startFill=1;startSize=18;fontFamily=Chalkboard SE,Comic Sans MS;fontSize=15;fontColor=#243142;labelBackgroundColor=#FFFDF5;" edge="1" parent="1" source="orchestrator" target="state">
+          <mxGeometry x="0" y="-1" relative="1" as="geometry"><mxPoint x="42" y="0" as="offset" /></mxGeometry>
+        </mxCell>
+        <mxCell id="e-runtime-output" value="ActivityEvent" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;sketch=1;curveFitting=1;jiggle=2;strokeColor=#243142;strokeWidth=2.5;endArrow=classic;endFill=1;endSize=18;dashed=1;dashPattern=8 6;fontFamily=Chalkboard SE,Comic Sans MS;fontSize=15;fontColor=#243142;labelBackgroundColor=#FFFDF5;" edge="1" parent="1" source="runtime" target="output-pipeline">
+          <mxGeometry x="0" y="-1" relative="1" as="geometry"><mxPoint x="50" y="0" as="offset" /></mxGeometry>
+        </mxCell>
+        <mxCell id="e-output-chat-output" value="筛选后的增量" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;sketch=1;curveFitting=1;jiggle=2;strokeColor=#243142;strokeWidth=2.5;endArrow=classic;endFill=1;endSize=18;fontFamily=Chalkboard SE,Comic Sans MS;fontSize=15;fontColor=#243142;labelBackgroundColor=#FFFDF5;" edge="1" parent="1" source="output-pipeline" target="chat-output">
+          <mxGeometry x="0" y="-1" relative="1" as="geometry"><mxPoint x="0" y="-16" as="offset" /></mxGeometry>
+        </mxCell>
+        <mxCell id="e-direct-chat-output" value="命令 / final（direct）" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;sketch=1;curveFitting=1;jiggle=2;strokeColor=#D97736;strokeWidth=2.5;endArrow=classic;endFill=1;endSize=18;dashed=1;dashPattern=8 6;fontFamily=Chalkboard SE,Comic Sans MS;fontSize=15;fontColor=#7C3514;labelBackgroundColor=#FFFDF5;exitX=0;exitY=0.75;entryX=0.5;entryY=0;" edge="1" parent="1" source="orchestrator" target="chat-output">
+          <mxGeometry x="0" y="-1" relative="1" as="geometry">
+            <mxPoint x="0" y="-14" as="offset" />
+            <Array as="points"><mxPoint x="720" y="368" /><mxPoint x="720" y="650" /><mxPoint x="548" y="650" /></Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e-chat-output-chat" value="stream / reply" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;sketch=1;curveFitting=1;jiggle=2;strokeColor=#243142;strokeWidth=2.5;endArrow=classic;endFill=1;endSize=18;fontFamily=Chalkboard SE,Comic Sans MS;fontSize=15;fontColor=#243142;labelBackgroundColor=#FFFDF5;" edge="1" parent="1" source="chat-output" target="wecom-chat">
+          <mxGeometry x="0" y="-1" relative="1" as="geometry">
+            <mxPoint x="-28" y="0" as="offset" />
+            <Array as="points"><mxPoint x="195" y="740" /></Array>
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
